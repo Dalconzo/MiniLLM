@@ -21,9 +21,11 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent write-function --spec ... --repo ...`
 - `lagent write-tests --repo ... --target ...`
 - `lagent explain-log --file ... [--repo ...]`
+- `lagent ingest-chatgpt --input ... --dry-run --trace`
+- `lagent ingest-chatgpt --input ... --trace`
 - `lagent memory-check`
 - `lagent memory-trace <run-id>`
-- Trace-aware ChatGPT memory command stubs for `ingest-chatgpt --dry-run --trace` and `memory-search --explain --json`
+- Trace-aware ChatGPT memory search stub for `memory-search --explain --json`
 - Structured run logging under `data/logs/`
 - Patch artifacts under `data/patches/`
 - Initial routing labels for local-vs-frontier expectations
@@ -44,6 +46,7 @@ lagent search . "RunLogger"
 lagent review --repo . --file src/local_agent_lab/tools/git_tools.py
 lagent write-tests --repo . --target src/local_agent_lab/tools/git_tools.py
 lagent explain-log --file /tmp/error.log --repo .
+lagent ingest-chatgpt --input data/chatgpt_exports/raw --dry-run --trace
 lagent memory-check
 ```
 
@@ -63,7 +66,7 @@ lagent memory-check
 - Ollama is the default local backend.
 - `lagent write-function` and `lagent write-tests` generate patch files by default and only write files with `--apply`.
 - `lagent explain-log` works without a repo, but `--repo` gives it traceback-aware code lookup.
-- ChatGPT export memory work is tracked under `lagent-100`; the storage and observability contract is in `docs/chatgpt_memory_contract.md`.
+- ChatGPT export memory work is tracked under `lagent-100`; the storage and observability contract is in `docs/chatgpt_memory_contract.md`, and the user/agent operating model is in `docs/memory_operating_model.md`.
 - Memory/RAG commands must expose `run_id` trace artifacts so ingestion, search, ranking, and agent context are inspectable from the terminal.
 - Any content sent to the model is passed through a lightweight redaction layer first.
 - Every CLI run writes a JSONL event plus per-run artifacts in `data/logs/`.

@@ -35,6 +35,7 @@ from .indexing.repo_indexer import default_db_path, index_repo
 from .llm.model_router import route_task
 from .llm.ollama_client import OllamaClient, OllamaError
 from .logging.run_logger import RunLogger
+from .memory.chatgpt_ingest import SCHEMA_VERSION, import_chatgpt_export
 from .memory.observability import (
     MemoryObservationError,
     MemoryTraceWriter,
@@ -612,12 +613,35 @@ def ingest_chatgpt(
         memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
         memory_trace.trace("discover_input", "Inspecting ChatGPT export input.", source_kind="path", source_ref=str(input_path))
         if not dry_run:
-            raise MemoryObservationError(
-                "Full ChatGPT ingestion is tracked by lagent-102. Use --dry-run --trace to verify export discovery first.",
-                stage="parse_export",
-                error_code="ingestion_not_implemented",
-                source_ref=str(input_path),
+            memory_trace.schema_version = SCHEMA_VERSION
+            memory_trace.trace("parse_export", "Parsing ChatGPT export.", source_kind="path", source_ref=str(input_path))
+            memory_trace.trace("normalize_conversations", "Normalizing conversations and messages.")
+            memory_trace.trace("chunk_messages", "Chunking normalized message text.")
+            memory_trace.trace("write_jsonl", "Writing normalized JSONL artifacts.")
+            memory_trace.trace("migrate_sqlite", "Ensuring ChatGPT memory SQLite schema.")
+            memory_trace.trace("write_sqlite", "Writing normalized records to SQLite.")
+            memory_trace.trace("refresh_fts", "Refreshing SQLite FTS rows for imported chunks.")
+            report = import_chatgpt_export(
+                input_path=input_path,
+                data_dir=config.paths["data_dir"],
+                memory_dir=config.paths["memory_dir"],
             )
+            memory_trace.trace(
+                "write_audit",
+                "Writing import report.",
+                details={"import_id": report["import_id"], **report["summary"]},
+            )
+            memory_trace.write_json("import_report.json", report)
+            for path in report.get("written_files", []):
+                if str(path) not in memory_trace.output_paths:
+                    memory_trace.output_paths.append(str(path))
+            memory_trace.finish(status="ok", result=report)
+            output = {"run_id": run.run_id, **report}
+            if trace:
+                output["trace_path"] = str(run.run_dir / "trace.jsonl")
+                output["artifact_dir"] = str(run.run_dir)
+            typer.echo(json.dumps(output, indent=2, sort_keys=True))
+            return
         report = dry_run_chatgpt_ingest(input_path)
         memory_trace.trace(
             "parse_export",

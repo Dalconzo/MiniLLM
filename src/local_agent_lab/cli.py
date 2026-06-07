@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -36,16 +37,18 @@ from .llm.model_router import route_task
 from .llm.ollama_client import OllamaClient, OllamaError
 from .logging.run_logger import RunLogger
 from .memory.chatgpt_ingest import SCHEMA_VERSION, import_chatgpt_export
+from .memory.embeddings import embed_missing_chunks, fallback_model_spec
 from .memory.observability import (
     MemoryObservationError,
     MemoryTraceWriter,
-    build_unimplemented_search_explain,
     dry_run_chatgpt_ingest,
     memory_db_path,
     read_memory_trace,
     render_memory_trace,
     validate_memory_state,
 )
+from .memory.search import search_chatgpt_memory
+from .memory.subjects import assign_conversation_subject, init_subject_schema, list_subjects
 from .tools.file_tools import redact_text
 from .tools.git_tools import changed_files_from_diff, git_diff
 from .tools.patches import PatchFile, apply_files, build_unified_patch, patch_filename
@@ -718,6 +721,11 @@ def memory_check(
 @app.command("memory-search")
 def memory_search(
     query: str = typer.Argument(..., help="Query to run against ChatGPT memory."),
+    limit: int = typer.Option(8, "--limit", min=1, max=50, help="Maximum number of hits to return."),
+    subject: str | None = typer.Option(None, "--subject", help="Optional subject filter."),
+    title: str | None = typer.Option(None, "--title", help="Optional conversation title filter."),
+    date_from: str | None = typer.Option(None, "--date-from", help="Inclusive ISO timestamp/date lower bound."),
+    date_to: str | None = typer.Option(None, "--date-to", help="Inclusive ISO timestamp/date upper bound."),
     explain: bool = typer.Option(False, "--explain", help="Write score/candidate explanation artifacts."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -732,19 +740,63 @@ def memory_search(
         config_path=config.path,
         sqlite_path=memory_db_path(config.paths["memory_dir"]),
     )
-    memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
-    memory_trace.trace("retrieve_candidates", "ChatGPT memory search backend is not implemented yet.", level="error")
-    payload = build_unimplemented_search_explain(query)
-    payload["run_id"] = run.run_id
-    if explain:
-        memory_trace.write_json("search_explain.json", payload)
-    error = payload["error"]
-    memory_trace.finish(status="error", result=payload, error=error)
-    if json_output or explain:
+    try:
+        memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
+        memory_trace.trace(
+            "retrieve_candidates",
+            "Searching ChatGPT memory FTS index.",
+            details={
+                "query": query,
+                "limit": limit,
+                "subject": subject,
+                "title": title,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+        )
+        payload = search_chatgpt_memory(
+            memory_dir=config.paths["memory_dir"],
+            query=query,
+            limit=limit,
+            subject=subject,
+            title=title,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        payload["run_id"] = run.run_id
+        memory_trace.trace(
+            "rank_results",
+            "Ranked ChatGPT memory results.",
+            details=payload["candidate_counts"],
+        )
+        memory_trace.trace(
+            "apply_disclosure",
+            "Applied default medium disclosure tier.",
+            details={"results": payload["count"]},
+        )
+        memory_trace.write_json("search.json", payload)
+        if explain:
+            memory_trace.write_json("search_explain.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output or explain:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_search(payload))
+    except MemoryObservationError as exc:
+        memory_trace.trace(
+            exc.stage,
+            str(exc),
+            level="error",
+            source_ref=exc.source_ref,
+            details={"error_code": exc.error_code},
+        )
+        error = exc.to_dict()
+        payload = {"status": "error", "query": query, "run_id": run.run_id, "error": error}
+        if explain:
+            memory_trace.write_json("search_explain.json", payload)
+        memory_trace.finish(status="error", result=payload, error=error)
         typer.echo(json.dumps(payload, indent=2, sort_keys=True), err=True)
-    else:
-        typer.echo(f"{error['message']}\nrun_id: {run.run_id}\nartifact_dir: {run.run_dir}", err=True)
-    raise typer.Exit(code=1)
+        raise typer.Exit(code=1)
 
 
 @app.command("memory-trace")
@@ -762,6 +814,199 @@ def memory_trace_command(
             typer.echo(render_memory_trace(trace))
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-embed")
+def memory_embed(
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum chunks to embed."),
+    dimension: int = typer.Option(64, "--dimension", min=1, max=4096, help="Fallback embedding dimension."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Build deterministic local embeddings for imported ChatGPT chunks."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-embed", {"limit": limit, "dimension": dimension, "db_path": str(db_path)})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-embed",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="embed_chunks",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
+        memory_trace.trace("embed_chunks", "Embedding chunks that are missing or stale.", details={"limit": limit})
+        with sqlite3.connect(db_path) as connection:
+            report = embed_missing_chunks(connection, spec=fallback_model_spec(dimension=dimension), limit=limit)
+        report["run_id"] = run.run_id
+        report["sqlite_path"] = str(db_path)
+        memory_trace.write_json("embedding_report.json", report)
+        memory_trace.finish(status="ok", result=report)
+        if json_output:
+            typer.echo(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_embed(report))
+    except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "embed_chunks", "error_code": "embedding_failed", "source_ref": str(db_path)}
+            stage = "embed_chunks"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-subjects")
+def memory_subjects(
+    kind: str | None = typer.Option(None, "--kind", help="Optional kind: subject, project, or workflow."),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum subjects to list."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """List ChatGPT memory subjects with counts and recency."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-subjects", {"kind": kind, "limit": limit, "db_path": str(db_path)})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-subjects",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="validate_state",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
+        memory_trace.trace("retrieve_candidates", "Listing memory subjects.", details={"kind": kind, "limit": limit})
+        with sqlite3.connect(db_path) as connection:
+            subjects = [summary.to_dict() for summary in list_subjects(connection, kind=kind, limit=limit)]
+        payload = {"status": "ok", "run_id": run.run_id, "count": len(subjects), "subjects": subjects}
+        memory_trace.write_json("subjects.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_subjects(payload))
+    except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "retrieve_candidates", "error_code": "subject_listing_failed", "source_ref": str(db_path)}
+            stage = "retrieve_candidates"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-assign-subject")
+def memory_assign_subject(
+    conversation_id: str = typer.Argument(..., help="Conversation ID to label."),
+    subject_name: str = typer.Argument(..., help="Subject, project, or workflow name."),
+    kind: str = typer.Option("subject", "--kind", help="subject, project, or workflow."),
+    include_chunks: bool = typer.Option(True, "--include-chunks/--no-include-chunks", help="Also label existing chunks."),
+    confidence: float = typer.Option(1.0, "--confidence", min=0.0, max=1.0, help="Assignment confidence."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Assign or correct a subject label for an imported conversation."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start(
+        "memory-assign-subject",
+        {
+            "conversation_id": conversation_id,
+            "subject_name": subject_name,
+            "kind": kind,
+            "include_chunks": include_chunks,
+            "confidence": confidence,
+            "db_path": str(db_path),
+        },
+    )
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-assign-subject",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="write_sqlite",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
+        memory_trace.trace(
+            "write_sqlite",
+            "Assigning subject to conversation.",
+            record_id=conversation_id,
+            details={"subject": subject_name, "kind": kind, "include_chunks": include_chunks},
+        )
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            init_subject_schema(connection)
+            row = connection.execute("SELECT id FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            if row is None:
+                raise MemoryObservationError(
+                    f"conversation not found: {conversation_id}",
+                    stage="write_sqlite",
+                    error_code="conversation_not_found",
+                    source_ref=conversation_id,
+                )
+            subject = assign_conversation_subject(
+                connection,
+                conversation_id,
+                subject_name,
+                kind=kind,
+                confidence=confidence,
+                source="manual",
+                include_chunks=include_chunks,
+            )
+        payload = {"status": "ok", "run_id": run.run_id, "conversation_id": conversation_id, "subject": subject.to_dict()}
+        memory_trace.write_json("subject_assignment.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(f"Assigned {subject.kind}:{subject.slug} to {conversation_id}\nrun_id: {run.run_id}")
+    except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "write_sqlite", "error_code": "subject_assignment_failed", "source_ref": str(db_path)}
+            stage = "write_sqlite"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
         raise typer.Exit(code=1)
 
 
@@ -956,6 +1201,41 @@ def _render_memory_check(payload: dict[str, object]) -> str:
     ]
     for check in payload["checks"]:
         lines.append(f"- {check['status']} {check['name']}: {check['message']}")
+    return "\n".join(lines)
+
+
+def _render_memory_search(payload: dict[str, object]) -> str:
+    lines = [
+        f"Run ID: {payload['run_id']}",
+        f"Results: {payload['count']}",
+    ]
+    for result in payload["results"]:
+        lines.append(
+            f"{result['rank']}. {result['title']} [{result['role']}] "
+            f"{result['chunk_id']} score={result['score']:.4f}"
+        )
+        lines.append(f"   {result['snippet']}")
+    return "\n".join(lines)
+
+
+def _render_memory_embed(payload: dict[str, object]) -> str:
+    return "\n".join(
+        [
+            f"Run ID: {payload['run_id']}",
+            f"Model: {payload['provider']}/{payload['model']} ({payload['dimension']} dims)",
+            f"Chunks considered: {payload['chunks_considered']}",
+            f"Embeddings written: {payload['embeddings_written']}",
+        ]
+    )
+
+
+def _render_memory_subjects(payload: dict[str, object]) -> str:
+    lines = [f"Run ID: {payload['run_id']}", f"Subjects: {payload['count']}"]
+    for subject in payload["subjects"]:
+        lines.append(
+            f"- {subject['kind']}:{subject['slug']} {subject['name']} "
+            f"conversations={subject['conversation_count']} chunks={subject['chunk_count']}"
+        )
     return "\n".join(lines)
 
 

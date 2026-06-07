@@ -25,7 +25,12 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent ingest-chatgpt --input ... --trace`
 - `lagent memory-check`
 - `lagent memory-trace <run-id>`
-- Trace-aware ChatGPT memory search stub for `memory-search --explain --json`
+- `lagent memory-search "query" --explain --json`
+- `lagent memory-embed`
+- `lagent memory-subjects`
+- `lagent memory-promote <chunk-id> --type decision`
+- `lagent memory-show <memory-id>`
+- `lagent memory-audit <run-id>`
 - Structured run logging under `data/logs/`
 - Patch artifacts under `data/patches/`
 - Initial routing labels for local-vs-frontier expectations

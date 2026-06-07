@@ -37,6 +37,8 @@ from .llm.model_router import route_task
 from .llm.ollama_client import OllamaClient, OllamaError
 from .logging.run_logger import RunLogger
 from .memory.chatgpt_ingest import SCHEMA_VERSION, import_chatgpt_export
+from .memory.audit import record_retrieval_event, retrieval_exposures_for_run, tombstone_source
+from .memory.curated import get_memory_record, list_memory_records, promote_chunk_to_memory_record
 from .memory.embeddings import embed_missing_chunks, fallback_model_spec
 from .memory.observability import (
     MemoryObservationError,
@@ -726,6 +728,9 @@ def memory_search(
     title: str | None = typer.Option(None, "--title", help="Optional conversation title filter."),
     date_from: str | None = typer.Option(None, "--date-from", help="Inclusive ISO timestamp/date lower bound."),
     date_to: str | None = typer.Option(None, "--date-to", help="Inclusive ISO timestamp/date upper bound."),
+    exclude_source: str | None = typer.Option(None, "--exclude-source", help="Comma-separated conversation/message/chunk IDs to exclude."),
+    exclude_subject: str | None = typer.Option(None, "--exclude-subject", help="Comma-separated subject names/slugs to exclude."),
+    depth: str = typer.Option("medium", "--depth", help="Disclosure depth: far, medium, close, or full."),
     explain: bool = typer.Option(False, "--explain", help="Write score/candidate explanation artifacts."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -752,6 +757,9 @@ def memory_search(
                 "title": title,
                 "date_from": date_from,
                 "date_to": date_to,
+                "exclude_source": exclude_source,
+                "exclude_subject": exclude_subject,
+                "depth": depth,
             },
         )
         payload = search_chatgpt_memory(
@@ -762,8 +770,23 @@ def memory_search(
             title=title,
             date_from=date_from,
             date_to=date_to,
+            exclude_source_ids=_comma_values(exclude_source),
+            exclude_subjects=_comma_values(exclude_subject),
+            depth=depth,
         )
         payload["run_id"] = run.run_id
+        with sqlite3.connect(memory_db_path(config.paths["memory_dir"])) as connection:
+            audit = record_retrieval_event(
+                connection,
+                run_id=run.run_id,
+                query=query,
+                command="memory-search",
+                filters=payload["filters_applied"],
+                ranking_profile=payload["ranking_profile"],
+                disclosure_depth=depth,
+                results=payload["results"],
+            )
+        payload["retrieval_event_id"] = audit["retrieval_event_id"]
         memory_trace.trace(
             "rank_results",
             "Ranked ChatGPT memory results.",
@@ -771,7 +794,7 @@ def memory_search(
         )
         memory_trace.trace(
             "apply_disclosure",
-            "Applied default medium disclosure tier.",
+            "Applied requested disclosure depth.",
             details={"results": payload["count"]},
         )
         memory_trace.write_json("search.json", payload)
@@ -1010,6 +1033,267 @@ def memory_assign_subject(
         raise typer.Exit(code=1)
 
 
+@app.command("memory-block-source")
+def memory_block_source(
+    source_id: str = typer.Argument(..., help="Conversation, message, or chunk ID to block."),
+    source_kind: str = typer.Option("chatgpt_export", "--source-kind", help="Source kind label for the tombstone."),
+    reason: str = typer.Option("blocked_by_user", "--reason", help="Reason stored in the tombstone."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Tombstone a source so future memory retrieval excludes it by default."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-block-source", {"source_id": source_id, "source_kind": source_kind, "reason": reason})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-block-source",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="write_sqlite",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        memory_trace.trace("write_sqlite", "Writing source tombstone.", record_id=source_id)
+        with sqlite3.connect(db_path) as connection:
+            tombstone = tombstone_source(connection, source_kind=source_kind, source_id=source_id, reason=reason)
+        payload = {"status": "ok", "run_id": run.run_id, "tombstone": tombstone}
+        memory_trace.write_json("tombstone.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(f"Blocked {source_id}\nrun_id: {run.run_id}")
+    except (MemoryObservationError, sqlite3.Error) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "write_sqlite", "error_code": "block_source_failed", "source_ref": str(db_path)}
+            stage = "write_sqlite"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-promote")
+def memory_promote(
+    chunk_id: str = typer.Argument(..., help="Chunk ID to promote into curated memory."),
+    record_type: str = typer.Option(..., "--type", help="Curated memory type, e.g. decision, preference, workflow."),
+    title: str | None = typer.Option(None, "--title", help="Optional title override."),
+    trust_level: str = typer.Option("medium", "--trust", help="low, medium, high, or canonical."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Promote an imported ChatGPT chunk into curated working memory."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-promote", {"chunk_id": chunk_id, "record_type": record_type, "title": title})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-promote",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="write_sqlite",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        memory_trace.trace("write_sqlite", "Promoting chunk to curated memory.", record_id=chunk_id)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            record = promote_chunk_to_memory_record(
+                connection,
+                chunk_id,
+                record_type=record_type,
+                title=title,
+                trust_level=trust_level,
+                created_by="user",
+            )
+        payload = {"status": "ok", "run_id": run.run_id, "memory_record": record.to_dict()}
+        memory_trace.write_json("memory_record.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(f"Promoted {chunk_id} -> {record.id}\nrun_id: {run.run_id}")
+    except (MemoryObservationError, sqlite3.Error, KeyError, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "write_sqlite", "error_code": "memory_promotion_failed", "source_ref": chunk_id}
+            stage = "write_sqlite"
+            source_ref = chunk_id
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-show")
+def memory_show(
+    memory_id: str = typer.Argument(..., help="Curated memory record ID."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Show a curated memory record with provenance."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-show", {"memory_id": memory_id})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-show",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="retrieve_candidates",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            record = get_memory_record(connection, memory_id)
+        payload = {"status": "ok", "run_id": run.run_id, "memory_record": record.to_dict()}
+        memory_trace.write_json("memory_record.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_record(payload))
+    except (MemoryObservationError, sqlite3.Error, KeyError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "retrieve_candidates", "error_code": "memory_record_not_found", "source_ref": memory_id}
+            stage = "retrieve_candidates"
+            source_ref = memory_id
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-list")
+def memory_list(
+    record_type: str | None = typer.Option(None, "--type", help="Optional curated memory type filter."),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum records to list."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """List active curated memory records."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-list", {"record_type": record_type, "limit": limit})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-list",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="retrieve_candidates",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            records = [record.to_dict() for record in list_memory_records(connection, record_type=record_type, limit=limit)]
+        payload = {"status": "ok", "run_id": run.run_id, "count": len(records), "memory_records": records}
+        memory_trace.write_json("memory_records.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_records(payload))
+    except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "retrieve_candidates", "error_code": "memory_list_failed", "source_ref": str(db_path)}
+            stage = "retrieve_candidates"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-audit")
+def memory_audit(
+    run_id: str = typer.Argument(..., help="Memory retrieval run ID to inspect."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Show what memory sources were exposed for a retrieval run."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-audit", {"target_run_id": run_id})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-audit",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="retrieve_candidates",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            exposures = retrieval_exposures_for_run(connection, run_id)
+        payload = {"status": "ok", "run_id": run.run_id, "target_run_id": run_id, "count": len(exposures), "exposures": exposures}
+        memory_trace.write_json("audit_exposures.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_audit(payload))
+    except (MemoryObservationError, sqlite3.Error) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "retrieve_candidates", "error_code": "audit_lookup_failed", "source_ref": str(db_path)}
+            stage = "retrieve_candidates"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
 def _collect_review_context(repo: Path, db_path: Path, relative_paths: list[str]) -> list[dict[str, object]]:
     snippets: list[dict[str, object]] = []
     seen: set[tuple[str, int]] = set()
@@ -1237,6 +1521,42 @@ def _render_memory_subjects(payload: dict[str, object]) -> str:
             f"conversations={subject['conversation_count']} chunks={subject['chunk_count']}"
         )
     return "\n".join(lines)
+
+
+def _render_memory_audit(payload: dict[str, object]) -> str:
+    lines = [f"Run ID: {payload['run_id']}", f"Target run: {payload['target_run_id']}", f"Exposures: {payload['count']}"]
+    for exposure in payload["exposures"]:
+        lines.append(
+            f"- {exposure['rank']}. {exposure['source_kind']}:{exposure['source_id']} "
+            f"tier={exposure['disclosure_tier']} redacted={exposure['redacted_secret_count']}"
+        )
+    return "\n".join(lines)
+
+
+def _render_memory_record(payload: dict[str, object]) -> str:
+    record = payload["memory_record"]
+    return "\n".join(
+        [
+            f"Run ID: {payload['run_id']}",
+            f"{record['id']} [{record['record_type']}/{record['trust_level']}/{record['status']}]",
+            record["title"],
+            record["body"],
+            f"Source: {record['source_kind']} {record['source_ref']}",
+        ]
+    )
+
+
+def _render_memory_records(payload: dict[str, object]) -> str:
+    lines = [f"Run ID: {payload['run_id']}", f"Records: {payload['count']}"]
+    for record in payload["memory_records"]:
+        lines.append(f"- {record['id']} [{record['record_type']}/{record['trust_level']}] {record['title']}")
+    return "\n".join(lines)
+
+
+def _comma_values(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
+from local_agent_lab.memory.curated import create_memory_record
 from local_agent_lab.memory.observability import MemoryObservationError
 from local_agent_lab.memory.search import search_chatgpt_memory
 
@@ -71,8 +72,9 @@ def test_search_chatgpt_memory_returns_citations_and_score_breakdown(tmp_path) -
     assert result["results"][0]["conversation_id"].startswith("conv_")
     assert result["results"][0]["message_id"].startswith("msg_")
     assert result["results"][0]["chunk_id"].startswith("chk_")
-    assert result["results"][0]["score_breakdown"]["fts_bm25"] == result["results"][0]["score"]
-    assert result["results"][0]["disclosure_tier"] == "medium"
+    assert result["results"][0]["score_breakdown"]["profile"] == "hybrid_memory_v1"
+    assert "keyword_relevance" in result["results"][0]["score_breakdown"]["components"]
+    assert result["results"][0]["disclosure_tier"] in {"far", "medium", "close", "full"}
 
 
 def test_search_chatgpt_memory_supports_title_filter(tmp_path) -> None:
@@ -84,6 +86,35 @@ def test_search_chatgpt_memory_supports_title_filter(tmp_path) -> None:
     assert result["count"] == 1
     assert result["results"][0]["title"] == "Finance notes"
     assert result["filters_applied"] == [{"field": "title", "value": "Finance"}]
+
+
+def test_search_chatgpt_memory_depth_caps_disclosure_tier(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", depth="far")
+
+    assert result["results"][0]["disclosure_tier"] == "far"
+    assert "snippet" not in result["results"][0]["exposed_fields"]
+
+
+def test_search_chatgpt_memory_includes_curated_memory_records(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Barcode parser decision",
+            body="Use the curated barcode parser workflow.",
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(memory_dir=memory_dir, query="curated barcode")
+
+    assert any(item["source_kind"] == "curated_memory" for item in result["results"])
+    assert result["candidate_counts"]["curated"] == 1
 
 
 def test_search_chatgpt_memory_subject_filter_is_explicit_without_subject_tables(tmp_path) -> None:

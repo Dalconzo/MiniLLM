@@ -1,0 +1,3 @@
+Summarize the user's text with a strong compression ratio.
+Preserve decisions, action items, deadlines, and unresolved questions.
+Use short paragraphs or flat bullets only when they improve clarity.

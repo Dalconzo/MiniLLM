@@ -1,0 +1,35 @@
+{
+  "default_model": "general",
+  "models": {
+    "general": {
+      "provider": "ollama",
+      "model": "llama3.2:3b",
+      "temperature": 0.2,
+      "num_ctx": 4096,
+      "top_p": 0.9,
+      "repeat_penalty": 1.05
+    },
+    "coder": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "temperature": 0.1,
+      "num_ctx": 8192,
+      "top_p": 0.9,
+      "repeat_penalty": 1.02
+    },
+    "fast": {
+      "provider": "ollama",
+      "model": "llama3.2:3b",
+      "temperature": 0.1,
+      "num_ctx": 2048,
+      "top_p": 0.8,
+      "repeat_penalty": 1.05
+    }
+  },
+  "task_defaults": {
+    "chat": "general",
+    "summarize": "general",
+    "classify": "fast",
+    "code": "coder"
+  }
+}

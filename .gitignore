@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+runs/
+*.egg-info/
+.pytest_cache/
+
+# Generated runtime state
+data/indexes/*
+!data/indexes/.gitkeep
+data/logs/*
+!data/logs/.gitkeep
+data/patches/*
+!data/patches/.gitkeep
+data/memory/*
+!data/memory/.gitkeep
+
+# Private imported/exported personal data
+data/chatgpt_exports/

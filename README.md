@@ -30,7 +30,9 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent memory-subjects`
 - `lagent memory-promote <chunk-id> --type decision`
 - `lagent memory-show <memory-id>`
+- `lagent memory-context "query" --depth medium`
 - `lagent memory-audit <run-id>`
+- `lagent memory-eval`
 - Structured run logging under `data/logs/`
 - Patch artifacts under `data/patches/`
 - Initial routing labels for local-vs-frontier expectations

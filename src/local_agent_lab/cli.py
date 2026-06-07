@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import typer
@@ -40,6 +41,7 @@ from .memory.chatgpt_ingest import SCHEMA_VERSION, import_chatgpt_export
 from .memory.audit import record_retrieval_event, retrieval_exposures_for_run, tombstone_source
 from .memory.curated import get_memory_record, list_memory_records, promote_chunk_to_memory_record
 from .memory.embeddings import embed_missing_chunks, fallback_model_spec
+from .memory.eval_checks import run_memory_eval
 from .memory.observability import (
     MemoryObservationError,
     MemoryTraceWriter,
@@ -822,6 +824,78 @@ def memory_search(
         raise typer.Exit(code=1)
 
 
+@app.command("memory-context")
+def memory_context(
+    query: str = typer.Argument(..., help="Task or question to build a memory context pack for."),
+    depth: str = typer.Option("medium", "--depth", help="Disclosure depth: far, medium, close, or full."),
+    limit: int = typer.Option(6, "--limit", min=1, max=20, help="Maximum context items."),
+    subject: str | None = typer.Option(None, "--subject", help="Optional subject filter."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Build an agent-facing memory context pack with provenance and controlled disclosure."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-context", {"query": query, "depth": depth, "limit": limit, "subject": subject})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-context",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        memory_trace.trace("retrieve_candidates", "Retrieving memory context candidates.", details={"query": query})
+        result = search_chatgpt_memory(
+            memory_dir=config.paths["memory_dir"],
+            query=query,
+            limit=limit,
+            subject=subject,
+            depth=depth,
+        )
+        context_items = [_context_item(item) for item in result["results"]]
+        with sqlite3.connect(db_path) as connection:
+            audit = record_retrieval_event(
+                connection,
+                run_id=run.run_id,
+                query=query,
+                command="memory-context",
+                filters=result["filters_applied"],
+                ranking_profile=result["ranking_profile"],
+                disclosure_depth=depth,
+                results=result["results"],
+            )
+        payload = {
+            "status": "ok",
+            "run_id": run.run_id,
+            "retrieval_event_id": audit["retrieval_event_id"],
+            "query": query,
+            "depth": depth,
+            "ranking_profile": result["ranking_profile"],
+            "candidate_counts": result["candidate_counts"],
+            "context_items": context_items,
+        }
+        memory_trace.write_json("context_pack.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_context(payload))
+    except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {"message": str(exc), "stage": "retrieve_candidates", "error_code": "memory_context_failed", "source_ref": str(db_path)}
+            stage = "retrieve_candidates"
+            source_ref = str(db_path)
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
 @app.command("memory-trace")
 def memory_trace_command(
     run_id: str = typer.Argument(..., help="Run ID to inspect."),
@@ -1294,6 +1368,43 @@ def memory_audit(
         raise typer.Exit(code=1)
 
 
+@app.command("memory-eval")
+def memory_eval(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Run synthetic ChatGPT memory quality and privacy checks."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("memory-eval", {})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-eval",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=memory_db_path(config.paths["memory_dir"]),
+    )
+    try:
+        memory_trace.trace("validate_state", "Running synthetic memory eval checks.")
+        with tempfile.TemporaryDirectory(prefix="lagent-memory-eval-") as temp_dir:
+            report = run_memory_eval(Path(temp_dir))
+        report["run_id"] = run.run_id
+        memory_trace.write_json("memory_eval.json", report)
+        status = "ok" if report["status"] == "pass" else "error"
+        memory_trace.finish(status=status, result=report)
+        if json_output:
+            typer.echo(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            typer.echo(_render_memory_eval(report))
+        if status != "ok":
+            raise typer.Exit(code=1)
+    except Exception as exc:
+        error = {"message": str(exc), "stage": "validate_state", "error_code": "memory_eval_failed", "source_ref": None}
+        memory_trace.trace("validate_state", str(exc), level="error", details={"error": error})
+        memory_trace.finish(status="error", result={"error": error}, error=error)
+        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
 def _collect_review_context(repo: Path, db_path: Path, relative_paths: list[str]) -> list[dict[str, object]]:
     snippets: list[dict[str, object]] = []
     seen: set[tuple[str, int]] = set()
@@ -1502,6 +1613,34 @@ def _render_memory_search(payload: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _context_item(result: dict[str, object]) -> dict[str, object]:
+    return {
+        "source_kind": result["source_kind"],
+        "source_id": result["chunk_id"],
+        "conversation_id": result.get("conversation_id"),
+        "message_id": result.get("message_id"),
+        "title": result["title"],
+        "snippet": result["snippet"],
+        "score": result["score"],
+        "score_breakdown": result["score_breakdown"],
+        "disclosure_tier": result["disclosure_tier"],
+        "exposed_fields": result["exposed_fields"],
+    }
+
+
+def _render_memory_context(payload: dict[str, object]) -> str:
+    lines = [
+        f"Run ID: {payload['run_id']}",
+        f"Retrieval event: {payload['retrieval_event_id']}",
+        f"Depth: {payload['depth']}",
+        "Context:",
+    ]
+    for item in payload["context_items"]:
+        lines.append(f"- {item['source_kind']}:{item['source_id']} score={item['score']}")
+        lines.append(f"  {item['title']}: {item['snippet']}")
+    return "\n".join(lines)
+
+
 def _render_memory_embed(payload: dict[str, object]) -> str:
     return "\n".join(
         [
@@ -1550,6 +1689,18 @@ def _render_memory_records(payload: dict[str, object]) -> str:
     lines = [f"Run ID: {payload['run_id']}", f"Records: {payload['count']}"]
     for record in payload["memory_records"]:
         lines.append(f"- {record['id']} [{record['record_type']}/{record['trust_level']}] {record['title']}")
+    return "\n".join(lines)
+
+
+def _render_memory_eval(payload: dict[str, object]) -> str:
+    summary = payload["summary"]
+    lines = [
+        f"Run ID: {payload['run_id']}",
+        f"Status: {payload['status']}",
+        f"Checks: {summary['passed']}/{summary['checks']} passed",
+    ]
+    for check in payload["checks"]:
+        lines.append(f"- {check['status']} {check['name']}")
     return "\n".join(lines)
 
 

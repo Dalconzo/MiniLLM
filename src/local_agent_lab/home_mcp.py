@@ -154,12 +154,23 @@ class HomeMCPServer:
             )
         self.auth_mode = normalized_auth_mode
         self.auth_token = auth_token.strip() if auth_token else None
+        self.resource_url = (
+            (self.config.raw.get("home_mcp", {}) or {}).get("resource_url")
+            if isinstance(self.config.raw.get("home_mcp", {}), dict)
+            else None
+        )
+        self.resource_url = (
+            self.resource_url
+            or os.environ.get("LAGENT_HOME_MCP_RESOURCE_URL")
+            or os.environ.get("HOME_MCP_RESOURCE_URL")
+            or (f"https://api.openai.com/v1/tunnel/{os.environ.get('HOME_MCP_TUNNEL_ID')}" if os.environ.get("HOME_MCP_TUNNEL_ID") else None)
+            or "http://127.0.0.1:8765"
+        )
         self.logger = RunLogger(self.config.logs_dir / "home_mcp")
 
     def oauth_protected_resource_metadata(self, *, request_url: str | None = None) -> dict[str, Any]:
-        resource = request_url.rstrip("/") if request_url else "http://127.0.0.1:8765"
         return {
-            "resource": resource,
+            "resource": self.resource_url.rstrip("/"),
             "authorization_servers": [],
             "scopes_supported": [],
             "resource_documentation": "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",

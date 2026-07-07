@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from ..config import AppConfig
 
 
@@ -43,6 +45,7 @@ def build_home_mcp_launchd_plist(
     *,
     auth_mode: str = "none",
     auth_token: str | None = None,
+    resource_url: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
     label: str = HOME_MCP_HOME_LABEL,
@@ -64,19 +67,45 @@ def build_home_mcp_launchd_plist(
     ]
     if auth_token:
         args.extend(["--auth-token", auth_token])
+    tunnel_id = _detect_tunnel_id(config)
+    resource_value = resource_url or (f"https://api.openai.com/v1/tunnel/{tunnel_id}" if tunnel_id else None)
     logs_dir = config.logs_dir
+    env = {
+        "LAGENT_CONFIG": str(config.path),
+        "PYTHONUNBUFFERED": "1",
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    }
+    if resource_value:
+        env["HOME_MCP_RESOURCE_URL"] = resource_value
     return _plist_base(
         args,
         label=label,
         working_directory=config.root_dir,
         stdout_path=logs_dir / "home_mcp.stdout.log",
         stderr_path=logs_dir / "home_mcp.stderr.log",
-        environment={
-            "LAGENT_CONFIG": str(config.path),
-            "PYTHONUNBUFFERED": "1",
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        },
+        environment=env,
     )
+
+
+def _detect_tunnel_id(config: AppConfig) -> str | None:
+    raw = config.raw.get("home_mcp", {})
+    if isinstance(raw, dict):
+        value = raw.get("tunnel_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    profile_path = Path.home() / ".config" / "tunnel-client" / "home-mcp.yaml"
+    if profile_path.exists():
+        try:
+            payload = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if isinstance(payload, dict):
+            control_plane = payload.get("control_plane")
+            if isinstance(control_plane, dict):
+                value = control_plane.get("tunnel_id")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return None
 
 
 def build_home_mcp_tunnel_launchd_plist(

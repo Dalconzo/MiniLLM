@@ -53,6 +53,36 @@ def test_home_mcp_launchd_plists_include_expected_programs(tmp_path) -> None:
     assert tunnel_plist["KeepAlive"] is True
 
 
+def test_home_mcp_launchd_plist_derives_https_resource_url(tmp_path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+
+    profile_dir = Path.home() / ".config" / "tunnel-client"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_path = profile_dir / "home-mcp.yaml"
+    profile_path.write_text(
+        "\n".join(
+            [
+                "config_version: 1",
+                "control_plane:",
+                '  tunnel_id: "tunnel_123"',
+                '  api_key: "env:CONTROL_PLANE_API_KEY"',
+                "mcp:",
+                '  server_urls:',
+                '    - channel: main',
+                '      url: "http://127.0.0.1:8765/mcp"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        plist = build_home_mcp_launchd_plist(config)
+        assert plist["EnvironmentVariables"]["HOME_MCP_RESOURCE_URL"] == "https://api.openai.com/v1/tunnel/tunnel_123"
+    finally:
+        profile_path.unlink(missing_ok=True)
+
+
 def test_home_mcp_launchd_plist_round_trip_and_tunnel_url(tmp_path) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)

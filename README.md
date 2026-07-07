@@ -33,6 +33,9 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent memory-context "query" --depth medium`
 - `lagent memory-audit <run-id>`
 - `lagent memory-eval`
+- `lagent home-mcp roots`
+- `lagent home-mcp serve --host 127.0.0.1 --port 8765`
+- `lagent home-mcp create-recipe --title "..." --body "..."`
 - Structured run logging under `data/logs/`
 - Patch artifacts under `data/patches/`
 - Initial routing labels for local-vs-frontier expectations
@@ -78,3 +81,4 @@ lagent memory-check
 - Any content sent to the model is passed through a lightweight redaction layer first.
 - Every CLI run writes a JSONL event plus per-run artifacts in `data/logs/`.
 - `lagent review --diff` requires the target repo to be an actual git checkout with `.git` metadata present.
+- `home-mcp` exposes only allowlisted roots and is intended to be tunneled or relayed, not opened directly to the public internet.

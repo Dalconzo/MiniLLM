@@ -7,11 +7,11 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from .ontology import validate_subject_kind
 from .observability import utc_now
 
 
 SUBJECT_SCHEMA_VERSION = 2
-VALID_SUBJECT_KINDS = {"subject", "project", "workflow"}
 
 
 @dataclass(frozen=True)
@@ -410,10 +410,7 @@ def _assign_chunks(
 
 
 def _normalize_kind(kind: str) -> str:
-    normalized = normalize_subject_slug(kind).replace("-", "_")
-    if normalized not in VALID_SUBJECT_KINDS:
-        raise ValueError(f"invalid subject kind: {kind}")
-    return normalized
+    return validate_subject_kind(kind)
 
 
 def _subject_id(kind: str, slug: str) -> str:

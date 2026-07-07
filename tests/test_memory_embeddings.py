@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
+from local_agent_lab.memory.audit import tombstone_source
 from local_agent_lab.memory.embeddings import (
     cosine_similarity,
     deterministic_fallback_embedding,
@@ -146,3 +147,17 @@ def test_stale_chunk_hash_is_detected_and_reembedded(tmp_path) -> None:
             (chunk_id, model_id),
         ).fetchone()[0]
         assert stored_hash == "updated-hash"
+
+
+def test_blocked_chunks_are_not_returned_for_embedding(tmp_path) -> None:
+    db_path = _import_memory(tmp_path)
+    spec = fallback_model_spec(dimension=8)
+
+    with sqlite3.connect(db_path) as connection:
+        model_id = register_embedding_model(connection, spec)
+        chunk_id = connection.execute("SELECT id FROM message_chunks ORDER BY id LIMIT 1").fetchone()[0]
+        tombstone_source(connection, source_kind="chatgpt_export", source_id=chunk_id, reason="private")
+
+        needing = list_chunks_needing_embeddings(connection, embedding_model_id=model_id)
+
+    assert all(chunk.chunk_id != chunk_id for chunk in needing)

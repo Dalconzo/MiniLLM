@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
+from .audit import blocked_source_ids
 from .observability import utc_now
 
 
@@ -161,6 +162,9 @@ def list_chunks_needing_embeddings(
     embedding_model_id: str,
     limit: int | None = None,
 ) -> list[ChunkForEmbedding]:
+    blocked_ids: list[str] = []
+    if connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='deletions'").fetchone() is not None:
+        blocked_ids = sorted(blocked_source_ids(connection))
     sql = """
         SELECT
             message_chunks.id,
@@ -180,10 +184,22 @@ def list_chunks_needing_embeddings(
               OR chunk_embeddings.text_sha256 != message_chunks.text_sha256
               OR chunk_embeddings.is_stale = 1
           )
+    """
+    params: list[Any] = [embedding_model_id]
+    if blocked_ids:
+        placeholders = ", ".join("?" for _ in blocked_ids)
+        sql += f"""
+          AND message_chunks.id NOT IN ({placeholders})
+          AND message_chunks.message_id NOT IN ({placeholders})
+          AND message_chunks.conversation_id NOT IN ({placeholders})
+        """
+        params.extend(blocked_ids)
+        params.extend(blocked_ids)
+        params.extend(blocked_ids)
+    sql += """
         ORDER BY message_chunks.import_id, message_chunks.conversation_id,
                  message_chunks.message_id, message_chunks.chunk_index
     """
-    params: list[Any] = [embedding_model_id]
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)

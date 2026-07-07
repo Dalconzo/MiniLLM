@@ -6,23 +6,21 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .observability import utc_now
+from .audit import blocked_source_ids
+from .ontology import (
+    CURATED_RECORD_TYPES,
+    VALID_RECORD_STATUSES,
+    VALID_TRUST_LEVELS,
+    classify_source_monitoring,
+    validate_curated_record_type,
+    validate_record_status,
+    validate_trust_level,
+)
+from .observability import MemoryObservationError, utc_now
+from .subjects import init_subject_schema
 
 
 CURATED_SCHEMA_VERSION = 4
-
-VALID_RECORD_TYPES = {
-    "project_fact",
-    "decision",
-    "preference",
-    "workflow",
-    "open_loop",
-    "lesson",
-    "contact_note",
-    "research_note",
-}
-VALID_TRUST_LEVELS = {"low", "medium", "high", "canonical"}
-VALID_RECORD_STATUSES = {"active", "stale", "superseded", "archived", "deleted"}
 
 
 @dataclass(frozen=True)
@@ -171,6 +169,7 @@ def create_memory_record(
     metadata: dict[str, Any] | None = None,
     record_id: str | None = None,
 ) -> MemoryRecord:
+    init_subject_schema(connection)
     init_curated_memory_schema(connection)
     normalized_type = _validate_record_type(record_type)
     normalized_trust = _validate_trust_level(trust_level)
@@ -256,6 +255,14 @@ def promote_chunk_to_memory_record(
     chunk = _fetch_chunk_provenance(connection, chunk_id)
     if chunk is None:
         raise KeyError(f"message chunk not found: {chunk_id}")
+    blocked_ids = blocked_source_ids(connection)
+    if chunk_id in blocked_ids or chunk["message_id"] in blocked_ids or chunk["conversation_id"] in blocked_ids:
+        raise MemoryObservationError(
+            f"source has been tombstoned and cannot be promoted: {chunk_id}",
+            stage="write_sqlite",
+            error_code="source_blocked",
+            source_ref=chunk_id,
+        )
 
     final_title = title or chunk["conversation_title"]
     final_body = body or chunk["text"]
@@ -272,6 +279,9 @@ def promote_chunk_to_memory_record(
             "chunk_index": chunk["chunk_index"],
             "text_sha256": chunk["text_sha256"],
         },
+        "source_monitoring": classify_source_monitoring(
+            chunk["role"],
+        ),
         **(provenance or {}),
     }
     record = create_memory_record(
@@ -482,15 +492,15 @@ def list_memory_links(
 
 
 def record_type_options() -> tuple[str, ...]:
-    return tuple(sorted(VALID_RECORD_TYPES))
+    return tuple(sorted(CURATED_RECORD_TYPES))
 
 
 def trust_level_options() -> tuple[str, ...]:
-    return ("low", "medium", "high", "canonical")
+    return VALID_TRUST_LEVELS
 
 
 def status_options() -> tuple[str, ...]:
-    return ("active", "stale", "superseded", "archived", "deleted")
+    return VALID_RECORD_STATUSES
 
 
 def _fetch_chunk_provenance(connection: sqlite3.Connection, chunk_id: str) -> dict[str, Any] | None:
@@ -591,24 +601,15 @@ def _record_id(
 
 
 def _validate_record_type(record_type: str) -> str:
-    normalized = record_type.strip().lower().replace("-", "_")
-    if normalized not in VALID_RECORD_TYPES:
-        raise ValueError(f"invalid memory record type: {record_type}")
-    return normalized
+    return validate_curated_record_type(record_type)
 
 
 def _validate_trust_level(trust_level: str) -> str:
-    normalized = trust_level.strip().lower().replace("-", "_")
-    if normalized not in VALID_TRUST_LEVELS:
-        raise ValueError(f"invalid memory trust level: {trust_level}")
-    return normalized
+    return validate_trust_level(trust_level)
 
 
 def _validate_status(status: str) -> str:
-    normalized = status.strip().lower().replace("-", "_")
-    if normalized not in VALID_RECORD_STATUSES:
-        raise ValueError(f"invalid memory record status: {status}")
-    return normalized
+    return validate_record_status(status)
 
 
 def _required_text(value: str, field: str) -> str:

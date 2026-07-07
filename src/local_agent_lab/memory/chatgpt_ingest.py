@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..indexing.chunker import chunk_text
+from .candidates import extract_candidate_memories, init_candidate_memory_schema, replace_candidate_memories
 from .observability import MemoryObservationError, memory_db_path, utc_now
 
 
@@ -21,6 +22,7 @@ class ParsedExport:
     conversations: list[dict[str, Any]]
     messages: list[dict[str, Any]]
     chunks: list[dict[str, Any]]
+    candidate_memories: list[dict[str, Any]]
     attachments: list[dict[str, Any]]
     conversation_files: list[dict[str, Any]]
 
@@ -36,6 +38,7 @@ def import_chatgpt_export(*, input_path: Path, data_dir: Path, memory_dir: Path)
         _write_jsonl(parsed_dir / "conversations.jsonl", parsed.conversations)
         _write_jsonl(parsed_dir / "messages.jsonl", parsed.messages)
         _write_jsonl(parsed_dir / "chunks.jsonl", parsed.chunks)
+        _write_jsonl(parsed_dir / "candidate_memories.jsonl", parsed.candidate_memories)
         _write_jsonl(parsed_dir / "attachments.jsonl", parsed.attachments)
     except OSError as exc:
         raise MemoryObservationError(
@@ -59,7 +62,9 @@ def import_chatgpt_export(*, input_path: Path, data_dir: Path, memory_dir: Path)
         with sqlite3.connect(sqlite_path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             init_chatgpt_memory_schema(connection)
+            init_candidate_memory_schema(connection)
             replace_import(connection, parsed)
+            replace_candidate_memories(connection, parsed)
     except sqlite3.Error as exc:
         raise MemoryObservationError(
             str(exc),
@@ -95,6 +100,7 @@ def parse_chatgpt_export(input_path: Path) -> ParsedExport:
     conversations: list[dict[str, Any]] = []
     messages: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
+    candidate_memories: list[dict[str, Any]] = []
     attachments: list[dict[str, Any]] = []
     file_reports: list[dict[str, Any]] = []
 
@@ -162,6 +168,18 @@ def parse_chatgpt_export(input_path: Path) -> ParsedExport:
             messages.extend(message_rows)
             chunks.extend(_chunk_rows(message_rows, import_id, conversation_id, title))
 
+    candidate_memories = extract_candidate_memories(
+        ParsedExport(
+            import_record={"id": import_id},
+            conversations=conversations,
+            messages=messages,
+            chunks=chunks,
+            candidate_memories=[],
+            attachments=attachments,
+            conversation_files=file_reports,
+        )
+    )
+
     import_record = {
         "id": import_id,
         "source_root": str(input_path),
@@ -173,6 +191,7 @@ def parse_chatgpt_export(input_path: Path) -> ParsedExport:
         "conversation_count": len(conversations),
         "message_count": len(messages),
         "chunk_count": len(chunks),
+        "candidate_memory_count": len(candidate_memories),
         "attachment_count": len(attachments),
         "content_sha256": _short_hash("|".join(file_hashes), length=64),
         "notes": "",
@@ -182,6 +201,7 @@ def parse_chatgpt_export(input_path: Path) -> ParsedExport:
         conversations=conversations,
         messages=messages,
         chunks=chunks,
+        candidate_memories=candidate_memories,
         attachments=attachments,
         conversation_files=file_reports,
     )
@@ -440,6 +460,7 @@ def _chunk_rows(messages: list[dict[str, Any]], import_id: str, conversation_id:
                     "text": text,
                     "title": title,
                     "role": message["role"],
+                    "created_at": message.get("created_at"),
                     "text_sha256": _short_hash(text, length=64),
                     "token_estimate": _token_estimate(text),
                     "start_char": start,
@@ -476,6 +497,7 @@ def _build_report(
             "conversations": len(parsed.conversations),
             "messages": len(parsed.messages),
             "chunks": len(parsed.chunks),
+            "candidate_memories": len(parsed.candidate_memories),
             "attachments": len(parsed.attachments),
             "errors": 0,
         },
@@ -483,6 +505,7 @@ def _build_report(
             str(parsed_dir / "conversations.jsonl"),
             str(parsed_dir / "messages.jsonl"),
             str(parsed_dir / "chunks.jsonl"),
+            str(parsed_dir / "candidate_memories.jsonl"),
             str(parsed_dir / "attachments.jsonl"),
             str(parsed_dir / "import_report.json"),
             str(sqlite_path),
@@ -497,13 +520,19 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _find_conversation_files(input_path: Path) -> list[Path]:
-    if input_path.is_file() and input_path.name == "conversations.json":
+    if input_path.is_file() and input_path.name.startswith("conversations") and input_path.suffix == ".json":
         return [input_path]
     if input_path.is_dir():
         direct = input_path / "conversations.json"
         if direct.exists():
             return [direct]
-        return sorted(input_path.rglob("conversations.json"))
+        files = sorted(
+            path
+            for path in input_path.rglob("*.json")
+            if path.is_file() and path.name.startswith("conversations") and path.suffix == ".json"
+        )
+        if files:
+            return files
     return []
 
 

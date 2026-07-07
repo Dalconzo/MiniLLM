@@ -7,7 +7,8 @@ from typing import Any
 
 from .audit import record_retrieval_event, retrieval_exposures_for_run
 from .chatgpt_ingest import import_chatgpt_export
-from .curated import promote_chunk_to_memory_record
+from .candidates import list_candidate_memories
+from .curated import create_memory_record, promote_chunk_to_memory_record
 from .search import search_chatgpt_memory
 from .subjects import assign_conversation_subject
 
@@ -24,8 +25,8 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
     exact = search_chatgpt_memory(memory_dir=memory_dir, query="barcode parser")
     checks.append(_check("exact_search", exact["count"] >= 1, {"count": exact["count"]}))
 
-    secret = search_chatgpt_memory(memory_dir=memory_dir, query="credential")
-    snippet = secret["results"][0]["snippet"] if secret["results"] else ""
+    secret = search_chatgpt_memory(memory_dir=memory_dir, query="credential", depth="full")
+    snippet = secret["results"][0].get("snippet", "") if secret["results"] else ""
     checks.append(
         _check(
             "redaction",
@@ -41,6 +42,21 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
         assign_conversation_subject(connection, conversation_id, "Lab Automation", include_chunks=True)
     subject = search_chatgpt_memory(memory_dir=memory_dir, query="barcode", subject="Lab Automation")
     checks.append(_check("subject_filter", subject["count"] >= 1, {"count": subject["count"]}))
+
+    with sqlite3.connect(db_path) as connection:
+        candidates = list_candidate_memories(connection)
+    assistant = next(candidate for candidate in candidates if candidate.assistant_suggestion)
+    user = next(candidate for candidate in candidates if not candidate.assistant_suggestion)
+    checks.append(
+        _check(
+            "assistant_user_separation",
+            assistant.assistant_suggestion and not user.assistant_suggestion and assistant.review_status == "pending",
+            {
+                "assistant": assistant.to_dict(),
+                "user": user.to_dict(),
+            },
+        )
+    )
 
     with sqlite3.connect(db_path) as connection:
         chunk_id = connection.execute(
@@ -59,6 +75,49 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
             "curated_retrieval",
             any(item["source_kind"] == "curated_memory" for item in curated["results"]),
             {"record_id": record.id, "count": curated["count"]},
+        )
+    )
+
+    effort_one = search_chatgpt_memory(memory_dir=memory_dir, query="barcode parser", depth="full", effort=1)
+    checks.append(
+        _check(
+            "effort_tier_cap",
+            effort_one["results"] and effort_one["results"][0]["disclosure_tier"] == "far",
+            {
+                "disclosure_tier": effort_one["results"][0]["disclosure_tier"] if effort_one["results"] else None,
+                "lenses": effort_one.get("lenses", []),
+            },
+        )
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Portfolio rebalancing notes",
+            body="Rebalance index funds monthly and document the rationale.",
+            trust_level="canonical",
+        )
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Old portfolio note",
+            body="This should no longer surface in high-risk search.",
+            trust_level="low",
+            status="stale",
+        )
+    high_risk = search_chatgpt_memory(memory_dir=memory_dir, query="portfolio", depth="full", effort=4)
+    checks.append(
+        _check(
+            "high_risk_governance",
+            high_risk["governance"]["high_risk"]
+            and "financial_caution" in high_risk["governance"]["labels"]
+            and len(high_risk["results"]) == 1
+            and high_risk["results"][0]["governance_reason"] == "high_risk_allowed",
+            {
+                "governance": high_risk["governance"],
+                "count": high_risk["count"],
+            },
         )
     )
 

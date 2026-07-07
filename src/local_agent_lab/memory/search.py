@@ -7,9 +7,20 @@ from typing import Any
 
 from .audit import blocked_source_ids, init_audit_schema
 from .curated import init_curated_memory_schema
+from .domain_scoping import (
+    apply_governance_policy,
+    classify_text_domains,
+    detect_query_domains,
+    dominant_domain,
+    high_risk_domains,
+    high_risk_lenses,
+    scope_candidate_domains,
+    select_lenses_for_query,
+)
 from .observability import MemoryObservationError, memory_db_path
 from .privacy import redact_obvious_secrets
 from .ranking import rank_memory_hits
+from .subjects import normalize_subject_slug
 
 
 def search_chatgpt_memory(
@@ -24,6 +35,8 @@ def search_chatgpt_memory(
     exclude_source_ids: list[str] | None = None,
     exclude_subjects: list[str] | None = None,
     depth: str = "medium",
+    effort: int = 2,
+    allow_cross_domain: bool = False,
 ) -> dict[str, Any]:
     sqlite_path = memory_db_path(memory_dir)
     if not sqlite_path.exists():
@@ -47,6 +60,7 @@ def search_chatgpt_memory(
         connection.row_factory = sqlite3.Row
         init_audit_schema(connection)
         filters_applied: list[dict[str, Any]] = []
+        query_domains = detect_query_domains(query)
         where = [
             "chatgpt_chunks_fts MATCH ?",
             "message_chunks.is_deleted = 0",
@@ -64,12 +78,6 @@ def search_chatgpt_memory(
             params.extend(excluded_ids)
             params.extend(excluded_ids)
             filters_applied.append({"field": "exclude_source", "value": excluded_ids})
-        joins = [
-            "JOIN message_chunks ON message_chunks.id = chatgpt_chunks_fts.chunk_id",
-            "JOIN messages ON messages.id = chatgpt_chunks_fts.message_id",
-            "JOIN conversations ON conversations.id = chatgpt_chunks_fts.conversation_id",
-        ]
-
         if title:
             where.append("conversations.title LIKE ?")
             params.append(f"%{title}%")
@@ -84,14 +92,28 @@ def search_chatgpt_memory(
             filters_applied.append({"field": "date_to", "value": date_to})
         if subject:
             if _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
-                joins.extend(
-                    [
-                        "JOIN chunk_subjects ON chunk_subjects.chunk_id = message_chunks.id",
-                        "JOIN subjects ON subjects.id = chunk_subjects.subject_id",
-                    ]
+                where.append(
+                    """
+                    (
+                        EXISTS (
+                            SELECT 1
+                            FROM chunk_subjects
+                            JOIN subjects ON subjects.id = chunk_subjects.subject_id
+                            WHERE chunk_subjects.chunk_id = message_chunks.id
+                              AND (subjects.slug = ? OR subjects.name LIKE ?)
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM conversation_subjects
+                            JOIN subjects ON subjects.id = conversation_subjects.subject_id
+                            WHERE conversation_subjects.conversation_id = conversations.id
+                              AND (subjects.slug = ? OR subjects.name LIKE ?)
+                        )
+                    )
+                    """
                 )
-                where.append("(subjects.slug = ? OR subjects.name LIKE ?)")
-                params.extend([_slug(subject), f"%{subject}%"])
+                subject_slug = normalize_subject_slug(subject)
+                params.extend([subject_slug, f"%{subject}%", subject_slug, f"%{subject}%"])
                 filters_applied.append({"field": "subject", "value": subject})
             else:
                 return _empty_result(
@@ -108,7 +130,7 @@ def search_chatgpt_memory(
                 )
         if exclude_subjects:
             if _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
-                subject_slugs = [_slug(item) for item in exclude_subjects]
+                subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
                 placeholders = ", ".join("?" for _ in subject_slugs)
                 where.append(
                     f"""
@@ -120,8 +142,17 @@ def search_chatgpt_memory(
                         WHERE excluded_chunk_subjects.chunk_id = message_chunks.id
                           AND excluded_subjects.slug IN ({placeholders})
                     )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM conversation_subjects excluded_conversation_subjects
+                        JOIN subjects excluded_subjects
+                          ON excluded_subjects.id = excluded_conversation_subjects.subject_id
+                        WHERE excluded_conversation_subjects.conversation_id = conversations.id
+                          AND excluded_subjects.slug IN ({placeholders})
+                    )
                     """
                 )
+                params.extend(subject_slugs)
                 params.extend(subject_slugs)
             filters_applied.append({"field": "exclude_subject", "value": exclude_subjects})
 
@@ -140,7 +171,9 @@ def search_chatgpt_memory(
                 bm25(chatgpt_chunks_fts) AS bm25_score,
                 snippet(chatgpt_chunks_fts, 2, '[', ']', '...', 24) AS snippet
             FROM chatgpt_chunks_fts
-            {' '.join(joins)}
+            JOIN message_chunks ON message_chunks.id = chatgpt_chunks_fts.chunk_id
+            JOIN messages ON messages.id = chatgpt_chunks_fts.message_id
+            JOIN conversations ON conversations.id = chatgpt_chunks_fts.conversation_id
             WHERE {' AND '.join(where)}
             ORDER BY bm25_score ASC
             LIMIT ?
@@ -153,19 +186,77 @@ def search_chatgpt_memory(
             query=query,
             subject=subject,
             exclude_source_ids=excluded_ids,
+            exclude_subjects=exclude_subjects,
+            title=title,
+            date_from=date_from,
+            date_to=date_to,
             limit=limit,
         )
 
-    results = rank_memory_hits([*fts_results, *curated_results], depth=depth)[:limit]
-    return {
-        "status": "ok",
-        "query": query,
-        "ranking_profile": "hybrid_memory_v1",
-        "candidate_counts": {
-            "fts": len(fts_results),
-            "vector": 0,
-            "curated": len(curated_results),
-            "after_filters": len(results),
+        scoped_results = []
+        for hit in [*fts_results, *curated_results]:
+            hit_domains = classify_text_domains(
+                hit.get("title"),
+                hit.get("snippet"),
+                hit.get("role"),
+            )
+            allowed, relation = scope_candidate_domains(
+                query_domains,
+                hit_domains,
+                effort=effort,
+                allow_cross_domain=allow_cross_domain,
+            )
+            if not allowed:
+                continue
+            governance_allowed, governance_reason, governance_labels = apply_governance_policy(
+                query_domains,
+                hit_domains,
+                effort=effort,
+                allow_cross_domain=allow_cross_domain,
+                candidate_status=str(hit.get("status") or "") or None,
+                candidate_trust_level=str(hit.get("trust_level") or "") or None,
+                source_role=str(hit.get("source_role") or hit.get("role") or "") or None,
+                domain_relation=relation,
+            )
+            if not governance_allowed:
+                continue
+            scoped_hit = dict(hit)
+            scoped_hit["domains"] = hit_domains
+            scoped_hit["domain_primary"] = dominant_domain(hit_domains)
+            scoped_hit["domain_relation"] = relation
+            scoped_hit["domain_reason"] = "query_domain_match" if relation in {"primary", "broad"} else relation
+            scoped_hit["governance_reason"] = governance_reason
+            scoped_hit["governance_labels"] = governance_labels
+            scoped_results.append(scoped_hit)
+
+        effective_depth = _effort_depth_cap(depth, effort)
+        results = rank_memory_hits(scoped_results, depth=effective_depth)[:limit]
+        results = [_project_hit_for_depth(result) for result in results]
+        lenses = select_lenses_for_query(query_domains, effort)
+        results = [_attach_effort_checks(result, effort=effort, query=query, query_domains=query_domains) for result in results]
+        return {
+            "status": "ok",
+            "query": query,
+            "ranking_profile": "hybrid_memory_v1",
+            "domain_detection": {
+                "primary_domain": dominant_domain(query_domains),
+                "domains": query_domains,
+                "effort": effort,
+                "allow_cross_domain": allow_cross_domain,
+                "policy": "heuristic_domain_scoping_v1",
+            },
+            "lenses": lenses,
+            "governance": {
+                "high_risk": bool(high_risk_domains(query_domains)),
+                "domains": high_risk_domains(query_domains),
+                "labels": high_risk_lenses(query_domains),
+                "policy": "conservative_high_risk_v1" if high_risk_domains(query_domains) else "standard_v1",
+            },
+            "candidate_counts": {
+                "fts": len(fts_results),
+                "vector": 0,
+                "curated": len(curated_results),
+                "after_filters": len(results),
         },
         "filters_applied": filters_applied,
         "results": results,
@@ -176,6 +267,7 @@ def search_chatgpt_memory(
 def _row_to_hit(rank: int, row: sqlite3.Row) -> dict[str, Any]:
     score = float(row["bm25_score"])
     redacted = redact_obvious_secrets(row["snippet"] or "")
+    source_role = row["role"]
     return {
         "rank": rank,
         "score": score,
@@ -192,8 +284,13 @@ def _row_to_hit(rank: int, row: sqlite3.Row) -> dict[str, Any]:
         "source_conversation_id": row["source_conversation_id"],
         "message_id": row["message_id"],
         "chunk_id": row["chunk_id"],
-        "title": row["title"],
-        "role": row["role"],
+        "title": redact_obvious_secrets(row["title"] or "").text,
+        "role": source_role,
+        "source_role": source_role,
+        "epistemic_status": "assistant_suggested" if source_role == "assistant" else "user_reported",
+        "confidence_basis": "assistant_suggestion_only" if source_role == "assistant" else "single_user_statement",
+        "status": None,
+        "trust_level": None,
         "turn_index": row["turn_index"],
         "chunk_index": row["chunk_index"],
         "message_created_at": row["message_created_at"],
@@ -208,6 +305,10 @@ def _curated_hits(
     query: str,
     subject: str | None,
     exclude_source_ids: list[str],
+    exclude_subjects: list[str] | None,
+    title: str | None,
+    date_from: str | None,
+    date_to: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
     if not _table_exists(connection, "memory_records"):
@@ -224,9 +325,30 @@ def _curated_hits(
         token_clauses.append("(memory_records.title LIKE ? OR memory_records.body LIKE ?)")
         params.extend([f"%{token}%", f"%{token}%"])
     where.append(f"({' OR '.join(token_clauses)})")
+    if title:
+        where.append("memory_records.title LIKE ?")
+        params.append(f"%{title}%")
+    if date_from:
+        where.append("COALESCE(memory_records.valid_from, memory_records.updated_at, memory_records.created_at, '') >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("COALESCE(memory_records.valid_from, memory_records.updated_at, memory_records.created_at, '') <= ?")
+        params.append(date_to)
     if exclude_source_ids:
         placeholders = ", ".join("?" for _ in exclude_source_ids)
-        where.append(f"memory_records.id NOT IN ({placeholders})")
+        where.append(f"(memory_records.source_ref IS NULL OR memory_records.source_ref NOT IN ({placeholders}))")
+        params.extend(exclude_source_ids)
+        where.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM memory_links blocked_links
+                WHERE blocked_links.from_kind = 'memory_record'
+                  AND blocked_links.from_id = memory_records.id
+                  AND blocked_links.to_id IN ({placeholders})
+            )
+            """
+        )
         params.extend(exclude_source_ids)
     if subject and _table_exists(connection, "subjects"):
         where.append(
@@ -236,13 +358,24 @@ def _curated_hits(
             )
             """
         )
-        params.extend([_slug(subject), f"%{subject}%"])
+        params.extend([normalize_subject_slug(subject), f"%{subject}%"])
+    if exclude_subjects and _table_exists(connection, "subjects"):
+        subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
+        placeholders = ", ".join("?" for _ in subject_slugs)
+        where.append(
+            f"""
+            (memory_records.subject_id IS NULL OR memory_records.subject_id NOT IN (
+                SELECT id FROM subjects WHERE slug IN ({placeholders})
+            ))
+            """
+        )
+        params.extend(subject_slugs)
 
     rows = connection.execute(
         f"""
         SELECT
             id, record_type, title, body, subject_id, trust_level,
-            source_kind, source_ref, updated_at
+            source_kind, source_ref, status, updated_at
         FROM memory_records
         WHERE {' AND '.join(where)}
         ORDER BY updated_at DESC, title COLLATE NOCASE ASC
@@ -269,15 +402,20 @@ def _curated_hits(
                 "source_conversation_id": None,
                 "message_id": None,
                 "chunk_id": row[0],
-                "title": row[2],
+                "title": redact_obvious_secrets(str(row[2]) or "").text,
                 "role": row[1],
-                "turn_index": None,
-                "chunk_index": None,
-                "message_created_at": row[8],
-                "snippet": redacted.text,
-                "redacted_secret_count": redacted.redacted_count,
-                "curated_trust": trust_scores.get(trust_level, 0.5),
-            }
+                "source_role": None,
+                "epistemic_status": "confirmed" if trust_level in {"canonical", "high"} else "user_reported",
+                    "confidence_basis": "multiple_sources_agree" if trust_level == "canonical" else "single_user_statement",
+                    "status": row[8],
+                    "trust_level": trust_level,
+                    "turn_index": None,
+                    "chunk_index": None,
+                    "message_created_at": row[9],
+                    "snippet": redacted.text,
+                    "redacted_secret_count": redacted.redacted_count,
+                    "curated_trust": trust_scores.get(trust_level, 0.5),
+                }
         )
     return hits
 
@@ -299,6 +437,36 @@ def _empty_result(*, query: str, ranking_profile: str, filters_applied: list[dic
     }
 
 
+def _project_hit_for_depth(hit: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(hit)
+    exposed_fields = set(projected.get("exposed_fields", []))
+    if "snippet" not in exposed_fields:
+        projected.pop("snippet", None)
+    if "role" not in exposed_fields:
+        projected.pop("role", None)
+    if "chunk_text" not in exposed_fields:
+        projected.pop("chunk_text", None)
+    if "nearby_turn_refs" not in exposed_fields:
+        projected.pop("nearby_turn_refs", None)
+    if "conversation_window" not in exposed_fields:
+        projected.pop("conversation_window", None)
+    if "related_curated_memories" not in exposed_fields:
+        projected.pop("related_curated_memories", None)
+    projected["title"] = redact_obvious_secrets(str(projected.get("title") or "")).text
+    return projected
+
+
+def _attach_effort_checks(hit: dict[str, Any], *, effort: int, query: str, query_domains: list[str]) -> dict[str, Any]:
+    projected = dict(hit)
+    validation_checks = {
+        "temporal": {"status": "not_run" if effort < 4 else _temporal_status(projected)},
+        "contradiction": {"status": "not_run" if effort < 4 else _contradiction_status(projected, query, query_domains)},
+    }
+    projected["validation_checks"] = validation_checks
+    projected["effort"] = effort
+    return projected
+
+
 def _fts_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]*", query)
     return " ".join(f'"{token.replace(chr(34), chr(34) + chr(34))}"' for token in tokens)
@@ -313,4 +481,36 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
 
 
 def _slug(value: str) -> str:
-    return "-".join(re.findall(r"[a-z0-9]+", value.lower()))
+    return normalize_subject_slug(value)
+
+
+def _effort_depth_cap(depth: str, effort: int) -> str:
+    effort_depth = {
+        1: "far",
+        2: "medium",
+        3: "close",
+    }.get(effort, "full")
+    tiers = ("far", "medium", "close", "full")
+    return tiers[min(tiers.index(depth), tiers.index(effort_depth))]
+
+
+def _temporal_status(hit: dict[str, Any]) -> str:
+    status = str(hit.get("status") or "").lower()
+    if status in {"stale", "superseded", "archived", "deleted"}:
+        return status
+    valid_to = hit.get("valid_to")
+    if valid_to:
+        return "stale"
+    return "current"
+
+
+def _contradiction_status(hit: dict[str, Any], query: str, query_domains: list[str]) -> str:
+    text = " ".join(str(hit.get(field) or "") for field in ("title", "snippet", "role")).lower()
+    query_text = query.lower()
+    if any(token in text for token in ("not ", "never", "instead", "avoid", "failed", "wrong", "contradict")) and any(
+        token in query_text for token in ("not", "avoid", "should", "wrong", "fail")
+    ):
+        return "possible"
+    if query_domains and hit.get("domain_relation") in {"transfer", "analogy"}:
+        return "review"
+    return "not_detected"

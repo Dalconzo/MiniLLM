@@ -48,10 +48,11 @@ def _import_memory(tmp_path):
 def test_search_redacts_obvious_secrets_from_snippets(tmp_path) -> None:
     memory_dir = _import_memory(tmp_path)
 
-    result = search_chatgpt_memory(memory_dir=memory_dir, query="credential")
+    result = search_chatgpt_memory(memory_dir=memory_dir, query="credential", depth="full")
 
     assert result["count"] == 1
-    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in result["results"][0]["snippet"]
+    snippet = result["results"][0].get("snippet", "")
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in snippet
     assert result["results"][0]["redacted_secret_count"] == 1
 
 

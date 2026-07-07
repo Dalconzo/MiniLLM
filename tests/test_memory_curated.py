@@ -4,6 +4,8 @@ import sqlite3
 import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
+from local_agent_lab.memory.audit import tombstone_source
+from local_agent_lab.memory.candidates import list_candidate_memories
 from local_agent_lab.memory.curated import (
     create_memory_link,
     create_memory_record,
@@ -17,6 +19,7 @@ from local_agent_lab.memory.curated import (
     trust_level_options,
     update_memory_record_status,
 )
+from local_agent_lab.memory.observability import MemoryObservationError
 from local_agent_lab.memory.subjects import init_subject_schema, upsert_subject
 
 
@@ -88,6 +91,7 @@ def test_curated_schema_creates_contract_tables(memory_connection) -> None:
 
     assert "memory_records" in tables
     assert "memory_links" in tables
+    assert "candidate_memories" in tables
     assert memory_connection.execute(
         "SELECT COUNT(*) FROM schema_migrations WHERE name = 'chatgpt_memory_curated_records'"
     ).fetchone()[0] == 1
@@ -143,6 +147,8 @@ def test_promote_chunk_to_record_captures_provenance_and_links(memory_connection
     assert record.body == "Use the lab automation parser module."
     assert record.provenance["source"]["chunk_id"] == chunk_id
     assert record.provenance["source"]["conversation_title"] == "Plate reader workflow"
+    assert record.provenance["source_monitoring"]["epistemic_status"] == "assistant_suggested"
+    assert record.provenance["source_monitoring"]["confidence_basis"] == "assistant_suggestion_only"
     assert record.metadata == {"reviewed": True}
 
     links = list_memory_links(memory_connection, from_kind="memory_record", from_id=record.id)
@@ -232,3 +238,40 @@ def test_curated_helpers_validate_enums_and_missing_chunks(memory_connection) ->
             "missing-chunk",
             record_type="lesson",
         )
+
+
+def test_promote_chunk_to_record_refuses_tombstoned_sources(memory_connection) -> None:
+    chunk_id = memory_connection.execute(
+        "SELECT id FROM message_chunks WHERE text LIKE '%parser module%'"
+    ).fetchone()[0]
+
+    tombstone_source(memory_connection, source_kind="chatgpt_export", source_id=chunk_id, reason="private")
+
+    with pytest.raises(MemoryObservationError, match="source has been tombstoned"):
+        promote_chunk_to_memory_record(
+            memory_connection,
+            chunk_id,
+            record_type="lesson",
+        )
+
+
+def test_candidate_memories_are_extracted_but_not_promoted(memory_connection) -> None:
+    candidates = list_candidate_memories(memory_connection)
+
+    assert len(candidates) == 2
+    assistant = next(candidate for candidate in candidates if candidate.assistant_suggestion)
+    user = next(candidate for candidate in candidates if not candidate.assistant_suggestion)
+
+    assert assistant.review_status == "pending"
+    assert assistant.memory_type == "assistant_suggestion"
+    assert assistant.reason_type == "assistant_suggestion"
+    assert assistant.source_kind == "chatgpt_export"
+    assert assistant.source_ref.startswith("chk_")
+    assert assistant.valid_from is not None
+    assert assistant.valid_to is None
+    assert assistant.last_confirmed_at is None
+    assert assistant.domains
+
+    assert user.review_status == "pending"
+    assert user.memory_type != "assistant_suggestion"
+    assert user.source_kind == "chatgpt_export"

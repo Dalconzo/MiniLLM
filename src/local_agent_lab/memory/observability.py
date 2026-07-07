@@ -153,6 +153,92 @@ def validate_memory_state(*, data_dir: Path, memory_dir: Path) -> dict[str, Any]
     }
 
 
+def summarize_memory_status(*, data_dir: Path, memory_dir: Path, logs_dir: Path, recent_limit: int = 5) -> dict[str, Any]:
+    report = validate_memory_state(data_dir=data_dir, memory_dir=memory_dir)
+    sqlite_path = memory_db_path(memory_dir)
+
+    sqlite_summary: dict[str, Any] = {
+        "exists": sqlite_path.exists(),
+        "counts": {},
+        "latest_import": None,
+    }
+    if sqlite_path.exists():
+        with sqlite3.connect(sqlite_path) as connection:
+            sqlite_summary["counts"] = _sqlite_counts(connection)
+            latest_import = connection.execute(
+                """
+                SELECT id, source_root, raw_manifest_path, imported_at, status, parser_version,
+                       file_count, conversation_count, message_count, chunk_count, attachment_count, content_sha256, notes
+                FROM imports
+                ORDER BY imported_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_import:
+                sqlite_summary["latest_import"] = {
+                    "id": latest_import[0],
+                    "source_root": latest_import[1],
+                    "raw_manifest_path": latest_import[2],
+                    "imported_at": latest_import[3],
+                    "status": latest_import[4],
+                    "parser_version": latest_import[5],
+                    "file_count": latest_import[6],
+                    "conversation_count": latest_import[7],
+                    "message_count": latest_import[8],
+                    "chunk_count": latest_import[9],
+                    "attachment_count": latest_import[10],
+                    "content_sha256": latest_import[11],
+                    "notes": latest_import[12],
+                    "candidate_memory_count": _count_candidates_for_import(connection, latest_import[0]),
+                }
+
+    recent_runs = list_recent_runs(logs_dir, limit=recent_limit)
+    return {
+        "status": report["status"],
+        "checked_at": report["checked_at"],
+        "data_dir": str(data_dir),
+        "memory_dir": str(memory_dir),
+        "logs_dir": str(logs_dir),
+        "validation": report,
+        "sqlite": sqlite_summary,
+        "recent_runs": recent_runs,
+    }
+
+
+def list_recent_runs(logs_dir: Path, *, limit: int = 5) -> list[dict[str, Any]]:
+    if not logs_dir.exists():
+        return []
+
+    runs: list[dict[str, Any]] = []
+    for run_dir in logs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        command_path = run_dir / "command.json"
+        if not command_path.exists():
+            continue
+        try:
+            command = _read_json(command_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        runs.append(
+            {
+                "run_id": command.get("run_id", run_dir.name),
+                "command": command.get("command"),
+                "status": command.get("status"),
+                "started_at": command.get("started_at"),
+                "finished_at": command.get("finished_at"),
+                "artifact_dir": command.get("artifact_dir", str(run_dir)),
+                "artifact_count": len(command.get("output_paths", []) or []),
+                "error": command.get("error"),
+            }
+        )
+
+    def sort_key(item: dict[str, Any]) -> tuple[str, str]:
+        return (str(item.get("finished_at") or item.get("started_at") or ""), str(item.get("run_id") or ""))
+
+    return sorted(runs, key=sort_key, reverse=True)[:limit]
+
+
 def dry_run_chatgpt_ingest(input_path: Path) -> dict[str, Any]:
     if not input_path.exists():
         raise MemoryObservationError(
@@ -314,6 +400,39 @@ def _check_path(checks: list[dict[str, Any]], name: str, path: Path, *, required
         checks.append({"name": name, "status": "error", "message": "Required path is missing.", "path": str(path)})
     else:
         checks.append({"name": name, "status": "warn", "message": "Path does not exist yet.", "path": str(path)})
+
+
+def _sqlite_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table in (
+        "imports",
+        "conversations",
+        "messages",
+        "message_chunks",
+        "candidate_memories",
+        "memory_records",
+        "subjects",
+        "retrieval_events",
+        "retrieval_exposures",
+        "chunk_embeddings",
+    ):
+        try:
+            counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        except sqlite3.Error:
+            counts[table] = 0
+    return counts
+
+
+def _count_candidates_for_import(connection: sqlite3.Connection, import_id: str) -> int:
+    try:
+        return int(
+            connection.execute(
+                "SELECT COUNT(*) FROM candidate_memories WHERE import_id = ?",
+                (import_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
 
 
 def _validate_sqlite(sqlite_path: Path) -> list[dict[str, Any]]:

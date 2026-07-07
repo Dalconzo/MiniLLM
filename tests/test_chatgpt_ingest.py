@@ -57,10 +57,14 @@ def test_parse_chatgpt_export_normalizes_conversations_messages_and_chunks(tmp_p
     assert parsed.import_record["conversation_count"] == 1
     assert parsed.import_record["message_count"] == 2
     assert parsed.import_record["chunk_count"] == 2
+    assert parsed.import_record["candidate_memory_count"] == 2
     assert parsed.conversations[0]["title"] == "Plate reader workflow"
     assert parsed.messages[0]["role"] == "user"
     assert parsed.messages[1]["role"] == "assistant"
     assert parsed.chunks[0]["source_kind"] == "chatgpt_export"
+    assert parsed.candidate_memories[1]["assistant_suggestion"] == 1
+    assert parsed.candidate_memories[1]["review_status"] == "pending"
+    assert parsed.candidate_memories[1]["source_ref"].startswith("chk_")
 
 
 def test_import_chatgpt_export_writes_jsonl_sqlite_and_fts(tmp_path) -> None:
@@ -76,6 +80,7 @@ def test_import_chatgpt_export_writes_jsonl_sqlite_and_fts(tmp_path) -> None:
     assert (parsed_dir / "conversations.jsonl").exists()
     assert (parsed_dir / "messages.jsonl").exists()
     assert (parsed_dir / "chunks.jsonl").exists()
+    assert (parsed_dir / "candidate_memories.jsonl").exists()
     assert (parsed_dir / "import_report.json").exists()
 
     with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
@@ -83,6 +88,7 @@ def test_import_chatgpt_export_writes_jsonl_sqlite_and_fts(tmp_path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM message_chunks").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM candidate_memories").fetchone()[0] == 2
         hits = connection.execute(
             """
             SELECT COUNT(*)
@@ -106,3 +112,4 @@ def test_import_chatgpt_export_is_idempotent_for_same_export(tmp_path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM chatgpt_chunks_fts").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM candidate_memories").fetchone()[0] == 2

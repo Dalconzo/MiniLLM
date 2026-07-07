@@ -706,10 +706,33 @@ def serve_home_mcp(server: HomeMCPServer, *, host: str = "127.0.0.1", port: int 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path == "/health":
-                self._json_response(200, {"status": "ok", "server": "home-mcp", "roots": server.list_allowed_roots()})
+            if parsed.path in {"/", "/health", "/mcp"}:
+                self._json_response(
+                    200,
+                    {
+                        "status": "ok",
+                        "server": "home-mcp",
+                        "endpoint": "/mcp",
+                        "authentication": {
+                            "mode": server.auth_mode,
+                            "tokenRequired": server.auth_mode == "bearer",
+                            "proxyHandled": server.auth_mode == "oauth",
+                        },
+                        "roots": server.list_allowed_roots(),
+                    },
+                )
                 return
             self._json_response(404, {"error": "not_found"})
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path in {"/", "/health", "/mcp"}:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

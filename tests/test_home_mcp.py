@@ -130,7 +130,16 @@ def test_home_mcp_http_health_and_rpc_round_trip(tmp_path) -> None:
     httpd = serve_home_mcp(server, host="127.0.0.1", port=0)
     try:
         port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["status"] == "ok"
+        assert payload["endpoint"] == "/mcp"
+
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["status"] == "ok"
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/mcp") as response:
             payload = json.loads(response.read().decode("utf-8"))
         assert payload["status"] == "ok"
 

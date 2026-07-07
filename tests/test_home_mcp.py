@@ -158,6 +158,26 @@ def test_home_mcp_http_health_and_rpc_round_trip(tmp_path) -> None:
         httpd.server_close()
 
 
+def test_home_mcp_serves_oauth_metadata_endpoints(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+    httpd = serve_home_mcp(server, host="127.0.0.1", port=0)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/.well-known/oauth-protected-resource/mcp") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["resource"].startswith("http://127.0.0.1:")
+        assert payload["authorization_servers"] == []
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/.well-known/oauth-authorization-server") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["issuer"] == "https://openai.invalid/no-auth"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_home_mcp_bearer_auth_blocks_and_allows(tmp_path) -> None:
     config_path = _write_config(tmp_path, extra_home_mcp={"auth_mode": "bearer", "auth_token": "secret"})
     config = load_config(config_path)

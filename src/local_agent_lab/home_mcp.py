@@ -28,6 +28,8 @@ TEXT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log"}
 MAX_FILE_BYTES = 128_000
 MAX_SEARCH_FILES = 250
 HOME_MCP_AUTH_MODES = {"none", "bearer", "oauth", "mixed"}
+HOME_MCP_OAUTH_RESOURCE_PATHS = {"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"}
+HOME_MCP_OAUTH_AUTH_SERVER_PATHS = {"/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"}
 
 
 class HomeMCPError(RuntimeError):
@@ -153,6 +155,26 @@ class HomeMCPServer:
         self.auth_mode = normalized_auth_mode
         self.auth_token = auth_token.strip() if auth_token else None
         self.logger = RunLogger(self.config.logs_dir / "home_mcp")
+
+    def oauth_protected_resource_metadata(self, *, request_url: str | None = None) -> dict[str, Any]:
+        resource = request_url.rstrip("/") if request_url else "http://127.0.0.1:8765"
+        return {
+            "resource": resource,
+            "authorization_servers": [],
+            "scopes_supported": [],
+            "resource_documentation": "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
+        }
+
+    def oauth_authorization_server_metadata(self) -> dict[str, Any]:
+        return {
+            "issuer": "https://openai.invalid/no-auth",
+            "authorization_endpoint": "",
+            "token_endpoint": "",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": [],
+        }
 
     @classmethod
     def from_config(
@@ -704,11 +726,24 @@ class HomeMCPServer:
 
 def serve_home_mcp(server: HomeMCPServer, *, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
+        def _metadata_request_url(self) -> str:
+            scheme = self.headers.get("X-Forwarded-Proto", "http")
+            host_header = self.headers.get("Host") or f"{host}:{port}"
+            return f"{scheme}://{host_header}"
+
+        def _json_public(self, payload: dict[str, Any], *, status_code: int = 200) -> None:
+            body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path in {"/", "/health", "/mcp"}:
-                self._json_response(
-                    200,
+                self._json_public(
                     {
                         "status": "ok",
                         "server": "home-mcp",
@@ -719,14 +754,20 @@ def serve_home_mcp(server: HomeMCPServer, *, host: str = "127.0.0.1", port: int 
                             "proxyHandled": server.auth_mode == "oauth",
                         },
                         "roots": server.list_allowed_roots(),
-                    },
+                    }
                 )
                 return
-            self._json_response(404, {"error": "not_found"})
+            if parsed.path in HOME_MCP_OAUTH_RESOURCE_PATHS:
+                self._json_public(server.oauth_protected_resource_metadata(request_url=self._metadata_request_url()))
+                return
+            if parsed.path in HOME_MCP_OAUTH_AUTH_SERVER_PATHS:
+                self._json_public(server.oauth_authorization_server_metadata())
+                return
+            self._json_public({"error": "not_found"}, status_code=404)
 
         def do_HEAD(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path in {"/", "/health", "/mcp"}:
+            if parsed.path in {"/", "/health", "/mcp"} | HOME_MCP_OAUTH_RESOURCE_PATHS | HOME_MCP_OAUTH_AUTH_SERVER_PATHS:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

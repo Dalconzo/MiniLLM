@@ -22,11 +22,12 @@ DEFAULT_HOME_MCP_ROOTS = {
     "household": ("household", True, "Household notes and checklists"),
     "projects": ("projects", True, "Project notes and planning"),
     "inbox": ("inbox", True, "Quick capture and scratch notes"),
-    "archive": ("archive", True, "Read-only archive space"),
+    "archive": ("archive", False, "Read-only archive space"),
 }
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log"}
 MAX_FILE_BYTES = 128_000
 MAX_SEARCH_FILES = 250
+HOME_MCP_AUTH_MODES = {"none", "bearer", "oauth", "mixed"}
 
 
 class HomeMCPError(RuntimeError):
@@ -131,6 +132,7 @@ class HomeMCPServer:
         config: AppConfig,
         base_dir: Path,
         root_specs: list[RootSpec],
+        auth_mode: str = "none",
         auth_token: str | None = None,
     ) -> None:
         self.config = config
@@ -140,18 +142,35 @@ class HomeMCPServer:
         for root in self.root_specs:
             root.path.mkdir(parents=True, exist_ok=True)
         self.roots_by_id = {root.id: root for root in self.root_specs}
+        normalized_auth_mode = auth_mode.strip().lower()
+        if normalized_auth_mode not in HOME_MCP_AUTH_MODES:
+            raise HomeMCPError(
+                f"unsupported auth mode: {auth_mode}",
+                stage="config",
+                error_code="unsupported_auth_mode",
+                source_ref=auth_mode,
+            )
+        self.auth_mode = normalized_auth_mode
         self.auth_token = auth_token.strip() if auth_token else None
         self.logger = RunLogger(self.config.logs_dir / "home_mcp")
 
     @classmethod
-    def from_config(cls, config: AppConfig, *, auth_token: str | None = None) -> "HomeMCPServer":
+    def from_config(
+        cls,
+        config: AppConfig,
+        *,
+        auth_mode: str | None = None,
+        auth_token: str | None = None,
+    ) -> "HomeMCPServer":
         raw = config.raw.get("home_mcp", {}) if isinstance(config.raw.get("home_mcp", {}), dict) else {}
         base_dir_value = raw.get("base_dir", DEFAULT_HOME_MCP_BASE_DIR)
         base_dir = _resolve_path(config.root_dir, base_dir_value)
         roots_payload = raw.get("allowed_roots")
         root_specs = _build_root_specs(base_dir, roots_payload if isinstance(roots_payload, dict) else None)
+        auth_mode_value = auth_mode if auth_mode is not None else raw.get("auth_mode") or os.environ.get("LAGENT_HOME_MCP_AUTH_MODE") or "none"
+        auth_mode_value = str(auth_mode_value)
         token = auth_token if auth_token is not None else raw.get("auth_token") or os.environ.get("LAGENT_HOME_MCP_TOKEN")
-        return cls(config=config, base_dir=base_dir, root_specs=root_specs, auth_token=token)
+        return cls(config=config, base_dir=base_dir, root_specs=root_specs, auth_mode=auth_mode_value, auth_token=token)
 
     def list_allowed_roots(self) -> dict[str, Any]:
         return {
@@ -502,6 +521,11 @@ class HomeMCPServer:
                     "serverInfo": {"name": "home-mcp", "version": "0.1.0"},
                     "capabilities": {"tools": {}, "logging": {}},
                     "instructions": "Use the allowlisted roots only. Read, search, and create notes via tools.",
+                    "authentication": {
+                        "mode": self.auth_mode,
+                        "tokenRequired": self.auth_mode in {"bearer"},
+                        "proxyHandled": self.auth_mode == "oauth",
+                    },
                     "roots": self.list_allowed_roots(),
                 }
                 response = _jsonrpc_ok(request_id, result)
@@ -692,12 +716,15 @@ def serve_home_mcp(server: HomeMCPServer, *, host: str = "127.0.0.1", port: int 
             if parsed.path != "/mcp":
                 self._json_response(404, {"error": "not_found"})
                 return
-            if server.auth_token is not None:
-                header = self.headers.get("Authorization", "")
-                expected = f"Bearer {server.auth_token}"
-                if header != expected:
+            if server.auth_mode == "bearer":
+                if not _matches_bearer_auth(self.headers.get("Authorization", ""), server.auth_token):
                     self._json_response(401, {"error": "unauthorized"})
                     return
+            elif server.auth_mode == "mixed":
+                if server.auth_token and not _matches_bearer_auth(self.headers.get("Authorization", ""), server.auth_token):
+                    # Mixed mode allows unauthenticated access for the connector path but still
+                    # accepts a bearer token when an admin client presents one.
+                    pass
             content_length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(content_length)
             try:
@@ -725,8 +752,13 @@ def serve_home_mcp(server: HomeMCPServer, *, host: str = "127.0.0.1", port: int 
     return httpd
 
 
-def build_home_mcp_server(config: AppConfig, *, auth_token: str | None = None) -> HomeMCPServer:
-    return HomeMCPServer.from_config(config, auth_token=auth_token)
+def build_home_mcp_server(
+    config: AppConfig,
+    *,
+    auth_mode: str | None = None,
+    auth_token: str | None = None,
+) -> HomeMCPServer:
+    return HomeMCPServer.from_config(config, auth_mode=auth_mode, auth_token=auth_token)
 
 
 def _build_root_specs(base_dir: Path, roots_payload: dict[str, Any] | None = None) -> list[RootSpec]:
@@ -861,6 +893,12 @@ def _format_tool_result(result: dict[str, Any]) -> dict[str, Any]:
         "isError": result.get("status") == "error",
         "structuredContent": result,
     }
+
+
+def _matches_bearer_auth(header_value: str, token: str | None) -> bool:
+    if not token:
+        return False
+    return header_value == f"Bearer {token}"
 
 
 def _jsonrpc_ok(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:

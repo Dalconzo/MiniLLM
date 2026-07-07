@@ -3293,13 +3293,14 @@ def _comma_values(value: str | None) -> list[str]:
 def home_mcp_serve(
     host: str = typer.Option("127.0.0.1", "--host", help="Host to bind the MCP HTTP server to."),
     port: int = typer.Option(8765, "--port", min=1, max=65535, help="Port to bind the MCP HTTP server to."),
+    auth_mode: str = typer.Option("none", "--auth-mode", help="Auth mode for POST /mcp: none, bearer, oauth, or mixed."),
     auth_token: str | None = typer.Option(None, "--auth-token", help="Optional bearer token required for POST /mcp."),
 ) -> None:
     """Serve the narrow home-mcp JSON-RPC surface over HTTP."""
     config, _client, logger = _client_and_logger()
-    run = logger.start("home-mcp:serve", {"host": host, "port": port, "auth_token": bool(auth_token)})
+    run = logger.start("home-mcp:serve", {"host": host, "port": port, "auth_mode": auth_mode, "auth_token": bool(auth_token)})
     try:
-        server = build_home_mcp_server(config, auth_token=auth_token)
+        server = build_home_mcp_server(config, auth_mode=auth_mode, auth_token=auth_token)
         logger.write_artifact(run, "home_mcp_roots.json", json.dumps(server.list_allowed_roots(), indent=2, sort_keys=True))
         httpd = serve_home_mcp(server, host=host, port=port)
         typer.echo(f"home-mcp serving on http://{host}:{port}/mcp")

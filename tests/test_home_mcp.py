@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -137,6 +138,37 @@ def test_home_mcp_http_health_and_rpc_round_trip(tmp_path) -> None:
             f"http://127.0.0.1:{port}/mcp",
             data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "roots/list", "params": {}}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["result"]["roots"]
+        initialize = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}})
+        assert initialize["result"]["authentication"]["mode"] == "none"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_home_mcp_bearer_auth_blocks_and_allows(tmp_path) -> None:
+    config_path = _write_config(tmp_path, extra_home_mcp={"auth_mode": "bearer", "auth_token": "secret"})
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+    httpd = serve_home_mcp(server, host="127.0.0.1", port=0)
+    try:
+        port = httpd.server_address[1]
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/mcp",
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "roots/list", "params": {}}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(request)
+        assert exc_info.value.code == 401
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/mcp",
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "roots/list", "params": {}}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer secret"},
         )
         with urllib.request.urlopen(request) as response:
             payload = json.loads(response.read().decode("utf-8"))

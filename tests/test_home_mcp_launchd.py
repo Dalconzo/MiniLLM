@@ -36,9 +36,30 @@ def _write_config(tmp_path: Path) -> Path:
     return config_path
 
 
-def test_home_mcp_launchd_plists_include_expected_programs(tmp_path) -> None:
+def test_home_mcp_launchd_plists_include_expected_programs(tmp_path, monkeypatch) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)
+
+    from local_agent_lab.services import home_mcp_launchd as launchd_mod
+
+    monkeypatch.setattr(launchd_mod.Path, "home", lambda: tmp_path)
+    profile_dir = tmp_path / ".config" / "tunnel-client"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "home-mcp.yaml").write_text(
+        "\n".join(
+            [
+                "config_version: 1",
+                "control_plane:",
+                '  tunnel_id: "tunnel_123"',
+                '  api_key: "env:CONTROL_PLANE_API_KEY"',
+                "mcp:",
+                '  server_urls:',
+                '    - channel: main',
+                '      url: "http://127.0.0.1:8765/mcp"',
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     home_plist = build_home_mcp_launchd_plist(config, auth_mode="none")
     assert home_plist["Label"] == HOME_MCP_HOME_LABEL
@@ -50,6 +71,11 @@ def test_home_mcp_launchd_plists_include_expected_programs(tmp_path) -> None:
     assert tunnel_plist["Label"] == HOME_MCP_TUNNEL_LABEL
     assert tunnel_plist["ProgramArguments"] == ["/bin/bash", str(config.root_dir / "scripts" / "home_mcp_tunnel.sh")]
     assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_PORT"] == "8765"
+    assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_TUNNEL_PROFILE"] == "home-mcp"
+    assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_TUNNEL_CLIENT_ENV_FILE"].endswith(
+        ".config/tunnel-client/home-mcp.env"
+    )
+    assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_TUNNEL_ID"] == "tunnel_123"
     assert tunnel_plist["KeepAlive"] is True
 
 
@@ -57,7 +83,11 @@ def test_home_mcp_launchd_plist_derives_https_resource_url(tmp_path, monkeypatch
     config_path = _write_config(tmp_path)
     config = load_config(config_path)
 
-    profile_dir = Path.home() / ".config" / "tunnel-client"
+    from local_agent_lab.services import home_mcp_launchd as launchd_mod
+
+    monkeypatch.setattr(launchd_mod.Path, "home", lambda: tmp_path)
+
+    profile_dir = tmp_path / ".config" / "tunnel-client"
     profile_dir.mkdir(parents=True, exist_ok=True)
     profile_path = profile_dir / "home-mcp.yaml"
     profile_path.write_text(
@@ -96,3 +126,16 @@ def test_home_mcp_launchd_plist_round_trip_and_tunnel_url(tmp_path) -> None:
     url_file.parent.mkdir(parents=True, exist_ok=True)
     url_file.write_text("https://example.trycloudflare.com\n", encoding="utf-8")
     assert read_home_mcp_tunnel_url(config) == "https://example.trycloudflare.com"
+
+
+def test_home_mcp_tunnel_client_env_file_is_written(tmp_path, monkeypatch) -> None:
+    from local_agent_lab.services import home_mcp_launchd as launchd_mod
+
+    monkeypatch.setattr(launchd_mod.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("CONTROL_PLANE_API_KEY", "sk-test-key")
+
+    env_file = launchd_mod.write_home_mcp_tunnel_client_env_file()
+    assert env_file is not None
+    assert env_file.exists()
+    assert "export CONTROL_PLANE_API_KEY=sk-test-key" in env_file.read_text(encoding="utf-8")
+    assert (env_file.stat().st_mode & 0o777) == 0o600

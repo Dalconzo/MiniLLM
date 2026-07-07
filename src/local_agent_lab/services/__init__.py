@@ -5,7 +5,7 @@ from .home_mcp_launchd import (
     build_home_mcp_tunnel_launchd_plist,
     install_home_mcp_launchd,
     read_home_mcp_tunnel_url,
+    write_home_mcp_tunnel_client_env_file,
     uninstall_home_mcp_launchd,
     write_plist_file,
 )
-

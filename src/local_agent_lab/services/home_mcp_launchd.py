@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import plistlib
 import subprocess
+import shlex
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,6 +110,29 @@ def _detect_tunnel_id(config: AppConfig) -> str | None:
     return None
 
 
+def _tunnel_client_env_file() -> Path:
+    return Path.home() / ".config" / "tunnel-client" / "home-mcp.env"
+
+
+def _format_shell_assignment(name: str, value: str) -> str:
+    return f"export {name}={shlex.quote(value)}"
+
+
+def write_home_mcp_tunnel_client_env_file(*, tunnel_api_key: str | None = None) -> Path | None:
+    key = tunnel_api_key or os.environ.get("CONTROL_PLANE_API_KEY")
+    if not key:
+        return None
+    env_file = _tunnel_client_env_file()
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("\n".join([
+        "# Managed by local-agent-lab home-mcp install-service.",
+        _format_shell_assignment("CONTROL_PLANE_API_KEY", key),
+        "",
+    ]), encoding="utf-8")
+    env_file.chmod(0o600)
+    return env_file
+
+
 def build_home_mcp_tunnel_launchd_plist(
     config: AppConfig,
     *,
@@ -116,19 +141,25 @@ def build_home_mcp_tunnel_launchd_plist(
 ) -> dict[str, Any]:
     script_path = tunnel_script or (config.root_dir / "scripts" / "home_mcp_tunnel.sh")
     logs_dir = config.logs_dir
+    tunnel_id = _detect_tunnel_id(config)
+    env = {
+        "HOME_MCP_ROOT": str(config.root_dir),
+        "HOME_MCP_TUNNEL_URL_FILE": str(config.root_dir / HOME_MCP_TUNNEL_URL_FILE),
+        "HOME_MCP_TUNNEL_LOG_FILE": str(config.root_dir / HOME_MCP_TUNNEL_LOG_FILE),
+        "HOME_MCP_TUNNEL_CLIENT_ENV_FILE": str(_tunnel_client_env_file()),
+        "HOME_MCP_TUNNEL_PROFILE": "home-mcp",
+        "HOME_MCP_PORT": "8765",
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    }
+    if tunnel_id:
+        env["HOME_MCP_TUNNEL_ID"] = tunnel_id
     return _plist_base(
         ["/bin/bash", str(script_path)],
         label=label,
         working_directory=config.root_dir,
         stdout_path=logs_dir / "home_mcp_tunnel.stdout.log",
         stderr_path=logs_dir / "home_mcp_tunnel.stderr.log",
-        environment={
-            "HOME_MCP_ROOT": str(config.root_dir),
-            "HOME_MCP_TUNNEL_URL_FILE": str(config.root_dir / HOME_MCP_TUNNEL_URL_FILE),
-            "HOME_MCP_TUNNEL_LOG_FILE": str(config.root_dir / HOME_MCP_TUNNEL_LOG_FILE),
-            "HOME_MCP_PORT": "8765",
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        },
+        environment=env,
     )
 
 
@@ -167,6 +198,14 @@ def install_home_mcp_launchd(
 
     tunnel_plist: Path | None = None
     if with_tunnel:
+        env_file = write_home_mcp_tunnel_client_env_file()
+        if env_file is None:
+            existing = _tunnel_client_env_file()
+            if not existing.exists():
+                raise RuntimeError(
+                    "CONTROL_PLANE_API_KEY is required to install the home-mcp tunnel client "
+                    f"or pre-create {existing}"
+                )
         tunnel_plist = launch_agents / f"{HOME_MCP_TUNNEL_LABEL}.plist"
         tunnel_payload = build_home_mcp_tunnel_launchd_plist(config)
         write_plist_file(tunnel_plist, tunnel_payload)

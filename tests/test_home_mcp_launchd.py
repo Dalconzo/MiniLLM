@@ -75,6 +75,7 @@ def test_home_mcp_launchd_plists_include_expected_programs(tmp_path, monkeypatch
     assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_TUNNEL_CLIENT_ENV_FILE"].endswith(
         ".config/tunnel-client/home-mcp.env"
     )
+    assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_TUNNEL_CLIENT_BIN"].endswith("/bin/tunnel-client")
     assert tunnel_plist["EnvironmentVariables"]["HOME_MCP_TUNNEL_ID"] == "tunnel_123"
     assert tunnel_plist["KeepAlive"] is True
 

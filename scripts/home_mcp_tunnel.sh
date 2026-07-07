@@ -8,6 +8,7 @@ URL_FILE="${HOME_MCP_TUNNEL_URL_FILE:-$ROOT_DIR/data/home_mcp/current_tunnel_url
 LOG_FILE="${HOME_MCP_TUNNEL_LOG_FILE:-$ROOT_DIR/data/logs/home_mcp_tunnel.log}"
 ENV_FILE="${HOME_MCP_TUNNEL_CLIENT_ENV_FILE:-$HOME/.config/tunnel-client/home-mcp.env}"
 TUNNEL_ID="${HOME_MCP_TUNNEL_ID:-}"
+TUNNEL_CLIENT_BIN="${HOME_MCP_TUNNEL_CLIENT_BIN:-$HOME/bin/tunnel-client}"
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
 mkdir -p "$(dirname "$URL_FILE")" "$(dirname "$LOG_FILE")"
@@ -36,8 +37,8 @@ if [[ -z "${CONTROL_PLANE_API_KEY:-}" ]]; then
   exit 1
 fi
 
-if ! command -v tunnel-client >/dev/null 2>&1; then
-  echo "tunnel-client is not installed or not on PATH" >&2
+if [[ ! -x "$TUNNEL_CLIENT_BIN" ]]; then
+  echo "tunnel-client is not installed or not executable at $TUNNEL_CLIENT_BIN" >&2
   exit 1
 fi
 
@@ -49,4 +50,4 @@ fi
 printf 'https://api.openai.com/v1/tunnel/%s\n' "$TUNNEL_ID" > "$URL_FILE"
 : > "$LOG_FILE"
 
-exec tunnel-client run --profile "$PROFILE" >>"$LOG_FILE" 2>&1
+exec "$TUNNEL_CLIENT_BIN" run --profile "$PROFILE" >>"$LOG_FILE" 2>&1

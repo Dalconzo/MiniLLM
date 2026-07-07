@@ -147,6 +147,7 @@ def build_home_mcp_tunnel_launchd_plist(
         "HOME_MCP_TUNNEL_URL_FILE": str(config.root_dir / HOME_MCP_TUNNEL_URL_FILE),
         "HOME_MCP_TUNNEL_LOG_FILE": str(config.root_dir / HOME_MCP_TUNNEL_LOG_FILE),
         "HOME_MCP_TUNNEL_CLIENT_ENV_FILE": str(_tunnel_client_env_file()),
+        "HOME_MCP_TUNNEL_CLIENT_BIN": str(Path.home() / "bin" / "tunnel-client"),
         "HOME_MCP_TUNNEL_PROFILE": "home-mcp",
         "HOME_MCP_PORT": "8765",
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",

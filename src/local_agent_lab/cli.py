@@ -4,6 +4,7 @@ import json
 import html
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -80,6 +81,13 @@ from .memory.observability import (
 from .memory.search import search_chatgpt_memory
 from .memory.subjects import assign_conversation_subject, init_subject_schema, list_subjects, normalize_subject_slug
 from .home_mcp import HomeMCPError, build_home_mcp_server, serve_home_mcp
+from .services.home_mcp_launchd import (
+    HOME_MCP_HOME_LABEL,
+    HOME_MCP_TUNNEL_LABEL,
+    install_home_mcp_launchd,
+    read_home_mcp_tunnel_url,
+    uninstall_home_mcp_launchd,
+)
 from .tools.file_tools import redact_text
 from .tools.git_tools import changed_files_from_diff, git_diff
 from .tools.patches import PatchFile, apply_files, build_unified_patch, patch_filename
@@ -3506,6 +3514,112 @@ def home_mcp_append_recipe_attempt(
             ),
         }
         logger.write_artifact(run, "home_mcp_append_recipe_attempt.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("install-service")
+def home_mcp_install_service(
+    auth_mode: str = typer.Option("none", "--auth-mode", help="Auth mode for the home-mcp service."),
+    auth_token: str | None = typer.Option(None, "--auth-token", help="Optional bearer token for the service."),
+    no_tunnel: bool = typer.Option(False, "--no-tunnel", help="Install only the local launchd agent, not the tunnel."),
+) -> None:
+    """Install and start the home-mcp launchd services."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:install-service", {"auth_mode": auth_mode, "no_tunnel": no_tunnel})
+    try:
+        result = install_home_mcp_launchd(config, auth_mode=auth_mode, auth_token=auth_token, with_tunnel=not no_tunnel)
+        payload = {
+            "run_id": run.run_id,
+            "status": "ok",
+            "home_plist": str(result.home_plist),
+            "tunnel_plist": str(result.tunnel_plist) if result.tunnel_plist else None,
+            "launched": result.launched,
+        }
+        logger.write_artifact(run, "home_mcp_install_service.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("uninstall-service")
+def home_mcp_uninstall_service(
+    no_tunnel: bool = typer.Option(False, "--no-tunnel", help="Only remove the local launchd agent."),
+) -> None:
+    """Stop and remove the home-mcp launchd services."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:uninstall-service", {"no_tunnel": no_tunnel})
+    try:
+        removed = uninstall_home_mcp_launchd(with_tunnel=not no_tunnel)
+        payload = {
+            "run_id": run.run_id,
+            "status": "ok",
+            "removed": removed,
+            "tunnel_url": read_home_mcp_tunnel_url(config),
+        }
+        logger.write_artifact(run, "home_mcp_uninstall_service.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("service-status")
+def home_mcp_service_status() -> None:
+    """Show launchd and tunnel status for home-mcp."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:service-status", {})
+    uid = subprocess.check_output(["id", "-u"], text=True).strip()
+    domain = f"gui/{uid}"
+    home_output = subprocess.run(
+        ["launchctl", "print", f"{domain}/{HOME_MCP_HOME_LABEL}"],
+        text=True,
+        capture_output=True,
+    )
+    tunnel_output = subprocess.run(
+        ["launchctl", "print", f"{domain}/{HOME_MCP_TUNNEL_LABEL}"],
+        text=True,
+        capture_output=True,
+    )
+    health = subprocess.run(
+        ["curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8765/health"],
+        text=True,
+        capture_output=True,
+    )
+    payload = {
+        "run_id": run.run_id,
+        "status": "ok",
+        "home_mcp_loaded": home_output.returncode == 0,
+        "tunnel_loaded": tunnel_output.returncode == 0,
+        "health_ok": health.returncode == 0,
+        "tunnel_url": read_home_mcp_tunnel_url(config),
+        "home_mcp_launchd_stdout": home_output.stdout[-2000:],
+        "home_mcp_launchd_stderr": home_output.stderr[-2000:],
+        "tunnel_launchd_stdout": tunnel_output.stdout[-2000:],
+        "tunnel_launchd_stderr": tunnel_output.stderr[-2000:],
+    }
+    logger.write_artifact(run, "home_mcp_service_status.json", json.dumps(payload, indent=2, sort_keys=True))
+    logger.finish(run, status="ok", result=payload)
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+@home_mcp_app.command("service-url")
+def home_mcp_service_url() -> None:
+    """Print the current Cloudflare tunnel URL, if one is recorded."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:service-url", {})
+    try:
+        payload = {"run_id": run.run_id, "tunnel_url": read_home_mcp_tunnel_url(config)}
+        logger.write_artifact(run, "home_mcp_service_url.json", json.dumps(payload, indent=2, sort_keys=True))
         logger.finish(run, status="ok", result=payload)
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     except Exception as exc:

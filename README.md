@@ -36,6 +36,9 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent home-mcp roots`
 - `lagent home-mcp serve --host 127.0.0.1 --port 8765 --auth-mode none`
 - `lagent home-mcp create-recipe --title "..." --body "..."`
+- `lagent home-mcp install-service`
+- `lagent home-mcp service-status`
+- `lagent home-mcp service-url`
 - Structured run logging under `data/logs/`
 - Patch artifacts under `data/patches/`
 - Initial routing labels for local-vs-frontier expectations
@@ -82,3 +85,4 @@ lagent memory-check
 - Every CLI run writes a JSONL event plus per-run artifacts in `data/logs/`.
 - `lagent review --diff` requires the target repo to be an actual git checkout with `.git` metadata present.
 - `home-mcp` exposes only allowlisted roots and is intended to be tunneled or relayed, not opened directly to the public internet. Supported auth modes are `none`, `bearer`, `oauth` (proxy-handled), and `mixed`.
+- `lagent home-mcp install-service` installs launchd agents for the local server and the Cloudflare tunnel on macOS. The current tunnel URL is recorded in `data/home_mcp/current_tunnel_url.txt`.

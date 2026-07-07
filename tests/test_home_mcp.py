@@ -91,6 +91,40 @@ def test_home_mcp_creates_recipe_notes_and_appends_attempts(tmp_path) -> None:
     assert any(event["stage"] == "call_tool" for event in trace_events)
 
 
+def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    created = server.create_recipe_card(
+        title="Focaccia with Rosemary",
+        body="Ingredients:\n- flour\n- rosemary\n\nSteps:\n- mix\n- bake\n",
+        tags=["bread", "rosemary"],
+    )
+
+    search = server.search_recipes(query="rosemary", tags=["bread"], limit=5)
+    assert search["count"] == 1
+    result = search["results"][0]
+    assert result["file_id"] == created["file_id"]
+    assert result["title"] == "Focaccia with Rosemary"
+    assert "bread" in result["tags"]
+
+    rpc = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+    tools = rpc["result"]["tools"]
+    assert any(tool["name"] == "search_recipes" for tool in tools)
+    assert any(tool["name"] == "create_recipe_card" for tool in tools)
+
+    rpc_call = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "search_recipes", "arguments": {"query": "rosemary", "tags": ["bread"], "limit": 5}},
+        }
+    )
+    assert rpc_call["result"]["structuredContent"]["count"] == 1
+
+
 def test_home_mcp_searches_reads_and_dispatches_jsonrpc(tmp_path) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)

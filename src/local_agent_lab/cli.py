@@ -3389,6 +3389,30 @@ def home_mcp_search_files(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("search-recipes")
+def home_mcp_search_recipes(
+    query: str | None = typer.Option(None, "--query", help="Optional recipe query text."),
+    tags: str | None = typer.Option(None, "--tags", help="Comma-separated tag filters."),
+    limit: int = typer.Option(10, "--limit", min=1, max=100, help="Maximum hits to return."),
+) -> None:
+    """Search the recipe book for notes and attempts."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:search-recipes", {"query": query, "tags": tags, "limit": limit})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.search_recipes(query=query, tags=_comma_values(tags), limit=limit),
+        }
+        logger.write_artifact(run, "home_mcp_search_recipes.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("read-file")
 def home_mcp_read_file(
     file_id: str = typer.Option(..., "--file-id", help="File identifier in root_id:relative/path.md form."),
@@ -3482,6 +3506,30 @@ def home_mcp_create_recipe(
             **server.create_recipe(title=title, body=body, tags=_comma_values(tags)),
         }
         logger.write_artifact(run, "home_mcp_create_recipe.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("create-recipe-card")
+def home_mcp_create_recipe_card(
+    title: str = typer.Option(..., "--title", help="Recipe title."),
+    body: str = typer.Option(..., "--body", help="Recipe body."),
+    tags: str | None = typer.Option(None, "--tags", help="Comma-separated tags."),
+) -> None:
+    """Create a recipe card note in the recipe book root."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:create-recipe-card", {"title": title})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.create_recipe_card(title=title, body=body, tags=_comma_values(tags)),
+        }
+        logger.write_artifact(run, "home_mcp_create_recipe_card.json", json.dumps(payload, indent=2, sort_keys=True))
         logger.finish(run, status="ok", result=payload)
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     except Exception as exc:

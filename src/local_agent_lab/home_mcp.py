@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
+import yaml
+
 from .config import AppConfig
 from .logging.run_logger import RunContext, RunLogger
 from .tools.file_tools import redact_text
@@ -419,6 +421,92 @@ class HomeMCPServer:
             lines.append(f"Next time: {next_time}")
         return self.append_markdown_log(file_id=recipe_id, entry="\n".join(lines), tags=["recipe_attempt", *(tags or [])])
 
+    def create_recipe_card(
+        self,
+        *,
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.create_recipe(title=title, body=body, tags=tags, metadata=metadata)
+
+    def search_recipes(
+        self,
+        *,
+        query: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        root = self._get_root("recipe_book")
+        normalized_query = (query or "").strip().lower()
+        tag_filters = {str(item).strip().lower() for item in (tags or []) if str(item).strip()}
+        hits: list[dict[str, Any]] = []
+        for path in _iter_text_files(root.path, file_types=[".md"], limit=MAX_SEARCH_FILES):
+            if len(hits) >= limit:
+                break
+            try:
+                raw_text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            except OSError:
+                continue
+            metadata, body = _parse_markdown_document(raw_text)
+            card_tags = [str(item) for item in metadata.get("tags", [])] if isinstance(metadata.get("tags"), list) else []
+            card_tags_lower = {tag.lower() for tag in card_tags}
+            if tag_filters and not tag_filters.issubset(card_tags_lower):
+                continue
+            title = str(metadata.get("title") or path.stem).strip()
+            body_text = redact_text(body)
+            combined_text = " ".join([title, " ".join(card_tags), body_text, str(metadata.get("kind", "")), str(metadata.get("summary", ""))]).lower()
+            matched_terms = [term for term in re.split(r"\s+", normalized_query) if term] if normalized_query else []
+            matched_terms = [term for term in matched_terms if term in combined_text]
+            if normalized_query and not matched_terms and normalized_query not in combined_text:
+                continue
+            score = 0.0
+            if normalized_query:
+                score += len(matched_terms)
+                if normalized_query in title.lower():
+                    score += 4
+                if normalized_query in " ".join(card_tags).lower():
+                    score += 2
+                if normalized_query in body_text.lower():
+                    score += 1
+                if normalized_query in str(path.relative_to(root.path)).lower():
+                    score += 1
+            else:
+                try:
+                    score += path.stat().st_mtime / 1_000_000_000
+                except OSError:
+                    score += 0
+            snippet_source = body_text or title
+            snippet_term = matched_terms[0] if matched_terms else (normalized_query or title.lower())
+            hits.append(
+                {
+                    **_file_metadata(root, path.resolve()),
+                    "title": title,
+                    "kind": str(metadata.get("kind") or "recipe"),
+                    "tags": card_tags,
+                    "summary": str(metadata.get("summary") or "").strip() or None,
+                    "created_at": metadata.get("created_at"),
+                    "updated_at": metadata.get("updated_at"),
+                    "score": round(score, 3),
+                    "match_reason": "title" if normalized_query and normalized_query in title.lower() else "content" if normalized_query else "recent",
+                    "matched_terms": matched_terms,
+                    "snippet": _make_snippet(snippet_source, snippet_term),
+                }
+            )
+        hits.sort(key=lambda item: (-float(item["score"]), item["title"].lower(), item["relative_path"]))
+        hits = hits[:limit]
+        return {
+            "status": "ok",
+            "root_id": "recipe_book",
+            "query": query or "",
+            "tags": sorted(tag_filters),
+            "count": len(hits),
+            "results": hits,
+        }
+
     def tools(self) -> list[dict[str, Any]]:
         return [
             _tool_definition("list_allowed_roots", "List allowed roots exposed by the home-mcp server.", {"type": "object", "properties": {}, "additionalProperties": False}),
@@ -449,6 +537,19 @@ class HomeMCPServer:
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     },
                     "required": ["query"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "search_recipes",
+                "Search the recipe book for recipe notes and attempts.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
                     "additionalProperties": False,
                 },
             ),
@@ -504,6 +605,21 @@ class HomeMCPServer:
             _tool_definition(
                 "create_recipe",
                 "Create a recipe note in the recipe book.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["title", "body"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "create_recipe_card",
+                "Create a recipe card note in the recipe book.",
                 {
                     "type": "object",
                     "properties": {
@@ -628,6 +744,12 @@ class HomeMCPServer:
                 file_types=[str(item) for item in file_types] if isinstance(file_types, list) else None,
                 limit=int(arguments.get("limit", 10)),
             )
+        if name == "search_recipes":
+            return self.search_recipes(
+                query=str(arguments["query"]) if arguments.get("query") is not None else None,
+                tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
+                limit=int(arguments.get("limit", 10)),
+            )
         if name == "read_file":
             return self.read_file(
                 file_id=arguments.get("file_id"),
@@ -656,6 +778,13 @@ class HomeMCPServer:
             )
         if name == "create_recipe":
             return self.create_recipe(
+                title=str(arguments["title"]),
+                body=str(arguments["body"]),
+                tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
+                metadata=arguments.get("metadata") if isinstance(arguments.get("metadata"), dict) else None,
+            )
+        if name == "create_recipe_card":
+            return self.create_recipe_card(
                 title=str(arguments["title"]),
                 body=str(arguments["body"]),
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
@@ -936,6 +1065,28 @@ def _slugify(value: str) -> str:
 
 def _frontmatter(payload: dict[str, Any]) -> str:
     return "---\n" + json.dumps(payload, indent=2, sort_keys=True) + "\n---"
+
+
+def _parse_markdown_document(text: str) -> tuple[dict[str, Any], str]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    end_index = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_index = index
+            break
+    if end_index is None:
+        return {}, text
+    raw_metadata = "\n".join(lines[1:end_index]).strip()
+    try:
+        metadata = yaml.safe_load(raw_metadata) if raw_metadata else {}
+    except Exception:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    body = "\n".join(lines[end_index + 1 :])
+    return metadata, body
 
 
 def _make_snippet(text: str, term: str, width: int = 220) -> str:

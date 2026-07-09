@@ -2610,8 +2610,9 @@ def _render_memory_search(payload: dict[str, object]) -> str:
         f"Results: {payload['count']}",
     ]
     for result in payload["results"]:
+        role = result.get("role") or result.get("source_role") or result.get("record_type") or "unknown"
         lines.append(
-            f"{result['rank']}. {result['title']} [{result['role']}] "
+            f"{result['rank']}. {result['title']} [{role}] "
             f"{result['chunk_id']} score={result['score']:.4f}"
         )
         snippet = result.get("snippet")

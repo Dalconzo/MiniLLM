@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from local_agent_lab.config import load_config
+from local_agent_lab.cli import _render_memory_search
 from local_agent_lab.home_mcp import HomeMCPError, build_home_mcp_server, serve_home_mcp
 from local_agent_lab.memory.audit import init_audit_schema
 from local_agent_lab.memory.candidates import init_candidate_memory_schema
@@ -438,6 +439,29 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     bridged = server.bridge_recipe_note_to_memory(file_id=recipe["file_id"], subject="Cooking and Baking")
     assert bridged["memory_record"]["source_kind"] == "recipe_book"
     assert bridged["memory_record"]["source_ref"] == recipe["file_id"]
+
+
+def test_memory_search_renderer_handles_curated_results() -> None:
+    rendered = _render_memory_search(
+        {
+            "run_id": "run_test",
+            "count": 1,
+            "results": [
+                {
+                    "rank": 1,
+                    "title": "Smoke Test Focaccia",
+                    "role": None,
+                    "source_role": None,
+                    "record_type": "research_note",
+                    "chunk_id": "mem_123",
+                    "score": 1.25,
+                    "snippet": "Rosemary focaccia.",
+                }
+            ],
+        }
+    )
+    assert "Smoke Test Focaccia" in rendered
+    assert "[research_note]" in rendered
 
 
 def test_home_mcp_searches_reads_and_dispatches_jsonrpc(tmp_path) -> None:

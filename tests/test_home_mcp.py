@@ -113,6 +113,7 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
     tools = rpc["result"]["tools"]
     assert any(tool["name"] == "search_recipes" for tool in tools)
     assert any(tool["name"] == "create_recipe_card" for tool in tools)
+    assert any(tool["name"] == "draft_recipe_card" for tool in tools)
 
     rpc_call = server.dispatch_jsonrpc(
         {
@@ -123,6 +124,86 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
         }
     )
     assert rpc_call["result"]["structuredContent"]["count"] == 1
+
+
+def test_home_mcp_drafts_structured_recipe_cards(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    draft = server.draft_recipe_card(
+        source_text=(
+            "Focaccia with Rosemary\n"
+            "Ingredients:\n"
+            "- 500g flour\n"
+            "- 1 tbsp rosemary\n"
+            "\n"
+            "Instructions:\n"
+            "1. Mix the dough.\n"
+            "2. Bake until golden.\n"
+            "\n"
+            "Servings: 4\n"
+            "Prep time: 20 minutes\n"
+            "Cook time: 25 minutes\n"
+        )
+    )
+    structured = draft["draft"]
+    assert structured["title"] == "Focaccia with Rosemary"
+    assert structured["ingredients"] == ["500g flour", "1 tbsp rosemary"]
+    assert structured["steps"] == ["Mix the dough.", "Bake until golden."]
+    assert structured["servings"] == "4"
+    assert structured["prep_time"] == "20 minutes"
+    assert structured["cook_time"] == "25 minutes"
+    assert structured["confidence"] > 0.5
+    assert "Ingredients" in structured["body"]
+
+    rpc = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "draft_recipe_card",
+                "arguments": {"source_text": "Toast\nIngredients:\n- bread\nSteps:\n- toast\n"},
+            },
+        }
+    )
+    assert rpc["result"]["structuredContent"]["draft"]["ingredients"] == ["bread"]
+
+
+def test_home_mcp_creates_structured_recipe_cards(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    created = server.create_recipe_card(
+        title="Focaccia with Rosemary",
+        ingredients=["500g flour", "1 tbsp rosemary"],
+        steps=["Mix the dough.", "Bake until golden."],
+        servings="4",
+        prep_time="20 minutes",
+        cook_time="25 minutes",
+        summary="A simple rosemary focaccia.",
+        notes="Use a generous amount of olive oil.",
+        tags=["bread", "rosemary"],
+    )
+    recipe_path = Path(created["path"])
+    content = recipe_path.read_text(encoding="utf-8")
+    assert "## Ingredients" in content
+    assert "- 500g flour" in content
+    assert "## Steps" in content
+    assert "1. Mix the dough." in content
+    assert '"kind": "recipe_card"' in content
+
+    search = server.search_recipes(query="golden", tags=["bread"], limit=5)
+    assert search["count"] == 1
+    result = search["results"][0]
+    assert result["ingredients_count"] == 2
+    assert result["steps_count"] == 2
+    assert result["servings"] == "4"
+    assert result["prep_time"] == "20 minutes"
+    assert result["cook_time"] == "25 minutes"
+    assert result["recipe_summary"] == "2 ingredients, 2 steps, servings 4"
 
 
 def test_home_mcp_searches_reads_and_dispatches_jsonrpc(tmp_path) -> None:

@@ -3413,6 +3413,31 @@ def home_mcp_search_recipes(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("draft-recipe-card")
+def home_mcp_draft_recipe_card(
+    source_text: str | None = typer.Option(None, "--source-text", help="Source text to extract from."),
+    file_id: str | None = typer.Option(None, "--file-id", help="File identifier to extract from."),
+    title: str | None = typer.Option(None, "--title", help="Optional override title."),
+    query: str | None = typer.Option(None, "--query", help="Optional search query context."),
+) -> None:
+    """Draft a structured recipe card from source text or a source file."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:draft-recipe-card", {"file_id": file_id, "title": title, "query": query})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.draft_recipe_card(source_text=source_text, file_id=file_id, title=title, query=query),
+        }
+        logger.write_artifact(run, "home_mcp_draft_recipe_card.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("read-file")
 def home_mcp_read_file(
     file_id: str = typer.Option(..., "--file-id", help="File identifier in root_id:relative/path.md form."),
@@ -3517,7 +3542,17 @@ def home_mcp_create_recipe(
 @home_mcp_app.command("create-recipe-card")
 def home_mcp_create_recipe_card(
     title: str = typer.Option(..., "--title", help="Recipe title."),
-    body: str = typer.Option(..., "--body", help="Recipe body."),
+    body: str | None = typer.Option(None, "--body", help="Recipe body."),
+    ingredient: list[str] = typer.Option([], "--ingredient", help="Ingredient line. Repeat to add more."),
+    step: list[str] = typer.Option([], "--step", help="Recipe step. Repeat to add more."),
+    servings: str | None = typer.Option(None, "--servings", help="Servings or yield."),
+    prep_time: str | None = typer.Option(None, "--prep-time", help="Prep time."),
+    cook_time: str | None = typer.Option(None, "--cook-time", help="Cook time."),
+    total_time: str | None = typer.Option(None, "--total-time", help="Total time."),
+    notes: str | None = typer.Option(None, "--notes", help="Optional notes."),
+    source_file_id: str | None = typer.Option(None, "--source-file-id", help="Optional source file identifier."),
+    source_query: str | None = typer.Option(None, "--source-query", help="Optional source query."),
+    summary: str | None = typer.Option(None, "--summary", help="Optional summary."),
     tags: str | None = typer.Option(None, "--tags", help="Comma-separated tags."),
 ) -> None:
     """Create a recipe card note in the recipe book root."""
@@ -3527,7 +3562,21 @@ def home_mcp_create_recipe_card(
         server = build_home_mcp_server(config)
         payload = {
             "run_id": run.run_id,
-            **server.create_recipe_card(title=title, body=body, tags=_comma_values(tags)),
+            **server.create_recipe_card(
+                title=title,
+                body=body,
+                ingredients=ingredient or None,
+                steps=step or None,
+                servings=servings,
+                prep_time=prep_time,
+                cook_time=cook_time,
+                total_time=total_time,
+                notes=notes,
+                source_file_id=source_file_id,
+                source_query=source_query,
+                summary=summary,
+                tags=_comma_values(tags),
+            ),
         }
         logger.write_artifact(run, "home_mcp_create_recipe_card.json", json.dumps(payload, indent=2, sort_keys=True))
         logger.finish(run, status="ok", result=payload)

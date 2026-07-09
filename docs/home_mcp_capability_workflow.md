@@ -61,9 +61,10 @@ For high-risk capabilities, include the reason for rejection or refusal in the t
 If the capability is recipe-related, prefer this progression:
 
 1. search or list candidate notes
-2. review the source content
-3. create or append a structured recipe note
-4. promote useful results into the curated memory layer later
+2. draft a structured recipe card from the source text or file
+3. review the draft before writing anything durable
+4. create or append a structured recipe note
+5. promote useful results into the curated memory layer later
 
 Do not jump straight from raw transcript text to a permanent recipe record without review.
 
@@ -75,6 +76,7 @@ Do not jump straight from raw transcript text to a permanent recipe record witho
 - Verify the terminal command and the MCP tool stay in sync.
 - Confirm the tunnel or launchd path still works after the change.
 - Document the final operator command in `README.md` if needed.
+- Keep the structured recipe draft and recipe card schemas aligned.
 
 ## What To Avoid
 
@@ -83,4 +85,3 @@ Do not jump straight from raw transcript text to a permanent recipe record witho
 - Hidden side effects.
 - Untested prompts that write notes automatically.
 - New capability surfaces without trace coverage.
-

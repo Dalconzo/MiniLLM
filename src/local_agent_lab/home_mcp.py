@@ -405,6 +405,70 @@ class HomeMCPServer:
         result["recipe_id"] = result["file_id"]
         return result
 
+    def draft_recipe_card(
+        self,
+        *,
+        source_text: str | None = None,
+        file_id: str | None = None,
+        title: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        if not source_text and not file_id:
+            raise HomeMCPError(
+                "source_text or file_id is required",
+                stage="draft_recipe_card",
+                error_code="missing_source",
+            )
+        source_path: str | None = None
+        source_root_id: str | None = None
+        source_relative_path: str | None = None
+        if file_id:
+            read = self.read_file(file_id=file_id)
+            source_text = read["content"]
+            source_path = read["path"]
+            source_root_id = read["root_id"]
+            source_relative_path = read["relative_path"]
+            title = title or str(Path(read["relative_path"]).stem).replace("-", " ").replace("_", " ").strip().title()
+        source_text = source_text or ""
+        parsed = _extract_recipe_structure(source_text, title=title, query=query)
+        draft_title = parsed["title"]
+        body = _render_recipe_card_body(
+            draft_title,
+            ingredients=parsed["ingredients"],
+            steps=parsed["steps"],
+            servings=parsed["servings"],
+            prep_time=parsed["prep_time"],
+            cook_time=parsed["cook_time"],
+            total_time=parsed["total_time"],
+            notes=parsed["notes"],
+            summary=parsed["summary"],
+            source=query or file_id,
+        )
+        return {
+            "status": "ok",
+            "source": {
+                "file_id": file_id,
+                "path": source_path,
+                "root_id": source_root_id,
+                "relative_path": source_relative_path,
+                "query": query,
+            },
+            "draft": {
+                "title": draft_title,
+                "body": body,
+                "ingredients": parsed["ingredients"],
+                "steps": parsed["steps"],
+                "servings": parsed["servings"],
+                "prep_time": parsed["prep_time"],
+                "cook_time": parsed["cook_time"],
+                "total_time": parsed["total_time"],
+                "notes": parsed["notes"],
+                "summary": parsed["summary"],
+                "confidence": parsed["confidence"],
+                "tags": parsed["tags"],
+            },
+        }
+
     def append_recipe_attempt(
         self,
         *,
@@ -425,11 +489,79 @@ class HomeMCPServer:
         self,
         *,
         title: str,
-        body: str,
+        body: str | None = None,
+        ingredients: list[str] | None = None,
+        steps: list[str] | None = None,
+        servings: str | None = None,
+        prep_time: str | None = None,
+        cook_time: str | None = None,
+        total_time: str | None = None,
+        notes: str | None = None,
+        source_file_id: str | None = None,
+        source_query: str | None = None,
+        summary: str | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.create_recipe(title=title, body=body, tags=tags, metadata=metadata)
+        structured_fields_present = any(
+            value
+            for value in [
+                ingredients,
+                steps,
+                servings,
+                prep_time,
+                cook_time,
+                total_time,
+                notes,
+                source_file_id,
+                source_query,
+                summary,
+            ]
+        )
+        if body is None and not structured_fields_present:
+            raise HomeMCPError(
+                "body or structured recipe fields are required",
+                stage="create_recipe_card",
+                error_code="missing_recipe_content",
+            )
+        recipe_metadata = {
+            "kind": "recipe_card",
+            "recipe_card": {
+                "ingredients": ingredients or [],
+                "steps": steps or [],
+                "servings": servings,
+                "prep_time": prep_time,
+                "cook_time": cook_time,
+                "total_time": total_time,
+                "notes": notes,
+                "summary": summary,
+                "source_file_id": source_file_id,
+                "source_query": source_query,
+            },
+            **(metadata or {}),
+        }
+        recipe_body = body or _render_recipe_card_body(
+            title,
+            ingredients=ingredients or [],
+            steps=steps or [],
+            servings=servings,
+            prep_time=prep_time,
+            cook_time=cook_time,
+            total_time=total_time,
+            notes=notes,
+            summary=summary,
+            source=source_file_id or source_query,
+        )
+        result = self.create_markdown_note(
+            root_id="recipe_book",
+            folder="",
+            title=title,
+            body=recipe_body,
+            tags=["recipe", "recipe_card", *(tags or [])],
+            metadata=recipe_metadata,
+        )
+        result["recipe_id"] = result["file_id"]
+        return result
 
     def search_recipes(
         self,
@@ -458,6 +590,7 @@ class HomeMCPServer:
                 continue
             title = str(metadata.get("title") or path.stem).strip()
             body_text = redact_text(body)
+            recipe_structure = _extract_recipe_structure(body_text, title=title)
             combined_text = " ".join([title, " ".join(card_tags), body_text, str(metadata.get("kind", "")), str(metadata.get("summary", ""))]).lower()
             matched_terms = [term for term in re.split(r"\s+", normalized_query) if term] if normalized_query else []
             matched_terms = [term for term in matched_terms if term in combined_text]
@@ -490,6 +623,13 @@ class HomeMCPServer:
                     "summary": str(metadata.get("summary") or "").strip() or None,
                     "created_at": metadata.get("created_at"),
                     "updated_at": metadata.get("updated_at"),
+                    "ingredients_count": len(recipe_structure["ingredients"]),
+                    "steps_count": len(recipe_structure["steps"]),
+                    "servings": recipe_structure["servings"],
+                    "prep_time": recipe_structure["prep_time"],
+                    "cook_time": recipe_structure["cook_time"],
+                    "total_time": recipe_structure["total_time"],
+                    "recipe_summary": recipe_structure["summary"],
                     "score": round(score, 3),
                     "match_reason": "title" if normalized_query and normalized_query in title.lower() else "content" if normalized_query else "recent",
                     "matched_terms": matched_terms,
@@ -549,6 +689,20 @@ class HomeMCPServer:
                         "query": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "draft_recipe_card",
+                "Draft a structured recipe card from source text or a file.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "source_text": {"type": "string"},
+                        "file_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "query": {"type": "string"},
                     },
                     "additionalProperties": False,
                 },
@@ -625,10 +779,20 @@ class HomeMCPServer:
                     "properties": {
                         "title": {"type": "string"},
                         "body": {"type": "string"},
+                        "ingredients": {"type": "array", "items": {"type": "string"}},
+                        "steps": {"type": "array", "items": {"type": "string"}},
+                        "servings": {"type": "string"},
+                        "prep_time": {"type": "string"},
+                        "cook_time": {"type": "string"},
+                        "total_time": {"type": "string"},
+                        "notes": {"type": "string"},
+                        "source_file_id": {"type": "string"},
+                        "source_query": {"type": "string"},
+                        "summary": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "metadata": {"type": "object"},
                     },
-                    "required": ["title", "body"],
+                    "required": ["title"],
                     "additionalProperties": False,
                 },
             ),
@@ -750,6 +914,13 @@ class HomeMCPServer:
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
                 limit=int(arguments.get("limit", 10)),
             )
+        if name == "draft_recipe_card":
+            return self.draft_recipe_card(
+                source_text=str(arguments["source_text"]) if arguments.get("source_text") is not None else None,
+                file_id=str(arguments["file_id"]) if arguments.get("file_id") else None,
+                title=str(arguments["title"]) if arguments.get("title") else None,
+                query=str(arguments["query"]) if arguments.get("query") else None,
+            )
         if name == "read_file":
             return self.read_file(
                 file_id=arguments.get("file_id"),
@@ -786,7 +957,17 @@ class HomeMCPServer:
         if name == "create_recipe_card":
             return self.create_recipe_card(
                 title=str(arguments["title"]),
-                body=str(arguments["body"]),
+                body=str(arguments["body"]) if arguments.get("body") is not None else None,
+                ingredients=[str(item) for item in arguments.get("ingredients", [])] if isinstance(arguments.get("ingredients"), list) else None,
+                steps=[str(item) for item in arguments.get("steps", [])] if isinstance(arguments.get("steps"), list) else None,
+                servings=str(arguments["servings"]) if arguments.get("servings") else None,
+                prep_time=str(arguments["prep_time"]) if arguments.get("prep_time") else None,
+                cook_time=str(arguments["cook_time"]) if arguments.get("cook_time") else None,
+                total_time=str(arguments["total_time"]) if arguments.get("total_time") else None,
+                notes=str(arguments["notes"]) if arguments.get("notes") else None,
+                source_file_id=str(arguments["source_file_id"]) if arguments.get("source_file_id") else None,
+                source_query=str(arguments["source_query"]) if arguments.get("source_query") else None,
+                summary=str(arguments["summary"]) if arguments.get("summary") else None,
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
                 metadata=arguments.get("metadata") if isinstance(arguments.get("metadata"), dict) else None,
             )
@@ -1087,6 +1268,200 @@ def _parse_markdown_document(text: str) -> tuple[dict[str, Any], str]:
         metadata = {}
     body = "\n".join(lines[end_index + 1 :])
     return metadata, body
+
+
+def _extract_recipe_structure(text: str, *, title: str | None = None, query: str | None = None) -> dict[str, Any]:
+    lines = [line.rstrip() for line in text.splitlines()]
+    if not any(line.strip() for line in lines):
+        inferred_title = title or query or "Recipe"
+        return {
+            "title": inferred_title,
+            "ingredients": [],
+            "steps": [],
+            "servings": None,
+            "prep_time": None,
+            "cook_time": None,
+            "total_time": None,
+            "notes": "",
+            "summary": "",
+            "confidence": 0.0,
+            "tags": [],
+        }
+    section_map = {
+        "ingredients": "ingredients",
+        "ingredient": "ingredients",
+        "steps": "steps",
+        "step": "steps",
+        "directions": "steps",
+        "direction": "steps",
+        "instructions": "steps",
+        "method": "steps",
+        "notes": "notes",
+        "note": "notes",
+        "servings": "servings",
+        "yield": "servings",
+        "makes": "servings",
+        "prep time": "prep_time",
+        "preparation time": "prep_time",
+        "cook time": "cook_time",
+        "cooking time": "cook_time",
+        "total time": "total_time",
+    }
+    current_section = "notes"
+    sections: dict[str, list[str]] = {key: [] for key in {"ingredients", "steps", "notes"}}
+    scalar_fields: dict[str, str] = {}
+    inferred_title = title
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if current_section == "notes":
+                sections[current_section].append("")
+            continue
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading_match:
+            heading = heading_match.group(2).strip()
+            normalized = re.sub(r"[^a-z0-9]+", " ", heading.lower()).strip()
+            if normalized in section_map:
+                current_section = section_map[normalized]
+                if current_section not in sections and current_section not in {"servings", "prep_time", "cook_time", "total_time"}:
+                    sections[current_section] = []
+                continue
+            if inferred_title is None:
+                inferred_title = heading
+                continue
+        if inferred_title is None and raw_line == lines[0] and len(raw_line.split()) <= 16 and not raw_line.startswith(("-", "*", "1.")):
+            inferred_title = raw_line.strip("# ").strip()
+            continue
+        if line.endswith(":"):
+            normalized = re.sub(r"[^a-z0-9]+", " ", line[:-1].lower()).strip()
+            if normalized in section_map:
+                mapped = section_map[normalized]
+                if mapped in {"ingredients", "steps", "notes"}:
+                    current_section = mapped
+                    if current_section not in sections:
+                        sections[current_section] = []
+                    continue
+        if ":" in line:
+            key, value = [item.strip() for item in line.split(":", 1)]
+            normalized = re.sub(r"[^a-z0-9]+", " ", key.lower()).strip()
+            if normalized in section_map and section_map[normalized] not in {"ingredients", "steps", "notes"}:
+                scalar_fields[section_map[normalized]] = value
+                continue
+        if current_section in {"ingredients", "steps", "notes"}:
+            sections[current_section].append(raw_line.rstrip())
+        else:
+            sections.setdefault("notes", []).append(raw_line.rstrip())
+    inferred_title = inferred_title or title or query or "Recipe"
+    ingredients = _normalize_recipe_lines(sections.get("ingredients", []), bullet_prefixes=("-", "*"))
+    steps = _normalize_recipe_steps(sections.get("steps", []))
+    notes = "\n".join(line for line in sections.get("notes", []) if line.strip()).strip()
+    summary_bits: list[str] = []
+    if ingredients:
+        summary_bits.append(f"{len(ingredients)} ingredients")
+    if steps:
+        summary_bits.append(f"{len(steps)} steps")
+    if scalar_fields.get("servings"):
+        summary_bits.append(f"servings {scalar_fields['servings']}")
+    elif any(re.search(r"\b(serves|servings|yield|makes)\b", line.lower()) for line in lines):
+        summary_bits.append("servings noted")
+    summary = ", ".join(summary_bits)
+    tags: list[str] = []
+    if ingredients:
+        tags.append("ingredients")
+    if steps:
+        tags.append("instructions")
+    if summary:
+        tags.append("structured")
+    confidence = 0.2
+    if ingredients:
+        confidence += 0.3
+    if steps:
+        confidence += 0.3
+    if summary_bits:
+        confidence += 0.1
+    return {
+        "title": inferred_title,
+        "ingredients": ingredients,
+        "steps": steps,
+        "servings": scalar_fields.get("servings"),
+        "prep_time": scalar_fields.get("prep_time"),
+        "cook_time": scalar_fields.get("cook_time"),
+        "total_time": scalar_fields.get("total_time"),
+        "notes": notes,
+        "summary": summary,
+        "confidence": round(min(confidence, 0.98), 2),
+        "tags": tags,
+    }
+
+
+def _normalize_recipe_lines(lines: list[str], *, bullet_prefixes: tuple[str, ...]) -> list[str]:
+    items: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(bullet_prefixes):
+            line = line.lstrip("-*").strip()
+        if re.match(r"^\d+[\.\)]\s+", line):
+            line = re.sub(r"^\d+[\.\)]\s+", "", line).strip()
+        if line:
+            items.append(line)
+    return items
+
+
+def _normalize_recipe_steps(lines: list[str]) -> list[str]:
+    steps = _normalize_recipe_lines(lines, bullet_prefixes=("-", "*"))
+    if steps:
+        return steps
+    fallback = [line.strip() for line in lines if line.strip()]
+    return fallback
+
+
+def _render_recipe_card_body(
+    title: str,
+    *,
+    ingredients: list[str] | None = None,
+    steps: list[str] | None = None,
+    servings: str | None = None,
+    prep_time: str | None = None,
+    cook_time: str | None = None,
+    total_time: str | None = None,
+    notes: str | None = None,
+    summary: str | None = None,
+    source: str | None = None,
+) -> str:
+    lines: list[str] = [f"# {title}"]
+    if summary:
+        lines.append("")
+        lines.append(summary.strip())
+    if servings or prep_time or cook_time or total_time:
+        lines.append("")
+        lines.append("## Timing")
+        if servings:
+            lines.append(f"- Servings: {servings}")
+        if prep_time:
+            lines.append(f"- Prep time: {prep_time}")
+        if cook_time:
+            lines.append(f"- Cook time: {cook_time}")
+        if total_time:
+            lines.append(f"- Total time: {total_time}")
+    if ingredients:
+        lines.append("")
+        lines.append("## Ingredients")
+        lines.extend(f"- {item}" for item in ingredients if item.strip())
+    if steps:
+        lines.append("")
+        lines.append("## Steps")
+        lines.extend(f"{index + 1}. {item}" for index, item in enumerate(steps) if item.strip())
+    if notes:
+        lines.append("")
+        lines.append("## Notes")
+        lines.append(notes.strip())
+    if source:
+        lines.append("")
+        lines.append("## Source")
+        lines.append(str(source).strip())
+    return "\n".join(line for line in lines if line is not None).strip() + "\n"
 
 
 def _make_snippet(text: str, term: str, width: int = 220) -> str:

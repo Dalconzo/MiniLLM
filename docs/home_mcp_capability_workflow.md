@@ -68,6 +68,18 @@ If the capability is recipe-related, prefer this progression:
 
 Do not jump straight from raw transcript text to a permanent recipe record without review.
 
+## Memory Bridge Pattern
+
+If the capability needs to connect the recipe book back into the memory layer later:
+
+1. keep the recipe note workflow unchanged
+2. bridge a single recipe note into curated memory explicitly
+3. preserve the recipe note file as the source of truth
+4. store provenance that points back to the recipe file
+5. verify the bridged record is searchable before widening the bridge
+
+This bridge should remain optional and explicit. The recipe book must still be usable on its own.
+
 ## New Capability Checklist
 
 - Add or update the bead that describes the work.

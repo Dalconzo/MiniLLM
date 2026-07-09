@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -9,6 +10,12 @@ import pytest
 
 from local_agent_lab.config import load_config
 from local_agent_lab.home_mcp import HomeMCPError, build_home_mcp_server, serve_home_mcp
+from local_agent_lab.memory.audit import init_audit_schema
+from local_agent_lab.memory.candidates import init_candidate_memory_schema
+from local_agent_lab.memory.chatgpt_ingest import init_chatgpt_memory_schema
+from local_agent_lab.memory.curated import init_curated_memory_schema
+from local_agent_lab.memory.feedback import init_feedback_schema
+from local_agent_lab.memory.subjects import assign_conversation_subject, init_subject_schema
 
 
 def _write_config(tmp_path: Path, extra_home_mcp: dict | None = None) -> Path:
@@ -33,6 +40,189 @@ def _write_config(tmp_path: Path, extra_home_mcp: dict | None = None) -> Path:
     config_path = config_dir / "agent.yaml"
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     return config_path
+
+
+def _seed_memory_database(memory_dir: Path) -> dict[str, str]:
+    data_dir = memory_dir.parent
+    (data_dir / "chatgpt_exports" / "raw").mkdir(parents=True, exist_ok=True)
+    (data_dir / "chatgpt_exports" / "parsed").mkdir(parents=True, exist_ok=True)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    import_id = "imp_test"
+    conversation_id = "conv_test"
+    message_id = "msg_test"
+    chunk_id = "chunk_test"
+    candidate_id = "cand_test"
+
+    with sqlite3.connect(db_path) as connection:
+        init_chatgpt_memory_schema(connection)
+        init_candidate_memory_schema(connection)
+        init_curated_memory_schema(connection)
+        init_feedback_schema(connection)
+        init_audit_schema(connection)
+        init_subject_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO imports (
+                id, source_root, raw_manifest_path, imported_at, status, parser_version,
+                file_count, conversation_count, message_count, chunk_count, attachment_count,
+                content_sha256, notes
+            )
+            VALUES (?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                import_id,
+                str(data_dir / "chatgpt_exports" / "raw"),
+                "",
+                "ok",
+                "chatgpt_export_v1",
+                1,
+                1,
+                1,
+                1,
+                0,
+                "seeded",
+                "",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO conversations (
+                id, import_id, source_conversation_id, title, created_at, updated_at,
+                message_count, first_message_at, last_message_at, summary, content_sha256,
+                is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, datetime('now'), datetime('now'), ?, datetime('now'), datetime('now'), ?, ?, 0, '{}')
+            """,
+            (
+                conversation_id,
+                import_id,
+                "source-conv",
+                "Rosemary Focaccia",
+                1,
+                "A recipe discussion.",
+                "seeded-conversation",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO messages (
+                id, conversation_id, import_id, source_message_id, parent_message_id, role,
+                author_name, turn_index, created_at, content_text, content_sha256, token_estimate,
+                attachment_count, is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, 0, '{}')
+            """,
+            (
+                message_id,
+                conversation_id,
+                import_id,
+                "source-message",
+                None,
+                "user",
+                None,
+                1,
+                "Please draft a rosemary focaccia recipe with notes.",
+                "seeded-message",
+                12,
+                0,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO message_chunks (
+                id, message_id, conversation_id, import_id, chunk_index, text, text_sha256,
+                token_estimate, start_char, end_char, source_kind, summary, is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '{}')
+            """,
+            (
+                chunk_id,
+                message_id,
+                conversation_id,
+                import_id,
+                1,
+                "Please draft a rosemary focaccia recipe with notes.",
+                "seeded-chunk",
+                12,
+                0,
+                49,
+                "text",
+                "Recipe request",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chatgpt_chunks_fts (
+                title, role, text, import_id, conversation_id, message_id, chunk_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Rosemary Focaccia",
+                "user",
+                "Please draft a rosemary focaccia recipe with notes.",
+                import_id,
+                conversation_id,
+                message_id,
+                chunk_id,
+            ),
+        )
+        assign_conversation_subject(connection, conversation_id, "Cooking and Baking", include_chunks=True)
+        connection.execute(
+            """
+            INSERT INTO candidate_memories (
+                id, import_id, conversation_id, message_id, chunk_id, source_kind, source_ref,
+                source_role, memory_type, reason_type, domain_primary, domains_json, confidence,
+                valid_from, valid_to, last_confirmed_at, review_status, review_notes, origin,
+                assistant_suggestion, source_links_json, content, metadata_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            """,
+            (
+                candidate_id,
+                import_id,
+                conversation_id,
+                message_id,
+                chunk_id,
+                "chatgpt_export",
+                chunk_id,
+                "user",
+                "procedure",
+                "recipe_instruction",
+                "cooking_baking",
+                json.dumps(["cooking_baking"], sort_keys=True),
+                0.93,
+                "2026-07-01T00:00:00+00:00",
+                None,
+                None,
+                "pending",
+                None,
+                "chatgpt_export",
+                0,
+                json.dumps(
+                    {
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "chunk_id": chunk_id,
+                        "source_kind": "chatgpt_export",
+                        "source_role": "user",
+                    },
+                    sort_keys=True,
+                ),
+                "Please draft a rosemary focaccia recipe with notes.",
+                json.dumps({"message_turn_index": 1, "chunk_index": 1}, sort_keys=True),
+            ),
+        )
+    return {
+        "db_path": str(db_path),
+        "import_id": import_id,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "chunk_id": chunk_id,
+        "candidate_id": candidate_id,
+    }
 
 
 def test_home_mcp_lists_roots_and_blocks_escape(tmp_path) -> None:
@@ -204,6 +394,50 @@ def test_home_mcp_creates_structured_recipe_cards(tmp_path) -> None:
     assert result["prep_time"] == "20 minutes"
     assert result["cook_time"] == "25 minutes"
     assert result["recipe_summary"] == "2 ingredients, 2 steps, servings 4"
+
+
+def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    seed = _seed_memory_database(config.paths["memory_dir"])
+    server = build_home_mcp_server(config)
+
+    rpc = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}})
+    tool_names = {tool["name"] for tool in rpc["result"]["tools"]}
+    assert {"memory_status", "memory_search", "memory_review", "memory_subjects", "bridge_recipe_note_to_memory"} <= tool_names
+
+    status = server.memory_status(recent_limit=1)
+    assert status["status"] == "ok"
+    assert status["sqlite"]["exists"] is True
+
+    subjects = server.memory_subjects(kind="subject", limit=5)
+    assert subjects["count"] >= 1
+
+    candidates = server.memory_candidates(review_status="pending", domain="cooking_baking", limit=5)
+    assert candidates["count"] == 1
+
+    review = server.memory_review(
+        candidate_id=seed["candidate_id"],
+        action="promote",
+        record_type="research_note",
+        title="Rosemary Focaccia",
+        trust_level="high",
+    )
+    assert review["memory_record"]["source_kind"] == "chatgpt_candidate"
+    assert review["candidate_memory"]["review_status"] == "merged"
+
+    search = server.memory_search(query="rosemary", limit=5)
+    assert search["count"] >= 1
+    assert any(result["source_kind"] in {"curated_memory", "fts"} for result in search["results"])
+
+    recipe = server.create_recipe_card(
+        title="Bridge Test Focaccia",
+        body="Ingredients:\n- flour\n- rosemary\n\nSteps:\n- mix\n- bake\n",
+        tags=["bread", "rosemary"],
+    )
+    bridged = server.bridge_recipe_note_to_memory(file_id=recipe["file_id"], subject="Cooking and Baking")
+    assert bridged["memory_record"]["source_kind"] == "recipe_book"
+    assert bridged["memory_record"]["source_ref"] == recipe["file_id"]
 
 
 def test_home_mcp_searches_reads_and_dispatches_jsonrpc(tmp_path) -> None:

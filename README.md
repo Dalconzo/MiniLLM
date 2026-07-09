@@ -39,6 +39,7 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent home-mcp draft-recipe-card --file-id recipe_book:...`
 - `lagent home-mcp create-recipe --title "..." --body "..."`
 - `lagent home-mcp create-recipe-card --title "..." --body "..."`
+- `lagent home-mcp bridge-recipe-note-to-memory --file-id recipe_book:...`
 - `lagent home-mcp install-service`
 - `lagent home-mcp service-status`
 - `lagent home-mcp service-url`

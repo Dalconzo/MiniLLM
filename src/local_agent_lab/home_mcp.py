@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +16,23 @@ import yaml
 
 from .config import AppConfig
 from .logging.run_logger import RunContext, RunLogger
+from .memory.analysis import analyze_memory_corpus
+from .memory.audit import init_audit_schema
+from .memory.candidates import (
+    CandidateMemory,
+    get_candidate_memory,
+    list_candidate_memories,
+    list_candidate_memories_for_subject,
+    list_candidate_subjects,
+    update_candidate_review,
+    init_candidate_memory_schema,
+)
+from .memory.chatgpt_ingest import init_chatgpt_memory_schema
+from .memory.curated import MemoryRecord, create_memory_record, init_curated_memory_schema, list_memory_records
+from .memory.feedback import init_feedback_schema, list_open_loops
+from .memory.observability import MemoryObservationError, memory_db_path, read_memory_trace, summarize_memory_status
+from .memory.search import search_chatgpt_memory
+from .memory.subjects import init_subject_schema, list_subjects, normalize_subject_slug, upsert_subject
 from .tools.file_tools import redact_text
 
 
@@ -32,6 +50,74 @@ MAX_SEARCH_FILES = 250
 HOME_MCP_AUTH_MODES = {"none", "bearer", "oauth", "mixed"}
 HOME_MCP_OAUTH_RESOURCE_PATHS = {"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"}
 HOME_MCP_OAUTH_AUTH_SERVER_PATHS = {"/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"}
+
+
+def _default_curated_record_type(memory_type: str) -> str:
+    mapping = {
+        "decision": "decision",
+        "preference": "preference",
+        "procedure": "workflow",
+        "workaround": "lesson",
+        "failure": "lesson",
+        "open_loop": "open_loop",
+        "episodic": "research_note",
+        "skill": "workflow",
+        "analogy": "lesson",
+        "project": "project",
+        "semantic_fact": "research_note",
+        "source_note": "research_note",
+        "constraint": "lesson",
+        "risk": "research_note",
+        "relationship": "contact_note",
+        "health_note": "research_note",
+        "financial_note": "research_note",
+    }
+    return mapping.get(memory_type, "research_note")
+
+
+def _candidate_title(candidate: CandidateMemory) -> str:
+    text = candidate.content.strip()
+    if len(text) <= 80:
+        return text
+    return text[:77].rstrip() + "..."
+
+
+def _promote_candidate_memory(
+    connection: sqlite3.Connection,
+    candidate: CandidateMemory,
+    *,
+    record_type: str | None,
+    title: str | None,
+    trust_level: str,
+    note: str | None,
+) -> MemoryRecord:
+    curated_record_type = record_type or _default_curated_record_type(candidate.memory_type)
+    provenance = {
+        "source": candidate.source_links,
+        "candidate_memory_id": candidate.id,
+        "candidate_review_status": candidate.review_status,
+        "candidate_reason_type": candidate.reason_type,
+        "candidate_domains": candidate.domains,
+        "assistant_suggestion": candidate.assistant_suggestion,
+    }
+    record_title = title or _candidate_title(candidate)
+    return create_memory_record(
+        connection,
+        record_type=curated_record_type,
+        title=record_title,
+        body=candidate.content,
+        trust_level=trust_level,
+        source_kind="chatgpt_candidate",
+        source_ref=candidate.id,
+        provenance=provenance,
+        metadata={
+            "candidate_memory_id": candidate.id,
+            "candidate_review_status": candidate.review_status,
+            "review_note": note,
+            "source_role": candidate.source_links.get("source_role"),
+        },
+        created_by="user",
+    )
 
 
 class HomeMCPError(RuntimeError):
@@ -647,6 +733,400 @@ class HomeMCPServer:
             "results": hits,
         }
 
+    def memory_status(self, *, recent_limit: int = 5) -> dict[str, Any]:
+        return summarize_memory_status(
+            data_dir=self.config.paths["data_dir"],
+            memory_dir=self.config.paths["memory_dir"],
+            logs_dir=self.config.logs_dir,
+            recent_limit=recent_limit,
+        )
+
+    def memory_analyze(self, *, subject_limit: int = 10, recent_limit: int = 5) -> dict[str, Any]:
+        return analyze_memory_corpus(
+            data_dir=self.config.paths["data_dir"],
+            memory_dir=self.config.paths["memory_dir"],
+            logs_dir=self.config.logs_dir,
+            subject_limit=subject_limit,
+            recent_limit=recent_limit,
+        )
+
+    def memory_subjects(self, *, kind: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        if not db_path.exists():
+            raise HomeMCPError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="memory_subjects",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            init_subject_schema(connection)
+            subjects = [summary.to_dict() for summary in list_subjects(connection, kind=kind, limit=limit)]
+        return {"status": "ok", "count": len(subjects), "subjects": subjects}
+
+    def memory_candidates(
+        self,
+        *,
+        review_status: str | None = "pending",
+        domain: str | None = None,
+        source_role: str | None = None,
+        assistant_suggestion: bool | None = None,
+        subject: str | None = None,
+        subject_kind: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        if not db_path.exists():
+            raise HomeMCPError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="memory_candidates",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            candidates = [
+                candidate.to_dict()
+                for candidate in list_candidate_memories(
+                    connection,
+                    review_status=review_status,
+                    domain=domain,
+                    source_role=source_role,
+                    assistant_suggestion=assistant_suggestion,
+                    subject=subject,
+                    subject_kind=subject_kind,
+                    limit=limit,
+                )
+            ]
+        return {"status": "ok", "count": len(candidates), "candidate_memories": candidates}
+
+    def memory_review_subjects(
+        self,
+        *,
+        subject: str | None = None,
+        kind: str = "subject",
+        review_status: str | None = "pending",
+        source_role: str | None = None,
+        assistant_only: bool = False,
+        subject_limit: int = 20,
+        candidate_limit: int = 20,
+    ) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        if not db_path.exists():
+            raise HomeMCPError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="memory_review_subjects",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            init_subject_schema(connection)
+            init_candidate_memory_schema(connection)
+            subject_summaries = list_candidate_subjects(
+                connection,
+                review_status=review_status,
+                source_role=source_role,
+                assistant_suggestion=True if assistant_only else None,
+                kind=kind,
+                limit=subject_limit,
+            )
+            candidate_memories: list[dict[str, Any]] = []
+            selected_subject: dict[str, Any] | None = None
+            if subject is not None:
+                candidate_memories = [
+                    candidate.to_dict()
+                    for candidate in list_candidate_memories_for_subject(
+                        connection,
+                        subject,
+                        kind=kind,
+                        review_status=review_status,
+                        source_role=source_role,
+                        assistant_suggestion=True if assistant_only else None,
+                        limit=candidate_limit,
+                    )
+                ]
+                selected_subject = next(
+                    (item for item in subject_summaries if item["kind"] == kind and item["slug"] == normalize_subject_slug(subject)),
+                    None,
+                )
+                if selected_subject is None:
+                    selected_subject = {
+                        "kind": kind,
+                        "slug": normalize_subject_slug(subject),
+                        "name": subject,
+                        "candidate_count": len(candidate_memories),
+                        "pending_count": len(candidate_memories) if review_status == "pending" else 0,
+                        "approved_count": 0,
+                        "merged_count": 0,
+                        "rejected_count": 0,
+                        "assistant_count": sum(1 for item in candidate_memories if item["assistant_suggestion"]),
+                        "latest_candidate_activity_at": None,
+                    }
+        return {
+            "status": "ok",
+            "count": len(subject_summaries),
+            "subject_summaries": subject_summaries,
+            "selected_subject": selected_subject,
+            "candidate_memories": candidate_memories,
+            "filters": {
+                "subject": subject,
+                "kind": kind,
+                "review_status": review_status,
+                "source_role": source_role,
+                "assistant_only": assistant_only,
+                "subject_limit": subject_limit,
+                "candidate_limit": candidate_limit,
+            },
+        }
+
+    def memory_review(
+        self,
+        *,
+        candidate_id: str | None = None,
+        action: str | None = None,
+        review_status: str | None = "pending",
+        domain: str | None = None,
+        subject: str | None = None,
+        subject_kind: str = "subject",
+        source_role: str | None = None,
+        assistant_only: bool = False,
+        limit: int | None = 20,
+        note: str | None = None,
+        record_type: str | None = None,
+        title: str | None = None,
+        trust_level: str = "high",
+        allow_assistant: bool = False,
+    ) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        if not db_path.exists():
+            raise HomeMCPError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="memory_review",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            init_candidate_memory_schema(connection)
+            init_curated_memory_schema(connection)
+            init_subject_schema(connection)
+            if candidate_id is not None:
+                candidate = get_candidate_memory(connection, candidate_id)
+                selected = [candidate]
+            else:
+                selected = list_candidate_memories(
+                    connection,
+                    review_status=review_status,
+                    domain=domain,
+                    source_role=source_role,
+                    assistant_suggestion=True if assistant_only else None,
+                    subject=subject,
+                    subject_kind=subject_kind,
+                    limit=limit,
+                )
+
+            if action is None:
+                candidates = [candidate.to_dict() for candidate in selected]
+                return {
+                    "status": "ok",
+                    "count": len(candidates),
+                    "candidate_memories": candidates,
+                    "filters": {
+                        "review_status": review_status,
+                        "domain": domain,
+                        "subject": subject,
+                        "subject_kind": subject_kind,
+                        "source_role": source_role,
+                        "assistant_only": assistant_only,
+                        "limit": limit,
+                    },
+                }
+
+            if candidate_id is None:
+                raise HomeMCPError(
+                    "--candidate-id is required when using an action",
+                    stage="memory_review",
+                    error_code="missing_candidate_id",
+                )
+            candidate = selected[0]
+            if action == "approve":
+                updated = update_candidate_review(
+                    connection,
+                    candidate.id,
+                    review_status="approved",
+                    review_notes=note,
+                    last_confirmed_at=utc_now(),
+                )
+                return {"status": "ok", "candidate_memory": updated.to_dict()}
+            if action == "reject":
+                updated = update_candidate_review(
+                    connection,
+                    candidate.id,
+                    review_status="rejected",
+                    review_notes=note,
+                )
+                return {"status": "ok", "candidate_memory": updated.to_dict()}
+            if action == "promote":
+                if candidate.assistant_suggestion and not allow_assistant:
+                    raise HomeMCPError(
+                        "assistant suggestions stay separate until explicit confirmation",
+                        stage="memory_review",
+                        error_code="assistant_promotion_blocked",
+                        source_ref=candidate.id,
+                    )
+                promoted = _promote_candidate_memory(
+                    connection,
+                    candidate,
+                    record_type=record_type,
+                    title=title,
+                    trust_level=trust_level,
+                    note=note,
+                )
+                updated = update_candidate_review(
+                    connection,
+                    candidate.id,
+                    review_status="merged",
+                    review_notes=note,
+                    last_confirmed_at=utc_now(),
+                )
+                return {"status": "ok", "candidate_memory": updated.to_dict(), "memory_record": promoted.to_dict()}
+            raise HomeMCPError(
+                f"invalid review action: {action}",
+                stage="memory_review",
+                error_code="invalid_review_action",
+                source_ref=action,
+            )
+
+    def memory_search(
+        self,
+        *,
+        query: str,
+        limit: int = 8,
+        subject: str | None = None,
+        title: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        exclude_source_ids: list[str] | None = None,
+        exclude_subjects: list[str] | None = None,
+        depth: str = "medium",
+        effort: int = 2,
+        allow_cross_domain: bool = False,
+    ) -> dict[str, Any]:
+        return search_chatgpt_memory(
+            memory_dir=self.config.paths["memory_dir"],
+            query=query,
+            limit=limit,
+            subject=subject,
+            title=title,
+            date_from=date_from,
+            date_to=date_to,
+            exclude_source_ids=exclude_source_ids,
+            exclude_subjects=exclude_subjects,
+            depth=depth,
+            effort=effort,
+            allow_cross_domain=allow_cross_domain,
+        )
+
+    def memory_list(self, *, record_type: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        if not db_path.exists():
+            raise HomeMCPError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="memory_list",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            init_curated_memory_schema(connection)
+            records = [record.to_dict() for record in list_memory_records(connection, record_type=record_type, limit=limit)]
+        return {"status": "ok", "count": len(records), "memory_records": records}
+
+    def memory_open_loops(self, *, limit: int | None = None) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        if not db_path.exists():
+            raise HomeMCPError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="memory_open_loops",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            init_feedback_schema(connection)
+            loops = list_open_loops(connection, limit=limit)
+        return {"status": "ok", "count": len(loops), "open_loops": loops}
+
+    def memory_trace(self, *, run_id: str) -> dict[str, Any]:
+        return read_memory_trace(self.config.logs_dir, run_id)
+
+    def bridge_recipe_note_to_memory(
+        self,
+        *,
+        file_id: str,
+        record_type: str = "research_note",
+        title: str | None = None,
+        trust_level: str = "high",
+        subject: str | None = None,
+        subject_kind: str = "subject",
+    ) -> dict[str, Any]:
+        read = self.read_file(file_id=file_id)
+        if read["root_id"] != "recipe_book":
+            raise HomeMCPError(
+                "recipe note bridge only accepts recipe_book files",
+                stage="bridge_recipe_note_to_memory",
+                error_code="invalid_recipe_root",
+                source_ref=file_id,
+            )
+        metadata, body = _parse_markdown_document(str(read["content"]))
+        note_title = title or str(metadata.get("title") or Path(read["relative_path"]).stem).strip()
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            init_subject_schema(connection)
+            init_curated_memory_schema(connection)
+            subject_id = None
+            if subject:
+                subject_record = upsert_subject(connection, subject, kind=subject_kind)
+                subject_id = subject_record.id
+            memory_record = create_memory_record(
+                connection,
+                record_type=record_type,
+                title=note_title,
+                body=body.strip() or str(read["content"]).strip(),
+                subject_id=subject_id,
+                trust_level=trust_level,
+                source_kind="recipe_book",
+                source_ref=file_id,
+                provenance={
+                    "recipe_file_id": file_id,
+                    "recipe_root_id": read["root_id"],
+                    "recipe_relative_path": read["relative_path"],
+                    "recipe_note_metadata": metadata,
+                },
+                metadata={
+                    "recipe_file_id": file_id,
+                    "recipe_root_id": read["root_id"],
+                    "recipe_relative_path": read["relative_path"],
+                    "recipe_note_kind": metadata.get("kind"),
+                    "recipe_note_tags": metadata.get("tags", []),
+                },
+                created_by="user",
+            )
+        return {
+            "status": "ok",
+            "source_file": {
+                "file_id": file_id,
+                "root_id": read["root_id"],
+                "relative_path": read["relative_path"],
+            },
+            "memory_record": memory_record.to_dict(),
+        }
+
     def tools(self) -> list[dict[str, Any]]:
         return [
             _tool_definition("list_allowed_roots", "List allowed roots exposed by the home-mcp server.", {"type": "object", "properties": {}, "additionalProperties": False}),
@@ -809,6 +1289,173 @@ class HomeMCPServer:
                         "tags": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": ["recipe_id", "notes"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_status",
+                "Summarize ChatGPT memory health and recent activity.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "recent_limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_analyze",
+                "Summarize corpus shape and write analysis artifacts.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "subject_limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "recent_limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_subjects",
+                "List ChatGPT memory subjects with counts and recency.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_candidates",
+                "List candidate memories with review filters.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "review_status": {"type": "string"},
+                        "domain": {"type": "string"},
+                        "source_role": {"type": "string"},
+                        "assistant_suggestion": {"type": "boolean"},
+                        "subject": {"type": "string"},
+                        "subject_kind": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_review_subjects",
+                "Browse candidate memories by subject with traceable drill-down.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "review_status": {"type": "string"},
+                        "source_role": {"type": "string"},
+                        "assistant_only": {"type": "boolean"},
+                        "subject_limit": {"type": "integer", "minimum": 1},
+                        "candidate_limit": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_review",
+                "Inspect candidate memories and optionally approve, reject, or promote them.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "candidate_id": {"type": "string"},
+                        "action": {"type": "string"},
+                        "review_status": {"type": "string"},
+                        "domain": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "subject_kind": {"type": "string"},
+                        "source_role": {"type": "string"},
+                        "assistant_only": {"type": "boolean"},
+                        "limit": {"type": "integer", "minimum": 1},
+                        "note": {"type": "string"},
+                        "record_type": {"type": "string"},
+                        "title": {"type": "string"},
+                        "trust_level": {"type": "string"},
+                        "allow_assistant": {"type": "boolean"},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_search",
+                "Search the ChatGPT memory corpus.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "subject": {"type": "string"},
+                        "title": {"type": "string"},
+                        "date_from": {"type": "string"},
+                        "date_to": {"type": "string"},
+                        "exclude_source_ids": {"type": "array", "items": {"type": "string"}},
+                        "exclude_subjects": {"type": "array", "items": {"type": "string"}},
+                        "depth": {"type": "string"},
+                        "effort": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "allow_cross_domain": {"type": "boolean"},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_list",
+                "List curated memory records.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "record_type": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_open_loops",
+                "List open loops recorded in memory.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "memory_trace",
+                "Read a run trace by run_id.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "bridge_recipe_note_to_memory",
+                "Promote a recipe note into the curated memory layer.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_id": {"type": "string"},
+                        "record_type": {"type": "string"},
+                        "title": {"type": "string"},
+                        "trust_level": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "subject_kind": {"type": "string"},
+                    },
+                    "required": ["file_id"],
                     "additionalProperties": False,
                 },
             ),
@@ -978,6 +1625,90 @@ class HomeMCPServer:
                 outcome=str(arguments["outcome"]) if arguments.get("outcome") else None,
                 next_time=str(arguments["next_time"]) if arguments.get("next_time") else None,
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
+            )
+        if name == "memory_status":
+            return self.memory_status(recent_limit=int(arguments.get("recent_limit", 5)))
+        if name == "memory_analyze":
+            return self.memory_analyze(
+                subject_limit=int(arguments.get("subject_limit", 10)),
+                recent_limit=int(arguments.get("recent_limit", 5)),
+            )
+        if name == "memory_subjects":
+            return self.memory_subjects(
+                kind=str(arguments["kind"]) if arguments.get("kind") else None,
+                limit=_optional_int(arguments.get("limit")),
+            )
+        if name == "memory_candidates":
+            assistant_suggestion = arguments.get("assistant_suggestion")
+            return self.memory_candidates(
+                review_status=str(arguments["review_status"]) if arguments.get("review_status") is not None else "pending",
+                domain=str(arguments["domain"]) if arguments.get("domain") else None,
+                source_role=str(arguments["source_role"]) if arguments.get("source_role") else None,
+                assistant_suggestion=bool(assistant_suggestion) if assistant_suggestion is not None else None,
+                subject=str(arguments["subject"]) if arguments.get("subject") else None,
+                subject_kind=str(arguments["subject_kind"]) if arguments.get("subject_kind") else None,
+                limit=_optional_int(arguments.get("limit")),
+            )
+        if name == "memory_review_subjects":
+            return self.memory_review_subjects(
+                subject=str(arguments["subject"]) if arguments.get("subject") else None,
+                kind=str(arguments["kind"]) if arguments.get("kind") else "subject",
+                review_status=str(arguments["review_status"]) if arguments.get("review_status") is not None else "pending",
+                source_role=str(arguments["source_role"]) if arguments.get("source_role") else None,
+                assistant_only=bool(arguments.get("assistant_only", False)),
+                subject_limit=int(arguments.get("subject_limit", 20)),
+                candidate_limit=int(arguments.get("candidate_limit", 20)),
+            )
+        if name == "memory_review":
+            return self.memory_review(
+                candidate_id=str(arguments["candidate_id"]) if arguments.get("candidate_id") else None,
+                action=str(arguments["action"]) if arguments.get("action") else None,
+                review_status=str(arguments["review_status"]) if arguments.get("review_status") is not None else "pending",
+                domain=str(arguments["domain"]) if arguments.get("domain") else None,
+                subject=str(arguments["subject"]) if arguments.get("subject") else None,
+                subject_kind=str(arguments["subject_kind"]) if arguments.get("subject_kind") else "subject",
+                source_role=str(arguments["source_role"]) if arguments.get("source_role") else None,
+                assistant_only=bool(arguments.get("assistant_only", False)),
+                limit=_optional_int(arguments.get("limit")),
+                note=str(arguments["note"]) if arguments.get("note") else None,
+                record_type=str(arguments["record_type"]) if arguments.get("record_type") else None,
+                title=str(arguments["title"]) if arguments.get("title") else None,
+                trust_level=str(arguments["trust_level"]) if arguments.get("trust_level") else "high",
+                allow_assistant=bool(arguments.get("allow_assistant", False)),
+            )
+        if name == "memory_search":
+            exclude_source_ids = arguments.get("exclude_source_ids")
+            exclude_subjects = arguments.get("exclude_subjects")
+            return self.memory_search(
+                query=str(arguments["query"]),
+                limit=int(arguments.get("limit", 8)),
+                subject=str(arguments["subject"]) if arguments.get("subject") else None,
+                title=str(arguments["title"]) if arguments.get("title") else None,
+                date_from=str(arguments["date_from"]) if arguments.get("date_from") else None,
+                date_to=str(arguments["date_to"]) if arguments.get("date_to") else None,
+                exclude_source_ids=[str(item) for item in exclude_source_ids] if isinstance(exclude_source_ids, list) else None,
+                exclude_subjects=[str(item) for item in exclude_subjects] if isinstance(exclude_subjects, list) else None,
+                depth=str(arguments.get("depth", "medium")),
+                effort=int(arguments.get("effort", 2)),
+                allow_cross_domain=bool(arguments.get("allow_cross_domain", False)),
+            )
+        if name == "memory_list":
+            return self.memory_list(
+                record_type=str(arguments["record_type"]) if arguments.get("record_type") else None,
+                limit=_optional_int(arguments.get("limit")),
+            )
+        if name == "memory_open_loops":
+            return self.memory_open_loops(limit=_optional_int(arguments.get("limit")))
+        if name == "memory_trace":
+            return self.memory_trace(run_id=str(arguments["run_id"]))
+        if name == "bridge_recipe_note_to_memory":
+            return self.bridge_recipe_note_to_memory(
+                file_id=str(arguments["file_id"]),
+                record_type=str(arguments["record_type"]) if arguments.get("record_type") else "research_note",
+                title=str(arguments["title"]) if arguments.get("title") else None,
+                trust_level=str(arguments["trust_level"]) if arguments.get("trust_level") else "high",
+                subject=str(arguments["subject"]) if arguments.get("subject") else None,
+                subject_kind=str(arguments["subject_kind"]) if arguments.get("subject_kind") else "subject",
             )
         raise HomeMCPError(f"unsupported tool: {name}", stage="tools/call", error_code="unsupported_tool", source_ref=name)
 

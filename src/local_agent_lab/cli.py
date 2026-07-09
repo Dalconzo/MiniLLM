@@ -3619,6 +3619,40 @@ def home_mcp_append_recipe_attempt(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("bridge-recipe-note-to-memory")
+def home_mcp_bridge_recipe_note_to_memory(
+    file_id: str = typer.Option(..., "--file-id", help="Recipe note file identifier."),
+    record_type: str = typer.Option("research_note", "--record-type", help="Curated memory record type."),
+    title: str | None = typer.Option(None, "--title", help="Optional override title."),
+    trust_level: str = typer.Option("high", "--trust-level", help="Trust level for the curated memory record."),
+    subject: str | None = typer.Option(None, "--subject", help="Optional subject to assign."),
+    subject_kind: str = typer.Option("subject", "--subject-kind", help="Subject kind: subject, project, or workflow."),
+) -> None:
+    """Promote a recipe note into the curated memory layer."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:bridge-recipe-note-to-memory", {"file_id": file_id, "record_type": record_type, "subject": subject})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.bridge_recipe_note_to_memory(
+                file_id=file_id,
+                record_type=record_type,
+                title=title,
+                trust_level=trust_level,
+                subject=subject,
+                subject_kind=subject_kind,
+            ),
+        }
+        logger.write_artifact(run, "home_mcp_bridge_recipe_note_to_memory.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("install-service")
 def home_mcp_install_service(
     auth_mode: str = typer.Option("none", "--auth-mode", help="Auth mode for the home-mcp service."),

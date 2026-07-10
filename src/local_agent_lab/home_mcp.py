@@ -873,6 +873,7 @@ class HomeMCPServer:
             except OSError:
                 continue
             metadata, body = _parse_markdown_document(raw_text)
+            nested_metadata = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
             card_tags = [str(item) for item in metadata.get("tags", [])] if isinstance(metadata.get("tags"), list) else []
             card_tags_lower = {tag.lower() for tag in card_tags}
             if tag_filters and not tag_filters.issubset(card_tags_lower):
@@ -883,7 +884,13 @@ class HomeMCPServer:
             card_summary = str(
                 metadata.get("summary")
                 or (metadata.get("recipe_card", {}) if isinstance(metadata.get("recipe_card"), dict) else {}).get("summary", "")
+                or nested_metadata.get("recipe_card", {}).get("summary", "")
             )
+            schema_version = None
+            if isinstance(metadata.get("recipe_card"), dict):
+                schema_version = metadata["recipe_card"].get("schema_version")
+            elif isinstance(nested_metadata.get("recipe_card"), dict):
+                schema_version = nested_metadata["recipe_card"].get("schema_version")
             combined_text = " ".join([title, " ".join(card_tags), body_text, str(metadata.get("kind", "")), card_summary]).lower()
             matched_terms = [term for term in re.split(r"\s+", normalized_query) if term] if normalized_query else []
             matched_terms = [term for term in matched_terms if term in combined_text]
@@ -923,7 +930,7 @@ class HomeMCPServer:
                     "cook_time": recipe_structure["cook_time"],
                     "total_time": recipe_structure["total_time"],
                     "recipe_summary": recipe_structure["summary"],
-                    "schema_version": (metadata.get("recipe_card", {}) if isinstance(metadata.get("recipe_card"), dict) else {}).get("schema_version"),
+                    "schema_version": schema_version,
                     "score": round(score, 3),
                     "match_reason": "title" if normalized_query and normalized_query in title.lower() else "content" if normalized_query else "recent",
                     "matched_terms": matched_terms,

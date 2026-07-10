@@ -3824,14 +3824,27 @@ def home_mcp_service_url() -> None:
 
 def _probe_home_mcp_health(url: str) -> dict[str, object]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=3) as response:
-            raw = response.read().decode("utf-8")
-        payload = json.loads(raw)
-        ok = payload.get("status") == "ok"
-        return {"ok": ok, "status": "ok" if ok else "bad_status", "response": payload, "error": None}
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
-        return {"ok": False, "status": "error", "response": None, "error": str(exc)}
+    last_error: str | None = None
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
+            ok = payload.get("status") == "ok"
+            return {
+                "ok": ok,
+                "status": "ok" if ok else "bad_status",
+                "response": payload,
+                "error": None,
+                "attempts": attempt + 1,
+            }
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            last_error = str(exc)
+            if attempt < 4:
+                import time
+
+                time.sleep(0.5)
+    return {"ok": False, "status": "error", "response": None, "error": last_error, "attempts": 5}
 
 
 if __name__ == "__main__":

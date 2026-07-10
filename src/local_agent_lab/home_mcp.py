@@ -2023,6 +2023,8 @@ def _extract_recipe_structure(text: str, *, title: str | None = None, query: str
         "ingredient": "ingredients",
         "steps": "steps",
         "step": "steps",
+        "step by step instructions": "steps",
+        "step by step": "steps",
         "directions": "steps",
         "direction": "steps",
         "instructions": "steps",
@@ -2042,6 +2044,7 @@ def _extract_recipe_structure(text: str, *, title: str | None = None, query: str
     sections: dict[str, list[str]] = {key: [] for key in {"ingredients", "steps", "notes"}}
     scalar_fields: dict[str, str] = {}
     inferred_title = title
+    step_heading_mode = False
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
@@ -2054,11 +2057,23 @@ def _extract_recipe_structure(text: str, *, title: str | None = None, query: str
             normalized = re.sub(r"[^a-z0-9]+", " ", heading.lower()).strip()
             if normalized in section_map:
                 current_section = section_map[normalized]
+                if current_section == "steps":
+                    step_heading_mode = False
                 if current_section not in sections and current_section not in {"servings", "prep_time", "cook_time", "total_time"}:
                     sections[current_section] = []
                 continue
             if inferred_title is None:
                 inferred_title = heading
+                continue
+            if current_section == "ingredients":
+                continue
+            if current_section == "steps":
+                step_heading_mode = True
+                step_title = heading
+                if re.match(r"^\d+[\.\)]\s+", step_title):
+                    step_title = re.sub(r"^\d+[\.\)]\s+", "", step_title).strip()
+                if step_title:
+                    sections["steps"].append(step_title)
                 continue
         if inferred_title is None and raw_line == lines[0] and len(raw_line.split()) <= 16 and not raw_line.startswith(("-", "*", "1.")):
             inferred_title = raw_line.strip("# ").strip()
@@ -2069,6 +2084,8 @@ def _extract_recipe_structure(text: str, *, title: str | None = None, query: str
                 mapped = section_map[normalized]
                 if mapped in {"ingredients", "steps", "notes"}:
                     current_section = mapped
+                    if current_section == "steps":
+                        step_heading_mode = False
                     if current_section not in sections:
                         sections[current_section] = []
                     continue
@@ -2078,6 +2095,10 @@ def _extract_recipe_structure(text: str, *, title: str | None = None, query: str
             if normalized in section_map and section_map[normalized] not in {"ingredients", "steps", "notes"}:
                 scalar_fields[section_map[normalized]] = value
                 continue
+        if current_section == "ingredients" and (line.startswith("###") or line.startswith("##")):
+            continue
+        if current_section == "steps" and step_heading_mode:
+            continue
         if current_section in {"ingredients", "steps", "notes"}:
             sections[current_section].append(raw_line.rstrip())
         else:

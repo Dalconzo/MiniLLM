@@ -10,7 +10,7 @@ import pytest
 
 from local_agent_lab.config import load_config
 from local_agent_lab.cli import _render_memory_search
-from local_agent_lab.home_mcp import HomeMCPError, build_home_mcp_server, serve_home_mcp
+from local_agent_lab.home_mcp import HomeMCPError, _extract_recipe_structure, build_home_mcp_server, serve_home_mcp
 from local_agent_lab.memory.audit import init_audit_schema
 from local_agent_lab.memory.candidates import init_candidate_memory_schema
 from local_agent_lab.memory.chatgpt_ingest import init_chatgpt_memory_schema
@@ -360,6 +360,36 @@ def test_home_mcp_drafts_structured_recipe_cards(tmp_path) -> None:
         }
     )
     assert rpc["result"]["structuredContent"]["draft"]["ingredients"] == ["bread"]
+
+
+def test_home_mcp_extracts_sectioned_recipe_cards(tmp_path) -> None:
+    text = (
+        "Miso-Butter Roast Bowl with Jammy Eggs\n"
+        "\n"
+        "## Ingredients\n"
+        "### Rice\n"
+        "- 1 cup jasmine rice\n"
+        "- 1 1/4 cups water\n"
+        "\n"
+        "### Miso-butter sauce\n"
+        "- 2 tbsp butter\n"
+        "- 2 tbsp white or yellow miso\n"
+        "\n"
+        "## Step-by-step instructions\n"
+        "### 1. Start the rice\n"
+        "Use:\n"
+        "- 1 cup jasmine rice\n"
+        "- 1 1/4 cups water\n"
+        "\n"
+        "### 2. Heat the oven and prep the first roast\n"
+        "Use:\n"
+        "- 1 large sweet potato\n"
+    )
+    parsed = _extract_recipe_structure(text, title="Miso-Butter Roast Bowl with Jammy Eggs")
+    assert parsed["title"] == "Miso-Butter Roast Bowl with Jammy Eggs"
+    assert parsed["ingredients"] == ["1 cup jasmine rice", "1 1/4 cups water", "2 tbsp butter", "2 tbsp white or yellow miso"]
+    assert parsed["steps"] == ["Start the rice", "Heat the oven and prep the first roast"]
+    assert parsed["summary"] == "4 ingredients, 2 steps"
 
 
 def test_home_mcp_creates_structured_recipe_cards(tmp_path) -> None:

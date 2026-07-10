@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from local_agent_lab.config import load_config
-from local_agent_lab.cli import _render_memory_search
+from local_agent_lab.cli import _probe_home_mcp_health, _render_memory_search
 from local_agent_lab.home_mcp import HomeMCPError, _extract_recipe_structure, build_home_mcp_server, serve_home_mcp
 from local_agent_lab.memory.audit import init_audit_schema
 from local_agent_lab.memory.candidates import init_candidate_memory_schema
@@ -303,6 +303,7 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
     rpc = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
     tools = rpc["result"]["tools"]
     assert any(tool["name"] == "recipe_standard" for tool in tools)
+    assert any(tool["name"] == "browse_recipes" for tool in tools)
     assert any(tool["name"] == "search_recipes" for tool in tools)
     assert any(tool["name"] == "create_recipe_card" for tool in tools)
     assert any(tool["name"] == "draft_recipe_card" for tool in tools)
@@ -377,6 +378,27 @@ def test_home_mcp_reports_recipe_standard(tmp_path) -> None:
     assert "Use the same structure every time before creating a new recipe card." in standard["checklist"]
 
 
+def test_home_mcp_browses_standardized_recipes(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    created = server.create_recipe_card(
+        title="Browse Me",
+        ingredients=["1 cup flour"],
+        steps=["Mix."],
+        summary="Browseable.",
+        tags=["bread"],
+    )
+    browse = server.browse_recipes(query="Browse", tags=["bread"], limit=5)
+    assert browse["status"] == "ok"
+    assert browse["view"] == "standardized_recipe_browse"
+    assert browse["standard"]["schema_version"] == 1
+    assert browse["count"] == 1
+    assert browse["results"][0]["file_id"] == created["file_id"]
+    assert browse["results"][0]["schema_version"] == 1
+
+
 def test_home_mcp_extracts_sectioned_recipe_cards(tmp_path) -> None:
     text = (
         "Miso-Butter Roast Bowl with Jammy Eggs\n"
@@ -431,6 +453,21 @@ def test_home_mcp_normalizes_recipe_cards(tmp_path) -> None:
     assert "## At a glance" in raw_after
     assert "## Method" in raw_after
     assert "# Normalize Me" not in raw_after.split("## Notes", 1)[1]
+
+
+def test_home_mcp_health_probe_reports_json_status(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+    httpd = serve_home_mcp(server, host="127.0.0.1", port=0)
+    try:
+        port = httpd.server_address[1]
+        probe = _probe_home_mcp_health(f"http://127.0.0.1:{port}/health")
+        assert probe["ok"] is True
+        assert probe["status"] == "ok"
+        assert probe["response"]["status"] == "ok"
+    finally:
+        httpd.shutdown()
 
 
 def test_home_mcp_creates_structured_recipe_cards(tmp_path) -> None:

@@ -948,6 +948,19 @@ class HomeMCPServer:
             "results": hits,
         }
 
+    def browse_recipes(
+        self,
+        *,
+        query: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        browse = self.search_recipes(query=query, tags=tags, limit=limit)
+        browse["standard"] = _recipe_standard()
+        browse["view"] = "standardized_recipe_browse"
+        browse["status"] = "ok"
+        return browse
+
     def memory_status(self, *, recent_limit: int = 5) -> dict[str, Any]:
         return summarize_memory_status(
             data_dir=self.config.paths["data_dir"],
@@ -1394,6 +1407,19 @@ class HomeMCPServer:
                 },
             ),
             _tool_definition(
+                "browse_recipes",
+                "Browse standardized recipe cards in the recipe book.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
                 "draft_recipe_card",
                 "Draft a structured recipe card from source text or a file.",
                 {
@@ -1777,6 +1803,12 @@ class HomeMCPServer:
             )
         if name == "search_recipes":
             return self.search_recipes(
+                query=str(arguments["query"]) if arguments.get("query") is not None else None,
+                tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
+                limit=int(arguments.get("limit", 10)),
+            )
+        if name == "browse_recipes":
+            return self.browse_recipes(
                 query=str(arguments["query"]) if arguments.get("query") is not None else None,
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
                 limit=int(arguments.get("limit", 10)),

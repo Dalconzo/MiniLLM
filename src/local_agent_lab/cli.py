@@ -7,6 +7,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import typer
@@ -3414,6 +3416,30 @@ def home_mcp_search_recipes(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("browse-recipes")
+def home_mcp_browse_recipes(
+    query: str | None = typer.Option(None, "--query", help="Optional recipe query text."),
+    tags: str | None = typer.Option(None, "--tags", help="Comma-separated tag filters."),
+    limit: int = typer.Option(10, "--limit", min=1, max=100, help="Maximum hits to return."),
+) -> None:
+    """Browse standardized recipe cards in the recipe book."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:browse-recipes", {"query": query, "tags": tags, "limit": limit})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.browse_recipes(query=query, tags=_comma_values(tags), limit=limit),
+        }
+        logger.write_artifact(run, "home_mcp_browse_recipes.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("draft-recipe-card")
 def home_mcp_draft_recipe_card(
     source_text: str | None = typer.Option(None, "--source-text", help="Source text to extract from."),
@@ -3759,17 +3785,16 @@ def home_mcp_service_status() -> None:
         text=True,
         capture_output=True,
     )
-    health = subprocess.run(
-        ["curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8765/health"],
-        text=True,
-        capture_output=True,
-    )
+    health = _probe_home_mcp_health("http://127.0.0.1:8765/health")
     payload = {
         "run_id": run.run_id,
         "status": "ok",
         "home_mcp_loaded": home_output.returncode == 0,
         "tunnel_loaded": tunnel_output.returncode == 0,
-        "health_ok": health.returncode == 0,
+        "health_ok": health["ok"],
+        "health_status": health["status"],
+        "health_response": health["response"],
+        "health_error": health["error"],
         "tunnel_url": read_home_mcp_tunnel_url(config),
         "home_mcp_launchd_stdout": home_output.stdout[-2000:],
         "home_mcp_launchd_stderr": home_output.stderr[-2000:],
@@ -3795,6 +3820,18 @@ def home_mcp_service_url() -> None:
         logger.finish(run, status="error", result={"error": str(exc)})
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
+
+
+def _probe_home_mcp_health(url: str) -> dict[str, object]:
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            raw = response.read().decode("utf-8")
+        payload = json.loads(raw)
+        ok = payload.get("status") == "ok"
+        return {"ok": ok, "status": "ok" if ok else "bad_status", "response": payload, "error": None}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        return {"ok": False, "status": "error", "response": None, "error": str(exc)}
 
 
 if __name__ == "__main__":

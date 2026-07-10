@@ -36,9 +36,11 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent home-mcp roots`
 - `lagent home-mcp serve --host 127.0.0.1 --port 8765 --auth-mode none`
 - `lagent home-mcp search-recipes --query "rosemary"`
+- `lagent home-mcp recipe-standard`
 - `lagent home-mcp draft-recipe-card --file-id recipe_book:...`
 - `lagent home-mcp create-recipe --title "..." --body "..."`
 - `lagent home-mcp create-recipe-card --title "..." --body "..."`
+- `lagent home-mcp normalize-recipes --apply`
 - `lagent home-mcp bridge-recipe-note-to-memory --file-id recipe_book:...`
 - `lagent home-mcp install-service`
 - `lagent home-mcp service-status`

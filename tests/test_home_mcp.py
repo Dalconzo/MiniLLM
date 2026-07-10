@@ -302,6 +302,7 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
 
     rpc = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
     tools = rpc["result"]["tools"]
+    assert any(tool["name"] == "recipe_standard" for tool in tools)
     assert any(tool["name"] == "search_recipes" for tool in tools)
     assert any(tool["name"] == "create_recipe_card" for tool in tools)
     assert any(tool["name"] == "draft_recipe_card" for tool in tools)
@@ -346,7 +347,9 @@ def test_home_mcp_drafts_structured_recipe_cards(tmp_path) -> None:
     assert structured["prep_time"] == "20 minutes"
     assert structured["cook_time"] == "25 minutes"
     assert structured["confidence"] > 0.5
-    assert "Ingredients" in structured["body"]
+    assert "## At a glance" in structured["body"]
+    assert "## Ingredients" in structured["body"]
+    assert "## Method" in structured["body"]
 
     rpc = server.dispatch_jsonrpc(
         {
@@ -360,6 +363,18 @@ def test_home_mcp_drafts_structured_recipe_cards(tmp_path) -> None:
         }
     )
     assert rpc["result"]["structuredContent"]["draft"]["ingredients"] == ["bread"]
+
+
+def test_home_mcp_reports_recipe_standard(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    standard = server.recipe_standard()
+    assert standard["status"] == "ok"
+    assert standard["schema_version"] == 1
+    assert "## Ingredients" in standard["template"]
+    assert "Use the same structure every time before creating a new recipe card." in standard["checklist"]
 
 
 def test_home_mcp_extracts_sectioned_recipe_cards(tmp_path) -> None:
@@ -392,6 +407,32 @@ def test_home_mcp_extracts_sectioned_recipe_cards(tmp_path) -> None:
     assert parsed["summary"] == "4 ingredients, 2 steps"
 
 
+def test_home_mcp_normalizes_recipe_cards(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    recipe = server.create_recipe_card(
+        title="Normalize Me",
+        ingredients=["1 cup flour"],
+        steps=["Mix."],
+        summary="Needs normalization.",
+        tags=["bread"],
+    )
+    path = Path(recipe["path"])
+    raw_before = path.read_text(encoding="utf-8")
+    assert "## Method" in raw_before
+
+    normalized = server.normalize_recipe_book(apply=True, limit=10)
+    assert normalized["status"] == "ok"
+    assert normalized["changed"] >= 1
+    raw_after = path.read_text(encoding="utf-8")
+    assert '"schema_version": 1' in raw_after
+    assert "## At a glance" in raw_after
+    assert "## Method" in raw_after
+    assert "# Normalize Me" not in raw_after.split("## Notes", 1)[1]
+
+
 def test_home_mcp_creates_structured_recipe_cards(tmp_path) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)
@@ -412,7 +453,7 @@ def test_home_mcp_creates_structured_recipe_cards(tmp_path) -> None:
     content = recipe_path.read_text(encoding="utf-8")
     assert "## Ingredients" in content
     assert "- 500g flour" in content
-    assert "## Steps" in content
+    assert "## Method" in content
     assert "1. Mix the dough." in content
     assert '"kind": "recipe_card"' in content
 

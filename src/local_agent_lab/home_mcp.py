@@ -44,6 +44,7 @@ DEFAULT_HOME_MCP_ROOTS = {
     "inbox": ("inbox", True, "Quick capture and scratch notes"),
     "archive": ("archive", False, "Read-only archive space"),
 }
+RECIPE_CARD_SCHEMA_VERSION = 1
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".log"}
 MAX_FILE_BYTES = 128_000
 MAX_SEARCH_FILES = 250
@@ -82,6 +83,93 @@ def _candidate_title(candidate: CandidateMemory) -> str:
     return text[:77].rstrip() + "..."
 
 
+def _recipe_standard() -> dict[str, Any]:
+    template = (
+        "# Title\n\n"
+        "One short summary paragraph.\n\n"
+        "## At a glance\n"
+        "- Yield: ...\n"
+        "- Prep time: ...\n"
+        "- Cook time: ...\n"
+        "- Total time: ...\n"
+        "- Tags: ...\n\n"
+        "## Ingredients\n"
+        "- Ingredient 1\n"
+        "- Ingredient 2\n\n"
+        "## Method\n"
+        "1. Step one.\n"
+        "2. Step two.\n\n"
+        "## Notes\n"
+        "- substitutions, warnings, or brief context\n\n"
+        "## Source\n"
+        "- file id, query, or other provenance\n"
+    )
+    return {
+        "schema_version": RECIPE_CARD_SCHEMA_VERSION,
+        "title": "Recipe Card Standard",
+        "purpose": "Minimal, AI-friendly recipe notes that are easy to read, create, and normalize.",
+        "checklist": [
+            "One title and one short summary paragraph.",
+            "At a glance section with yield and timing if known.",
+            "One ingredient per bullet; no nested ingredient subheadings.",
+            "One method step per numbered item; no nested step headings.",
+            "Notes stay brief and only capture exceptions or substitutions.",
+            "Source is explicit so the recipe can be traced later.",
+            "Use the same structure every time before creating a new recipe card.",
+        ],
+        "sections": [
+            "Title",
+            "At a glance",
+            "Ingredients",
+            "Method",
+            "Notes",
+            "Source",
+        ],
+        "template": template,
+    }
+
+
+def _extract_recipe_summary(text: str) -> str | None:
+    lines = text.splitlines()
+    summary_lines: list[str] = []
+    started = False
+    for line in lines:
+        stripped = line.strip()
+        if not started:
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                started = True
+                continue
+            started = True
+            summary_lines.append(stripped)
+            continue
+        if stripped.startswith("#"):
+            break
+        if stripped:
+            summary_lines.append(stripped)
+        elif summary_lines:
+            break
+    summary = " ".join(summary_lines).strip()
+    return summary or None
+
+
+def _strip_recipe_intro_block(text: str) -> str:
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index < len(lines) and lines[index].strip().startswith("#"):
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        while index < len(lines) and lines[index].strip() and not lines[index].strip().startswith("#"):
+            index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+    return "\n".join(lines[index:])
+
+
 def _promote_candidate_memory(
     connection: sqlite3.Connection,
     candidate: CandidateMemory,
@@ -118,6 +206,64 @@ def _promote_candidate_memory(
         },
         created_by="user",
     )
+
+
+def _normalize_recipe_note_text(
+    *,
+    title: str,
+    metadata: dict[str, Any],
+    body: str,
+    source_hint: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    parsed = _extract_recipe_structure(_strip_recipe_intro_block(body), title=title)
+    recipe_card = metadata.get("recipe_card") if isinstance(metadata.get("recipe_card"), dict) else {}
+    summary = str(metadata.get("summary") or recipe_card.get("summary") or "").strip() or _extract_recipe_summary(body)
+    tags = metadata.get("tags") if isinstance(metadata.get("tags"), list) else []
+    source_bits: list[str] = []
+    if isinstance(recipe_card, dict):
+        for key in ("source_file_id", "source_query"):
+            value = recipe_card.get(key)
+            if value:
+                source_bits.append(f"{key.replace('_', ' ').title()}: {value}")
+    for key in ("source", "created_from_chat", "created_for"):
+        value = metadata.get(key)
+        if value:
+            source_bits.append(f"{key.replace('_', ' ').title()}: {value}")
+    if source_hint:
+        source_bits.append(source_hint)
+    source = "\n".join(dict.fromkeys(source_bits)) or None
+    body_text = _render_recipe_card_body(
+        title,
+        summary=summary,
+        ingredients=parsed["ingredients"],
+        steps=parsed["steps"],
+        servings=parsed["servings"] or str(recipe_card.get("servings") or metadata.get("servings") or "").strip() or None,
+        prep_time=parsed["prep_time"] or str(recipe_card.get("prep_time") or metadata.get("prep_time") or "").strip() or None,
+        cook_time=parsed["cook_time"] or str(recipe_card.get("cook_time") or metadata.get("cook_time") or "").strip() or None,
+        total_time=parsed["total_time"] or str(recipe_card.get("total_time") or metadata.get("total_time") or "").strip() or None,
+        notes=parsed["notes"] or str(metadata.get("notes") or recipe_card.get("notes") or "").strip() or None,
+        tags=[str(tag) for tag in tags if str(tag).strip()],
+        source=source,
+    )
+    normalized_metadata = {
+        **metadata,
+        "kind": "recipe_card",
+        "recipe_card": {
+            **(recipe_card if isinstance(recipe_card, dict) else {}),
+            "schema_version": RECIPE_CARD_SCHEMA_VERSION,
+            "ingredients": parsed["ingredients"],
+            "steps": parsed["steps"],
+            "servings": parsed["servings"] or (recipe_card.get("servings") if isinstance(recipe_card, dict) else None),
+            "prep_time": parsed["prep_time"] or (recipe_card.get("prep_time") if isinstance(recipe_card, dict) else None),
+            "cook_time": parsed["cook_time"] or (recipe_card.get("cook_time") if isinstance(recipe_card, dict) else None),
+            "total_time": parsed["total_time"] or (recipe_card.get("total_time") if isinstance(recipe_card, dict) else None),
+            "notes": parsed["notes"] or (recipe_card.get("notes") if isinstance(recipe_card, dict) else None),
+            "summary": summary,
+            "source_file_id": recipe_card.get("source_file_id") if isinstance(recipe_card, dict) else None,
+            "source_query": recipe_card.get("source_query") if isinstance(recipe_card, dict) else None,
+        },
+    }
+    return body_text, normalized_metadata
 
 
 class HomeMCPError(RuntimeError):
@@ -520,6 +666,7 @@ class HomeMCPServer:
         draft_title = parsed["title"]
         body = _render_recipe_card_body(
             draft_title,
+            summary=parsed["summary"] or _extract_recipe_summary(source_text or ""),
             ingredients=parsed["ingredients"],
             steps=parsed["steps"],
             servings=parsed["servings"],
@@ -527,7 +674,7 @@ class HomeMCPServer:
             cook_time=parsed["cook_time"],
             total_time=parsed["total_time"],
             notes=parsed["notes"],
-            summary=parsed["summary"],
+            tags=parsed["tags"],
             source=query or file_id,
         )
         return {
@@ -552,6 +699,7 @@ class HomeMCPServer:
                 "summary": parsed["summary"],
                 "confidence": parsed["confidence"],
                 "tags": parsed["tags"],
+                "standard": _recipe_standard(),
             },
         }
 
@@ -612,6 +760,7 @@ class HomeMCPServer:
             )
         recipe_metadata = {
             "kind": "recipe_card",
+            "schema_version": RECIPE_CARD_SCHEMA_VERSION,
             "recipe_card": {
                 "ingredients": ingredients or [],
                 "steps": steps or [],
@@ -623,11 +772,13 @@ class HomeMCPServer:
                 "summary": summary,
                 "source_file_id": source_file_id,
                 "source_query": source_query,
+                "schema_version": RECIPE_CARD_SCHEMA_VERSION,
             },
             **(metadata or {}),
         }
         recipe_body = body or _render_recipe_card_body(
             title,
+            summary=summary,
             ingredients=ingredients or [],
             steps=steps or [],
             servings=servings,
@@ -635,7 +786,7 @@ class HomeMCPServer:
             cook_time=cook_time,
             total_time=total_time,
             notes=notes,
-            summary=summary,
+            tags=tags or [],
             source=source_file_id or source_query,
         )
         result = self.create_markdown_note(
@@ -648,6 +799,58 @@ class HomeMCPServer:
         )
         result["recipe_id"] = result["file_id"]
         return result
+
+    def recipe_standard(self) -> dict[str, Any]:
+        return {"status": "ok", **_recipe_standard()}
+
+    def normalize_recipe_book(self, *, apply: bool = False, limit: int = 500) -> dict[str, Any]:
+        root = self._get_root("recipe_book")
+        changed: list[dict[str, Any]] = []
+        inspected = 0
+        for path in _iter_text_files(root.path, file_types=[".md"], limit=limit):
+            inspected += 1
+            try:
+                raw_text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            metadata, body = _parse_markdown_document(raw_text)
+            title = str(metadata.get("title") or path.stem).strip()
+            normalized_body, normalized_metadata = _normalize_recipe_note_text(
+                title=title,
+                metadata=metadata,
+                body=body,
+                source_hint=f"File: {path.relative_to(root.path)}",
+            )
+            normalized_text = _frontmatter(
+                {
+                    "title": title,
+                    "created_at": metadata.get("created_at"),
+                    "updated_at": utc_now() if apply else metadata.get("updated_at"),
+                    "root_id": root.id,
+                    "kind": "markdown_note",
+                    "tags": metadata.get("tags", []),
+                    "metadata": normalized_metadata,
+                }
+            )
+            normalized_text += "\n" + normalized_body.strip() + "\n"
+            if raw_text != normalized_text:
+                changed.append(
+                    {
+                        "file_id": _file_id(root, path.resolve()),
+                        "relative_path": str(path.relative_to(root.path)),
+                        "title": title,
+                    }
+                )
+                if apply:
+                    path.write_text(normalized_text, encoding="utf-8")
+        return {
+            "status": "ok",
+            "root_id": root.id,
+            "inspected": inspected,
+            "changed": len(changed),
+            "dry_run": not apply,
+            "changed_files": changed,
+        }
 
     def search_recipes(
         self,
@@ -677,7 +880,11 @@ class HomeMCPServer:
             title = str(metadata.get("title") or path.stem).strip()
             body_text = redact_text(body)
             recipe_structure = _extract_recipe_structure(body_text, title=title)
-            combined_text = " ".join([title, " ".join(card_tags), body_text, str(metadata.get("kind", "")), str(metadata.get("summary", ""))]).lower()
+            card_summary = str(
+                metadata.get("summary")
+                or (metadata.get("recipe_card", {}) if isinstance(metadata.get("recipe_card"), dict) else {}).get("summary", "")
+            )
+            combined_text = " ".join([title, " ".join(card_tags), body_text, str(metadata.get("kind", "")), card_summary]).lower()
             matched_terms = [term for term in re.split(r"\s+", normalized_query) if term] if normalized_query else []
             matched_terms = [term for term in matched_terms if term in combined_text]
             if normalized_query and not matched_terms and normalized_query not in combined_text:
@@ -716,6 +923,7 @@ class HomeMCPServer:
                     "cook_time": recipe_structure["cook_time"],
                     "total_time": recipe_structure["total_time"],
                     "recipe_summary": recipe_structure["summary"],
+                    "schema_version": (metadata.get("recipe_card", {}) if isinstance(metadata.get("recipe_card"), dict) else {}).get("schema_version"),
                     "score": round(score, 3),
                     "match_reason": "title" if normalized_query and normalized_query in title.lower() else "content" if normalized_query else "recent",
                     "matched_terms": matched_terms,
@@ -1129,6 +1337,11 @@ class HomeMCPServer:
 
     def tools(self) -> list[dict[str, Any]]:
         return [
+            _tool_definition(
+                "recipe_standard",
+                "List the canonical recipe card standard before creating or normalizing recipes.",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+            ),
             _tool_definition("list_allowed_roots", "List allowed roots exposed by the home-mcp server.", {"type": "object", "properties": {}, "additionalProperties": False}),
             _tool_definition(
                 "list_files",
@@ -1601,6 +1814,8 @@ class HomeMCPServer:
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
                 metadata=arguments.get("metadata") if isinstance(arguments.get("metadata"), dict) else None,
             )
+        if name == "recipe_standard":
+            return self.recipe_standard()
         if name == "create_recipe_card":
             return self.create_recipe_card(
                 title=str(arguments["title"]),
@@ -2172,6 +2387,7 @@ def _normalize_recipe_steps(lines: list[str]) -> list[str]:
 def _render_recipe_card_body(
     title: str,
     *,
+    summary: str | None = None,
     ingredients: list[str] | None = None,
     steps: list[str] | None = None,
     servings: str | None = None,
@@ -2179,31 +2395,35 @@ def _render_recipe_card_body(
     cook_time: str | None = None,
     total_time: str | None = None,
     notes: str | None = None,
-    summary: str | None = None,
+    tags: list[str] | None = None,
     source: str | None = None,
 ) -> str:
     lines: list[str] = [f"# {title}"]
     if summary:
         lines.append("")
         lines.append(summary.strip())
-    if servings or prep_time or cook_time or total_time:
+    if servings or prep_time or cook_time or total_time or tags:
         lines.append("")
-        lines.append("## Timing")
+        lines.append("## At a glance")
         if servings:
-            lines.append(f"- Servings: {servings}")
+            lines.append(f"- Yield: {servings}")
         if prep_time:
             lines.append(f"- Prep time: {prep_time}")
         if cook_time:
             lines.append(f"- Cook time: {cook_time}")
         if total_time:
             lines.append(f"- Total time: {total_time}")
+        if tags:
+            joined_tags = ", ".join(tag for tag in tags if str(tag).strip())
+            if joined_tags:
+                lines.append(f"- Tags: {joined_tags}")
     if ingredients:
         lines.append("")
         lines.append("## Ingredients")
         lines.extend(f"- {item}" for item in ingredients if item.strip())
     if steps:
         lines.append("")
-        lines.append("## Steps")
+        lines.append("## Method")
         lines.extend(f"{index + 1}. {item}" for index, item in enumerate(steps) if item.strip())
     if notes:
         lines.append("")
@@ -2212,7 +2432,8 @@ def _render_recipe_card_body(
     if source:
         lines.append("")
         lines.append("## Source")
-        lines.append(str(source).strip())
+        source_lines = [line.strip() for line in str(source).splitlines() if line.strip()]
+        lines.extend(f"- {line}" if not line.startswith("-") else line for line in source_lines)
     return "\n".join(line for line in lines if line is not None).strip() + "\n"
 
 

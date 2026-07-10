@@ -3439,6 +3439,23 @@ def home_mcp_draft_recipe_card(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("recipe-standard")
+def home_mcp_recipe_standard() -> None:
+    """Print the canonical recipe card standard."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:recipe-standard", {})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {"run_id": run.run_id, **server.recipe_standard()}
+        logger.write_artifact(run, "home_mcp_recipe_standard.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("read-file")
 def home_mcp_read_file(
     file_id: str = typer.Option(..., "--file-id", help="File identifier in root_id:relative/path.md form."),
@@ -3580,6 +3597,26 @@ def home_mcp_create_recipe_card(
             ),
         }
         logger.write_artifact(run, "home_mcp_create_recipe_card.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("normalize-recipes")
+def home_mcp_normalize_recipes(
+    apply: bool = typer.Option(False, "--apply", help="Rewrite recipe files in place."),
+    limit: int = typer.Option(500, "--limit", min=1, max=1000, help="Maximum recipe files to inspect."),
+) -> None:
+    """Normalize recipe notes in the recipe book to the canonical card format."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:normalize-recipes", {"apply": apply, "limit": limit})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {"run_id": run.run_id, **server.normalize_recipe_book(apply=apply, limit=limit)}
+        logger.write_artifact(run, "home_mcp_normalize_recipes.json", json.dumps(payload, indent=2, sort_keys=True))
         logger.finish(run, status="ok", result=payload)
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     except Exception as exc:

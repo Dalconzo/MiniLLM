@@ -60,13 +60,29 @@ For high-risk capabilities, include the reason for rejection or refusal in the t
 
 If the capability is recipe-related, prefer this progression:
 
-1. search or list candidate notes
-2. draft a structured recipe card from the source text or file
-3. review the draft before writing anything durable
-4. create or append a structured recipe note
-5. promote useful results into the curated memory layer later
+1. inspect the recipe card standard first
+2. search or list candidate notes
+3. draft a structured recipe card from the source text or file
+4. review the draft before writing anything durable
+5. create or append a structured recipe note
+6. normalize existing cards to the standard when needed
+7. promote useful results into the curated memory layer later
 
 Do not jump straight from raw transcript text to a permanent recipe record without review.
+
+## Recipe Card Standard
+
+The canonical recipe format is intentionally minimalist:
+
+- one title
+- one short summary paragraph
+- one `## At a glance` section with yield, timing, and tags when known
+- one flat `## Ingredients` list
+- one flat `## Method` list
+- one brief `## Notes` section
+- one explicit `## Source` section
+
+Before creating a recipe card, the agent should inspect the standard and follow it exactly rather than improvising a new layout.
 
 ## Memory Bridge Pattern
 

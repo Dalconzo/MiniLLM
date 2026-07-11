@@ -305,6 +305,11 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
     assert any(tool["name"] == "recipe_standard" for tool in tools)
     assert any(tool["name"] == "browse_recipes" for tool in tools)
     assert any(tool["name"] == "search_recipes" for tool in tools)
+    assert any(tool["name"] == "search_notes" for tool in tools)
+    assert any(tool["name"] == "list_recent_files" for tool in tools)
+    assert any(tool["name"] == "get_recipe" for tool in tools)
+    assert any(tool["name"] == "compare_recipe_attempts" for tool in tools)
+    assert any(tool["name"] == "create_project_note" for tool in tools)
     assert any(tool["name"] == "create_recipe_card" for tool in tools)
     assert any(tool["name"] == "draft_recipe_card" for tool in tools)
 
@@ -317,6 +322,107 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
         }
     )
     assert rpc_call["result"]["structuredContent"]["count"] == 1
+
+
+def test_home_mcp_note_discovery_recipe_lookup_and_attempt_comparison(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    recipe = server.create_recipe_card(
+        title="Attempted Focaccia",
+        ingredients=["500g flour", "1 tbsp rosemary"],
+        steps=["Mix.", "Bake."],
+        tags=["bread"],
+    )
+    server.append_recipe_attempt(
+        recipe_id=recipe["file_id"],
+        notes="Baked at 425F for 22 minutes.",
+        outcome="good crust",
+        next_time="Add more olive oil.",
+    )
+    server.append_recipe_attempt(
+        recipe_id=recipe["file_id"],
+        notes="Baked at 425F for 20 minutes with more oil.",
+        outcome="better crumb",
+        next_time="Try longer proof.",
+    )
+
+    notes = server.search_notes(query="rosemary", root_id="recipe_book", limit=5)
+    assert notes["status"] == "ok"
+    assert notes["view"] == "notes"
+    assert notes["count"] == 1
+    assert notes["results"][0]["file_id"] == recipe["file_id"]
+
+    recent = server.list_recent_files(root_id="recipe_book", limit=5, file_types=[".md"])
+    assert recent["count"] == 1
+    assert recent["files"][0]["file_id"] == recipe["file_id"]
+
+    fetched = server.get_recipe(recipe_id=recipe["file_id"])
+    assert fetched["title"] == "Attempted Focaccia"
+    assert fetched["structure"]["ingredients"] == ["500g flour", "1 tbsp rosemary"]
+    assert fetched["structure"]["steps"][:2] == ["Mix.", "Bake."]
+    assert fetched["standard"]["schema_version"] == 1
+
+    compared = server.compare_recipe_attempts(recipe_id=recipe["file_id"])
+    assert compared["attempt_count"] == 2
+    assert compared["comparison"]["latest_outcome"] == "better crumb"
+    assert compared["comparison"]["latest_next_time"] == "Try longer proof."
+
+    rpc_call = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": {"name": "compare_recipe_attempts", "arguments": {"recipe_id": recipe["file_id"]}},
+        }
+    )
+    assert rpc_call["result"]["structuredContent"]["attempt_count"] == 2
+
+
+def test_home_mcp_creates_project_notes_inside_project_root(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    created = server.create_project_note(
+        project_id="../Craft iPad",
+        title="Station plan",
+        body="Mount, charger, and note workflow.",
+        tags=["craft"],
+    )
+    path = Path(created["path"])
+    assert created["root_id"] == "projects"
+    assert created["project_id"] == "craft-ipad"
+    assert created["relative_path"].startswith("craft-ipad/")
+    assert path.exists()
+    content = path.read_text(encoding="utf-8")
+    assert '"kind": "project_note"' in content
+    assert "Mount, charger, and note workflow." in content
+
+    rpc_call = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "create_project_note",
+                "arguments": {"project_id": "bread monitor", "title": "MVP", "body": "Sensor checklist."},
+            },
+        }
+    )
+    assert rpc_call["result"]["structuredContent"]["root_id"] == "projects"
+
+
+def test_home_mcp_get_recipe_rejects_non_recipe_root(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    note = server.create_markdown_note(root_id="projects", title="Not a Recipe", body="Project body.")
+    with pytest.raises(HomeMCPError) as exc_info:
+        server.get_recipe(recipe_id=note["file_id"])
+    assert exc_info.value.error_code == "invalid_recipe_root"
 
 
 def test_home_mcp_drafts_structured_recipe_cards(tmp_path) -> None:

@@ -3392,6 +3392,51 @@ def home_mcp_search_files(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("search-notes")
+def home_mcp_search_notes(
+    query: str = typer.Argument(..., help="Text query to search across Markdown notes."),
+    root_id: str | None = typer.Option(None, "--root-id", help="Restrict search to a single root."),
+    limit: int = typer.Option(10, "--limit", min=1, max=100, help="Maximum hits to return."),
+) -> None:
+    """Search Markdown notes inside allowlisted roots."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:search-notes", {"query": query, "root_id": root_id, "limit": limit})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {"run_id": run.run_id, **server.search_notes(query=query, root_id=root_id, limit=limit)}
+        logger.write_artifact(run, "home_mcp_search_notes.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("recent-files")
+def home_mcp_recent_files(
+    root_id: str = typer.Option(..., "--root-id", help="Allowlisted root identifier."),
+    limit: int = typer.Option(20, "--limit", min=1, max=100, help="Maximum files to return."),
+    file_types: str | None = typer.Option(None, "--file-types", help="Comma-separated suffixes, e.g. .md,.txt."),
+) -> None:
+    """List recently modified files in an allowlisted root."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:recent-files", {"root_id": root_id, "limit": limit, "file_types": file_types})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.list_recent_files(root_id=root_id, limit=limit, file_types=_comma_values(file_types) if file_types else None),
+        }
+        logger.write_artifact(run, "home_mcp_recent_files.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("search-recipes")
 def home_mcp_search_recipes(
     query: str | None = typer.Option(None, "--query", help="Optional recipe query text."),
@@ -3416,6 +3461,25 @@ def home_mcp_search_recipes(
         raise typer.Exit(code=1) from exc
 
 
+@home_mcp_app.command("get-recipe")
+def home_mcp_get_recipe(
+    recipe_id: str = typer.Option(..., "--recipe-id", help="Recipe file identifier."),
+) -> None:
+    """Read one recipe card with parsed structure."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:get-recipe", {"recipe_id": recipe_id})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {"run_id": run.run_id, **server.get_recipe(recipe_id=recipe_id)}
+        logger.write_artifact(run, "home_mcp_get_recipe.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("browse-recipes")
 def home_mcp_browse_recipes(
     query: str | None = typer.Option(None, "--query", help="Optional recipe query text."),
@@ -3432,6 +3496,25 @@ def home_mcp_browse_recipes(
             **server.browse_recipes(query=query, tags=_comma_values(tags), limit=limit),
         }
         logger.write_artifact(run, "home_mcp_browse_recipes.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("compare-recipe-attempts")
+def home_mcp_compare_recipe_attempts(
+    recipe_id: str = typer.Option(..., "--recipe-id", help="Recipe file identifier."),
+) -> None:
+    """Compare logged attempts for a recipe note."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:compare-recipe-attempts", {"recipe_id": recipe_id})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {"run_id": run.run_id, **server.compare_recipe_attempts(recipe_id=recipe_id)}
+        logger.write_artifact(run, "home_mcp_compare_recipe_attempts.json", json.dumps(payload, indent=2, sort_keys=True))
         logger.finish(run, status="ok", result=payload)
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     except Exception as exc:
@@ -3551,6 +3634,31 @@ def home_mcp_append_note(
             **server.append_markdown_log(file_id=file_id, entry=entry, tags=_comma_values(tags)),
         }
         logger.write_artifact(run, "home_mcp_append_note.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@home_mcp_app.command("create-project-note")
+def home_mcp_create_project_note(
+    project_id: str = typer.Option(..., "--project-id", help="Project identifier used as the folder slug."),
+    title: str = typer.Option(..., "--title", help="Project note title."),
+    body: str = typer.Option(..., "--body", help="Markdown body."),
+    tags: str | None = typer.Option(None, "--tags", help="Comma-separated tags."),
+) -> None:
+    """Create a project note under the projects root."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:create-project-note", {"project_id": project_id, "title": title})
+    try:
+        server = build_home_mcp_server(config)
+        payload = {
+            "run_id": run.run_id,
+            **server.create_project_note(project_id=project_id, title=title, body=body, tags=_comma_values(tags)),
+        }
+        logger.write_artifact(run, "home_mcp_create_project_note.json", json.dumps(payload, indent=2, sort_keys=True))
         logger.finish(run, status="ok", result=payload)
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     except Exception as exc:

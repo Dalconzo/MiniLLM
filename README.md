@@ -35,10 +35,15 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent memory-eval`
 - `lagent home-mcp roots`
 - `lagent home-mcp serve --host 127.0.0.1 --port 8765 --auth-mode none`
+- `lagent home-mcp search-notes "focaccia" --root-id recipe_book`
+- `lagent home-mcp recent-files --root-id recipe_book`
 - `lagent home-mcp search-recipes --query "rosemary"`
 - `lagent home-mcp browse-recipes --query "rosemary"`
+- `lagent home-mcp get-recipe --recipe-id recipe_book:focaccia.md`
+- `lagent home-mcp compare-recipe-attempts --recipe-id recipe_book:focaccia.md`
 - `lagent home-mcp recipe-standard`
 - `lagent home-mcp draft-recipe-card --file-id recipe_book:...`
+- `lagent home-mcp create-project-note --project-id bread-monitor --title "MVP" --body "..."`
 - `lagent home-mcp create-recipe --title "..." --body "..."`
 - `lagent home-mcp create-recipe-card --title "..." --body "..."`
 - `lagent home-mcp normalize-recipes --apply`

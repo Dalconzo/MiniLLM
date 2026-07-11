@@ -518,6 +518,38 @@ class HomeMCPServer:
         hits = hits[:limit]
         return {"status": "ok", "count": len(hits), "query": query, "results": hits}
 
+    def search_notes(
+        self,
+        *,
+        query: str,
+        root_id: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        return {
+            **self.search_files(query=query, root_id=root_id, file_types=[".md"], limit=limit),
+            "view": "notes",
+        }
+
+    def list_recent_files(
+        self,
+        *,
+        root_id: str,
+        limit: int = 20,
+        file_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        root = self._get_root(root_id)
+        if limit < 1:
+            return {"status": "ok", "root_id": root_id, "count": 0, "files": []}
+        files: list[dict[str, Any]] = []
+        for path in _iter_text_files(root.path, file_types=file_types, limit=MAX_SEARCH_FILES):
+            resolved = path.resolve()
+            if not _within_root(resolved, root.path):
+                continue
+            files.append(_file_metadata(root, resolved))
+        files.sort(key=lambda item: str(item["modified_at"]), reverse=True)
+        files = files[:limit]
+        return {"status": "ok", "root_id": root_id, "count": len(files), "files": files}
+
     def read_file(
         self,
         *,
@@ -637,6 +669,32 @@ class HomeMCPServer:
         result["recipe_id"] = result["file_id"]
         return result
 
+    def get_recipe(self, *, recipe_id: str) -> dict[str, Any]:
+        read = self.read_file(file_id=recipe_id)
+        if read["root_id"] != "recipe_book":
+            raise HomeMCPError(
+                "get_recipe only accepts recipe_book files",
+                stage="get_recipe",
+                error_code="invalid_recipe_root",
+                source_ref=recipe_id,
+            )
+        metadata, body = _parse_markdown_document(str(read["content"]))
+        title = str(metadata.get("title") or Path(str(read["relative_path"])).stem).strip()
+        parsed = _extract_recipe_structure(body, title=title)
+        nested_metadata = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
+        return {
+            "status": "ok",
+            "recipe_id": recipe_id,
+            "file": {key: read[key] for key in ("file_id", "root_id", "relative_path", "path", "line_count", "truncated")},
+            "title": title,
+            "tags": metadata.get("tags", []) if isinstance(metadata.get("tags"), list) else [],
+            "metadata": metadata,
+            "recipe_card": nested_metadata.get("recipe_card") if isinstance(nested_metadata.get("recipe_card"), dict) else metadata.get("recipe_card"),
+            "structure": parsed,
+            "content": body.strip(),
+            "standard": _recipe_standard(),
+        }
+
     def draft_recipe_card(
         self,
         *,
@@ -718,6 +776,38 @@ class HomeMCPServer:
         if next_time:
             lines.append(f"Next time: {next_time}")
         return self.append_markdown_log(file_id=recipe_id, entry="\n".join(lines), tags=["recipe_attempt", *(tags or [])])
+
+    def compare_recipe_attempts(self, *, recipe_id: str) -> dict[str, Any]:
+        recipe = self.get_recipe(recipe_id=recipe_id)
+        attempts = _extract_recipe_attempts(str(recipe["content"]))
+        return {
+            "status": "ok",
+            "recipe_id": recipe_id,
+            "title": recipe["title"],
+            "attempt_count": len(attempts),
+            "attempts": attempts,
+            "comparison": _compare_recipe_attempts(attempts),
+        }
+
+    def create_project_note(
+        self,
+        *,
+        project_id: str,
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        cleaned_project_id = _slugify(project_id)
+        result = self.create_markdown_note(
+            root_id="projects",
+            folder=cleaned_project_id,
+            title=title,
+            body=body,
+            tags=["project", cleaned_project_id, *(tags or [])],
+            metadata={"kind": "project_note", "project_id": cleaned_project_id},
+        )
+        result["project_id"] = cleaned_project_id
+        return result
 
     def create_recipe_card(
         self,
@@ -1394,6 +1484,34 @@ class HomeMCPServer:
                 },
             ),
             _tool_definition(
+                "search_notes",
+                "Search Markdown notes inside the allowlisted roots.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "root_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "list_recent_files",
+                "List recently modified files inside an allowlisted root.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "root_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "file_types": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["root_id"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
                 "search_recipes",
                 "Search the recipe book for recipe notes and attempts.",
                 {
@@ -1403,6 +1521,18 @@ class HomeMCPServer:
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "get_recipe",
+                "Read a recipe card by recipe_id with parsed structure and provenance.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "recipe_id": {"type": "string"},
+                    },
+                    "required": ["recipe_id"],
                     "additionalProperties": False,
                 },
             ),
@@ -1539,6 +1669,18 @@ class HomeMCPServer:
                 },
             ),
             _tool_definition(
+                "compare_recipe_attempts",
+                "Compare logged attempts for a recipe note without modifying it.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "recipe_id": {"type": "string"},
+                    },
+                    "required": ["recipe_id"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
                 "memory_status",
                 "Summarize ChatGPT memory health and recent activity.",
                 {
@@ -1546,6 +1688,21 @@ class HomeMCPServer:
                     "properties": {
                         "recent_limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     },
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
+                "create_project_note",
+                "Create a Markdown project note under the projects root.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["project_id", "title", "body"],
                     "additionalProperties": False,
                 },
             ),
@@ -1801,12 +1958,27 @@ class HomeMCPServer:
                 file_types=[str(item) for item in file_types] if isinstance(file_types, list) else None,
                 limit=int(arguments.get("limit", 10)),
             )
+        if name == "search_notes":
+            return self.search_notes(
+                query=str(arguments["query"]),
+                root_id=str(arguments["root_id"]) if arguments.get("root_id") else None,
+                limit=int(arguments.get("limit", 10)),
+            )
+        if name == "list_recent_files":
+            file_types = arguments.get("file_types")
+            return self.list_recent_files(
+                root_id=str(arguments["root_id"]),
+                limit=int(arguments.get("limit", 20)),
+                file_types=[str(item) for item in file_types] if isinstance(file_types, list) else None,
+            )
         if name == "search_recipes":
             return self.search_recipes(
                 query=str(arguments["query"]) if arguments.get("query") is not None else None,
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
                 limit=int(arguments.get("limit", 10)),
             )
+        if name == "get_recipe":
+            return self.get_recipe(recipe_id=str(arguments["recipe_id"]))
         if name == "browse_recipes":
             return self.browse_recipes(
                 query=str(arguments["query"]) if arguments.get("query") is not None else None,
@@ -1878,6 +2050,15 @@ class HomeMCPServer:
                 notes=str(arguments["notes"]),
                 outcome=str(arguments["outcome"]) if arguments.get("outcome") else None,
                 next_time=str(arguments["next_time"]) if arguments.get("next_time") else None,
+                tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
+            )
+        if name == "compare_recipe_attempts":
+            return self.compare_recipe_attempts(recipe_id=str(arguments["recipe_id"]))
+        if name == "create_project_note":
+            return self.create_project_note(
+                project_id=str(arguments["project_id"]),
+                title=str(arguments["title"]),
+                body=str(arguments["body"]),
                 tags=[str(item) for item in arguments.get("tags", [])] if isinstance(arguments.get("tags"), list) else None,
             )
         if name == "memory_status":
@@ -2489,6 +2670,78 @@ def _make_snippet(text: str, term: str, width: int = 220) -> str:
     if end < len(text):
         snippet = snippet + "..."
     return snippet
+
+
+def _extract_recipe_attempts(body: str) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        heading = re.match(r"^##\s+(.+)$", line)
+        if heading:
+            if current and _is_recipe_attempt(current):
+                attempts.append(_finalize_recipe_attempt(current))
+            current = {"heading": heading.group(1).strip(), "tags": [], "notes": [], "outcome": None, "next_time": None}
+            continue
+        if current is None:
+            continue
+        if line.lower().startswith("tags:"):
+            tags = [tag.strip() for tag in line.split(":", 1)[1].split(",") if tag.strip()]
+            current["tags"] = tags
+            continue
+        if line.lower().startswith("outcome:"):
+            current["outcome"] = line.split(":", 1)[1].strip()
+            continue
+        if line.lower().startswith("next time:"):
+            current["next_time"] = line.split(":", 1)[1].strip()
+            continue
+        if line:
+            current["notes"].append(line)
+    if current and _is_recipe_attempt(current):
+        attempts.append(_finalize_recipe_attempt(current))
+    return attempts
+
+
+def _is_recipe_attempt(attempt: dict[str, Any]) -> bool:
+    tags = {str(tag).lower() for tag in attempt.get("tags", [])}
+    return "recipe_attempt" in tags or bool(attempt.get("outcome")) or bool(attempt.get("next_time"))
+
+
+def _finalize_recipe_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "heading": attempt.get("heading"),
+        "tags": attempt.get("tags", []),
+        "notes": "\n".join(str(line) for line in attempt.get("notes", [])).strip(),
+        "outcome": attempt.get("outcome"),
+        "next_time": attempt.get("next_time"),
+    }
+
+
+def _compare_recipe_attempts(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not attempts:
+        return {"summary": "No recipe attempts recorded.", "latest_outcome": None, "latest_next_time": None, "changes": []}
+    changes: list[str] = []
+    previous_notes = ""
+    for index, attempt in enumerate(attempts, start=1):
+        notes = str(attempt.get("notes") or "").strip()
+        if index == 1:
+            changes.append(f"Attempt {index}: initial logged attempt.")
+        elif notes and notes != previous_notes:
+            changes.append(f"Attempt {index}: notes changed from previous attempt.")
+        elif notes:
+            changes.append(f"Attempt {index}: notes repeated the previous attempt.")
+        if attempt.get("outcome"):
+            changes.append(f"Attempt {index}: outcome - {attempt['outcome']}")
+        if attempt.get("next_time"):
+            changes.append(f"Attempt {index}: next time - {attempt['next_time']}")
+        previous_notes = notes
+    latest = attempts[-1]
+    return {
+        "summary": f"{len(attempts)} recipe attempt{'s' if len(attempts) != 1 else ''} recorded.",
+        "latest_outcome": latest.get("outcome"),
+        "latest_next_time": latest.get("next_time"),
+        "changes": changes,
+    }
 
 
 def _tool_definition(name: str, description: str, input_schema: dict[str, Any]) -> dict[str, Any]:

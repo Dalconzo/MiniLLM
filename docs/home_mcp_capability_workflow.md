@@ -61,7 +61,7 @@ For high-risk capabilities, include the reason for rejection or refusal in the t
 If the capability is recipe-related, prefer this progression:
 
 1. inspect the recipe card standard first
-2. search or list candidate notes
+2. browse or search candidate notes
 3. draft a structured recipe card from the source text or file
 4. review the draft before writing anything durable
 5. create or append a structured recipe note

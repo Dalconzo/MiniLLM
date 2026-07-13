@@ -276,3 +276,27 @@ def test_bake_cam_cli_schedule_flow(tmp_path: Path, monkeypatch) -> None:
     assert scheduled.exit_code == 0, scheduled.output
     payload = json.loads(scheduled.output)
     assert [item["offset_label"] for item in payload["capture_plan"]] == ["t+0h", "t+2h", "t+4h", "t+6h", "t+8h"]
+
+
+def test_bake_cam_cli_start_session_accepts_started_at(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_config(tmp_path)
+    monkeypatch.setenv("LAGENT_CONFIG", str(config_path))
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "bake-cam",
+            "start-session",
+            "--type",
+            "starter_feeding",
+            "--name",
+            "Started at feed",
+            "--started-at",
+            "2026-07-12T17:30:00-07:00",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["session"]["started_at"] == "2026-07-12T17:30:00-07:00"

@@ -3339,13 +3339,21 @@ def bake_cam_start_session(
     recipe_id: str | None = typer.Option(None, "--recipe-id", help="Optional recipe ID to attach."),
     batch_id: str | None = typer.Option(None, "--batch-id", help="Optional dough/bake batch ID."),
     feeding_id: str | None = typer.Option(None, "--feeding-id", help="Optional starter feeding ID."),
+    started_at: str | None = typer.Option(None, "--started-at", help="Optional ISO timestamp for the session start/feeding time."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """Create a baking observation session."""
     config, _client, logger = _client_and_logger()
     run = logger.start(
         "bake-cam:start-session",
-        {"type": session_type, "name": name, "recipe_id": recipe_id, "batch_id": batch_id, "feeding_id": feeding_id},
+        {
+            "type": session_type,
+            "name": name,
+            "recipe_id": recipe_id,
+            "batch_id": batch_id,
+            "feeding_id": feeding_id,
+            "started_at": started_at,
+        },
     )
     try:
         session = bake_cam_create_session(
@@ -3355,6 +3363,7 @@ def bake_cam_start_session(
             recipe_id=recipe_id,
             batch_id=batch_id,
             feeding_id=feeding_id,
+            started_at=started_at,
         )
         payload = {"status": "ok", "run_id": run.run_id, "session": session}
         logger.write_artifact(run, "bake_cam_session.json", json.dumps(payload, indent=2, sort_keys=True))

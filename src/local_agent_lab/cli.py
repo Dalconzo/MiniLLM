@@ -36,6 +36,20 @@ from .agents.test_writer import (
     parse_test_writer_response,
     render_test_plan,
 )
+from .bake_cam import (
+    BakeCamError,
+    capture_now as bake_cam_capture_now,
+    create_session as bake_cam_create_session,
+    health_check as bake_cam_health_check,
+    latest_capture as bake_cam_latest_capture,
+    list_devices as bake_cam_list_devices,
+    list_sessions as bake_cam_list_sessions,
+    load_session as bake_cam_load_session,
+    schedule_session as bake_cam_schedule_session,
+    status_summary as bake_cam_status_summary,
+    sync_spooled_captures as bake_cam_sync_spooled_captures,
+    write_trace as bake_cam_write_trace,
+)
 from .config import load_config
 from .indexing.repo_indexer import default_db_path, index_repo
 from .llm.model_router import route_task
@@ -98,7 +112,9 @@ from .tools.search import fetch_file_chunks, search_index
 
 app = typer.Typer(add_completion=False, help="Local Agent Lab CLI")
 home_mcp_app = typer.Typer(add_completion=False, help="Home MCP server and local tools.")
+bake_cam_app = typer.Typer(add_completion=False, help="Baking/proofing camera workstation tools.")
 app.add_typer(home_mcp_app, name="home-mcp")
+app.add_typer(bake_cam_app, name="bake-cam")
 
 
 def _client_and_logger():
@@ -3298,6 +3314,344 @@ def _comma_values(value: str | None) -> list[str]:
     if value is None:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+@bake_cam_app.command("devices")
+def bake_cam_devices(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """List configured baking camera workstations."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:devices", {})
+    try:
+        payload = {"status": "ok", "run_id": run.run_id, "devices": bake_cam_list_devices(config.paths["data_dir"])}
+        logger.write_artifact(run, "bake_cam_devices.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_devices(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("start-session")
+def bake_cam_start_session(
+    session_type: str = typer.Option(..., "--type", help="Session type: starter_feeding, bulk_fermentation, final_proof, bake, misc."),
+    name: str = typer.Option(..., "--name", help="Human-readable session name."),
+    recipe_id: str | None = typer.Option(None, "--recipe-id", help="Optional recipe ID to attach."),
+    batch_id: str | None = typer.Option(None, "--batch-id", help="Optional dough/bake batch ID."),
+    feeding_id: str | None = typer.Option(None, "--feeding-id", help="Optional starter feeding ID."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Create a baking observation session."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start(
+        "bake-cam:start-session",
+        {"type": session_type, "name": name, "recipe_id": recipe_id, "batch_id": batch_id, "feeding_id": feeding_id},
+    )
+    try:
+        session = bake_cam_create_session(
+            config.paths["data_dir"],
+            session_type=session_type,
+            name=name,
+            recipe_id=recipe_id,
+            batch_id=batch_id,
+            feeding_id=feeding_id,
+        )
+        payload = {"status": "ok", "run_id": run.run_id, "session": session}
+        logger.write_artifact(run, "bake_cam_session.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_session(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("list-sessions")
+def bake_cam_list_sessions_command(
+    limit: int = typer.Option(20, "--limit", min=1, max=100, help="Maximum sessions to show."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """List recent baking observation sessions."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:list-sessions", {"limit": limit})
+    try:
+        payload = {"status": "ok", "run_id": run.run_id, "sessions": bake_cam_list_sessions(config.paths["data_dir"], limit=limit)}
+        logger.write_artifact(run, "bake_cam_sessions.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_sessions(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("show-session")
+def bake_cam_show_session(
+    session_id: str = typer.Argument(..., help="Session ID to inspect."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Show one baking observation session."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:show-session", {"session_id": session_id})
+    try:
+        session = bake_cam_load_session(config.paths["data_dir"], session_id)
+        payload = {"status": "ok", "run_id": run.run_id, "session": session}
+        logger.write_artifact(run, "bake_cam_session.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_session(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("health")
+def bake_cam_health(
+    device: str = typer.Option("DavesDev", "--device", help="Device ID to probe."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Check SSH, camera tooling, disk, and time for a camera workstation."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:health", {"device": device})
+    try:
+        payload = {"run_id": run.run_id, **bake_cam_health_check(config.paths["data_dir"], device_id=device)}
+        logger.write_artifact(run, "bake_cam_health.json", json.dumps(payload, indent=2, sort_keys=True))
+        bake_cam_write_trace(run.run_dir / "trace.jsonl", payload["trace"])
+        logger.finish(run, status=payload["status"], result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_health(payload))
+        if payload["status"] == "error":
+            raise typer.Exit(code=1)
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("schedule")
+def bake_cam_schedule(
+    session_id: str = typer.Option(..., "--session", help="Session ID to schedule."),
+    every: str | None = typer.Option(None, "--every", help="Interval like 30m, 2h, 1d. Requires --until."),
+    until: str | None = typer.Option(None, "--until", help="End offset like 12h. Requires --every."),
+    at: str | None = typer.Option(None, "--at", help="Comma-separated offsets like 0h,2h,4h,8h."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Attach a deterministic t-plus capture plan to a session."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:schedule", {"session_id": session_id, "every": every, "until": until, "at": at})
+    try:
+        schedule = bake_cam_schedule_session(config.paths["data_dir"], session_id=session_id, every=every, until=until, at=at)
+        payload = {"status": "ok", "run_id": run.run_id, **schedule}
+        logger.write_artifact(run, "bake_cam_schedule.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_schedule(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("capture-now")
+def bake_cam_capture_now_command(
+    session_id: str = typer.Option(..., "--session", help="Session ID to attach capture to."),
+    device: str = typer.Option("DavesDev", "--device", help="Device ID to capture from."),
+    camera: str = typer.Option("main", "--camera", help="Camera ID label."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Capture one still image from a baking camera workstation."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:capture-now", {"session_id": session_id, "device": device, "camera": camera})
+    try:
+        payload = {"run_id": run.run_id, **bake_cam_capture_now(config.paths["data_dir"], session_id=session_id, device_id=device, camera_id=camera)}
+        logger.write_artifact(run, "bake_cam_capture.json", json.dumps(payload, indent=2, sort_keys=True))
+        bake_cam_write_trace(run.run_dir / "trace.jsonl", payload["trace"])
+        logger.finish(run, status=payload["status"], result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_capture(payload))
+        if payload["status"] == "error":
+            raise typer.Exit(code=1)
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("latest")
+def bake_cam_latest(
+    session_id: str | None = typer.Option(None, "--session", help="Optional session ID filter."),
+    camera: str | None = typer.Option(None, "--camera", help="Optional camera ID filter."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Show the latest captured still image metadata."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:latest", {"session_id": session_id, "camera": camera})
+    try:
+        capture = bake_cam_latest_capture(config.paths["data_dir"], session_id=session_id, camera_id=camera)
+        payload = {"status": "ok", "run_id": run.run_id, "capture": capture}
+        logger.write_artifact(run, "bake_cam_latest.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_latest(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("sync")
+def bake_cam_sync(
+    session_id: str | None = typer.Option(None, "--session", help="Optional session ID to sync."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Retry copy-back for remote captures left in the device spool."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:sync", {"session_id": session_id})
+    try:
+        payload = {"run_id": run.run_id, **bake_cam_sync_spooled_captures(config.paths["data_dir"], session_id=session_id)}
+        logger.write_artifact(run, "bake_cam_sync.json", json.dumps(payload, indent=2, sort_keys=True))
+        bake_cam_write_trace(run.run_dir / "trace.jsonl", payload["trace"])
+        logger.finish(run, status=payload["status"], result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_sync(payload))
+        if payload["status"] == "error":
+            raise typer.Exit(code=1)
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+@bake_cam_app.command("status")
+def bake_cam_status(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Show device, session, latest capture, and failure status."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("bake-cam:status", {})
+    try:
+        payload = {"run_id": run.run_id, **bake_cam_status_summary(config.paths["data_dir"])}
+        logger.write_artifact(run, "bake_cam_status.json", json.dumps(payload, indent=2, sort_keys=True))
+        logger.finish(run, status="ok", result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True) if json_output else _render_bake_cam_status(payload))
+    except BakeCamError as exc:
+        _finish_bake_cam_error(logger, run, exc)
+
+
+def _finish_bake_cam_error(logger: RunLogger, run, exc: BakeCamError) -> None:
+    payload = {"status": "error", "run_id": run.run_id, "error": exc.to_dict()}
+    logger.write_artifact(run, "bake_cam_error.json", json.dumps(payload, indent=2, sort_keys=True))
+    logger.finish(run, status="error", result=payload)
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True), err=True)
+    raise typer.Exit(code=1)
+
+
+def _render_bake_cam_devices(payload: dict) -> str:
+    lines = [f"run_id: {payload['run_id']}", "devices:"]
+    for device in payload["devices"]:
+        lines.append(f"- {device['device_id']} -> {device['ssh_target']} ({device.get('role', 'camera')})")
+    return "\n".join(lines)
+
+
+def _render_bake_cam_session(payload: dict) -> str:
+    session = payload["session"]
+    return "\n".join(
+        [
+            f"run_id: {payload['run_id']}",
+            f"session_id: {session['session_id']}",
+            f"name: {session['name']}",
+            f"type: {session['activity_type']}",
+            f"status: {session['status']}",
+            f"captures: {session['capture_count']}",
+            f"last_error: {session.get('last_error')}",
+        ]
+    )
+
+
+def _render_bake_cam_sessions(payload: dict) -> str:
+    lines = [f"run_id: {payload['run_id']}", f"sessions: {len(payload['sessions'])}"]
+    for session in payload["sessions"]:
+        lines.append(
+            f"- {session['session_id']} | {session['activity_type']} | {session['name']} | captures={session.get('capture_count', 0)}"
+        )
+    return "\n".join(lines)
+
+
+def _render_bake_cam_health(payload: dict) -> str:
+    probe = payload.get("probe", {})
+    lines = [
+        f"run_id: {payload['run_id']}",
+        f"status: {payload['status']}",
+        f"device: {payload['device']['device_id']}",
+        f"ssh_ok: {payload['ssh_ok']}",
+        f"camera_available: {payload['camera_available']}",
+        f"hostname: {probe.get('hostname')}",
+        f"time: {probe.get('time')}",
+        f"disk: {probe.get('disk')}",
+        f"camera_tool: {probe.get('camera_tool')}",
+        f"camera_probe: {probe.get('camera_probe')}",
+        f"video_devices: {probe.get('video_devices')}",
+    ]
+    failed_events = [event for event in payload.get("trace", []) if event.get("status") == "error"]
+    for event in failed_events:
+        details = event.get("details", {})
+        lines.append(f"failed_stage: {event.get('stage')}")
+        lines.append(f"error: {details.get('stderr') or event.get('message')}")
+    return "\n".join(lines)
+
+
+def _render_bake_cam_schedule(payload: dict) -> str:
+    lines = [f"run_id: {payload['run_id']}", f"session_id: {payload['session_id']}", "capture_plan:"]
+    for item in payload["capture_plan"]:
+        lines.append(f"- {item['offset_label']} | {item['status']} | capture_id={item.get('capture_id')}")
+    return "\n".join(lines)
+
+
+def _render_bake_cam_capture(payload: dict) -> str:
+    if payload["status"] != "ok":
+        return "\n".join(
+            [
+                f"run_id: {payload['run_id']}",
+                "status: error",
+                f"stage: {payload['error']['stage']}",
+                f"error: {payload['error']['message']}",
+            ]
+        )
+    capture = payload["capture"]
+    return "\n".join(
+        [
+            f"run_id: {payload['run_id']}",
+            "status: ok",
+            f"capture_id: {capture['capture_id']}",
+            f"local_path: {capture['local_path']}",
+            f"elapsed_seconds: {capture['elapsed_seconds']}",
+        ]
+    )
+
+
+def _render_bake_cam_latest(payload: dict) -> str:
+    capture = payload["capture"]
+    return "\n".join(
+        [
+            f"run_id: {payload['run_id']}",
+            f"capture_id: {capture['capture_id']}",
+            f"session_id: {capture['session_id']}",
+            f"camera_id: {capture['camera_id']}",
+            f"captured_at: {capture['captured_at']}",
+            f"local_path: {capture['local_path']}",
+        ]
+    )
+
+
+def _render_bake_cam_sync(payload: dict) -> str:
+    lines = [
+        f"run_id: {payload['run_id']}",
+        f"status: {payload['status']}",
+        f"synced: {len(payload['synced'])}",
+        f"failed: {len(payload['failed'])}",
+    ]
+    for item in payload["synced"][:5]:
+        lines.append(f"- synced {item['capture_id']} -> {item['local_path']}")
+    for item in payload["failed"][:5]:
+        lines.append(f"- failed {item['capture_id']} from {item['remote_path']}: {item['error']}")
+    return "\n".join(lines)
+
+
+def _render_bake_cam_status(payload: dict) -> str:
+    latest = payload.get("latest_capture") or {}
+    lines = [
+        f"run_id: {payload['run_id']}",
+        f"devices: {len(payload['devices'])}",
+        f"active_sessions: {len(payload['active_sessions'])}",
+        f"recent_sessions: {len(payload['recent_sessions'])}",
+        f"latest_capture: {latest.get('local_path') if latest else None}",
+    ]
+    for session in payload["active_sessions"][:5]:
+        plan = session.get("capture_plan") or []
+        pending = len([item for item in plan if item.get("status") == "pending"])
+        lines.append(
+            f"- {session['session_id']} | {session['activity_type']} | captures={session.get('capture_count', 0)} | pending={pending} | last_error={session.get('last_error')}"
+        )
+    return "\n".join(lines)
 
 
 @home_mcp_app.command("serve")

@@ -51,6 +51,13 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent home-mcp install-service`
 - `lagent home-mcp service-status`
 - `lagent home-mcp service-url`
+- `lagent bake-cam devices`
+- `lagent bake-cam start-session --type starter_feeding --name "..."`
+- `lagent bake-cam health --device DavesDev`
+- `lagent bake-cam capture-now --session <session-id> --device DavesDev --camera main`
+- `lagent bake-cam sync --session <session-id>`
+- `lagent bake-cam latest`
+- `lagent bake-cam status`
 - Structured run logging under `data/logs/`
 - Patch artifacts under `data/patches/`
 - Initial routing labels for local-vs-frontier expectations
@@ -99,3 +106,4 @@ lagent memory-check
 - `home-mcp` exposes only allowlisted roots and is intended to be tunneled or relayed, not opened directly to the public internet. Supported auth modes are `none`, `bearer`, `oauth` (proxy-handled), and `mixed`.
 - `lagent home-mcp install-service` installs launchd agents for the local server and the OpenAI secure tunnel client on macOS. The current tunnel URL is recorded in `data/home_mcp/current_tunnel_url.txt`, and the tunnel client runtime key is stored locally in `~/.config/tunnel-client/home-mcp.env`.
 - Capability expansion guidance for future assistant work lives in [`docs/home_mcp_capability_workflow.md`](docs/home_mcp_capability_workflow.md).
+- Baking/proofing camera workstation planning is tracked under `lagent-192`; the storage and trace contract lives in [`docs/baking_observation_workstations.md`](docs/baking_observation_workstations.md).

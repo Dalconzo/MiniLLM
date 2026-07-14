@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from local_agent_lab.config import load_config
-from local_agent_lab.cli import _probe_home_mcp_health, _render_memory_search
+from local_agent_lab.cli import _probe_home_mcp_health, _render_memory_search, _run_home_mcp_smoke_test
 from local_agent_lab.home_mcp import HomeMCPError, _extract_recipe_structure, build_home_mcp_server, serve_home_mcp
 from local_agent_lab.memory.audit import init_audit_schema
 from local_agent_lab.memory.candidates import init_candidate_memory_schema
@@ -740,6 +740,52 @@ def test_home_mcp_http_health_and_rpc_round_trip(tmp_path) -> None:
         assert payload["result"]["roots"]
         initialize = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}})
         assert initialize["result"]["authentication"]["mode"] == "none"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_home_mcp_smoke_test_exercises_http_jsonrpc(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+    httpd = serve_home_mcp(server, host="127.0.0.1", port=0)
+    try:
+        port = httpd.server_address[1]
+        payload = _run_home_mcp_smoke_test(url=f"http://127.0.0.1:{port}/mcp")
+        assert payload["ok"] is True
+        assert payload["tool_count"] > 0
+        assert payload["required_tools_present"]["list_allowed_roots"] is True
+        assert payload["required_tools_present"]["recipe_standard"] is True
+        assert payload["required_tools_present"]["search_recipes"] is True
+        assert payload["write_result"] is None
+        assert {stage["name"] for stage in payload["stages"]} >= {
+            "health",
+            "initialize",
+            "tools/list",
+            "tool:list_allowed_roots",
+            "tool:recipe_standard",
+            "tool:search_recipes",
+        }
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_home_mcp_smoke_test_write_probe_is_explicit(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+    httpd = serve_home_mcp(server, host="127.0.0.1", port=0)
+    try:
+        port = httpd.server_address[1]
+        payload = _run_home_mcp_smoke_test(url=f"http://127.0.0.1:{port}/mcp", write_probe=True)
+        assert payload["ok"] is True
+        assert payload["write_probe"] is True
+        assert payload["write_result"] is not None
+        created = sorted((tmp_path / "data" / "home_mcp" / "projects" / "_smoke_tests").glob("*.md"))
+        assert len(created) == 1
+        assert "Automated write probe" in created[0].read_text(encoding="utf-8")
     finally:
         httpd.shutdown()
         httpd.server_close()

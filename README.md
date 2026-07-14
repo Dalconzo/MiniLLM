@@ -51,6 +51,7 @@ This repo now implements Phase 0 through Phase 5 from the spec:
 - `lagent home-mcp install-service`
 - `lagent home-mcp service-status`
 - `lagent home-mcp service-url`
+- `lagent home-mcp smoke-test --url http://127.0.0.1:8765/mcp`
 - `lagent bake-cam devices`
 - `lagent bake-cam start-session --type starter_feeding --name "..."`
 - `lagent bake-cam health --device DavesDev`
@@ -105,5 +106,6 @@ lagent memory-check
 - `lagent review --diff` requires the target repo to be an actual git checkout with `.git` metadata present.
 - `home-mcp` exposes only allowlisted roots and is intended to be tunneled or relayed, not opened directly to the public internet. Supported auth modes are `none`, `bearer`, `oauth` (proxy-handled), and `mixed`.
 - `lagent home-mcp install-service` installs launchd agents for the local server and the OpenAI secure tunnel client on macOS. The current tunnel URL is recorded in `data/home_mcp/current_tunnel_url.txt`, and the tunnel client runtime key is stored locally in `~/.config/tunnel-client/home-mcp.env`.
+- `lagent home-mcp smoke-test` verifies the actual JSON-RPC endpoint with stage-level results for health, initialize, tool listing, root discovery, recipe standard access, and recipe search. Add `--write-probe` only when you intentionally want to create a probe note under `projects/_smoke_tests`.
 - Capability expansion guidance for future assistant work lives in [`docs/home_mcp_capability_workflow.md`](docs/home_mcp_capability_workflow.md).
 - Baking/proofing camera workstation planning is tracked under `lagent-192`; the storage and trace contract lives in [`docs/baking_observation_workstations.md`](docs/baking_observation_workstations.md).

@@ -10,6 +10,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import typer
 
@@ -4277,6 +4278,32 @@ def home_mcp_service_status() -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
+@home_mcp_app.command("smoke-test")
+def home_mcp_smoke_test(
+    url: str = typer.Option("http://127.0.0.1:8765/mcp", "--url", help="Home MCP JSON-RPC endpoint to test."),
+    auth_token: str | None = typer.Option(None, "--auth-token", help="Optional bearer token for protected endpoints."),
+    write_probe: bool = typer.Option(False, "--write-probe", help="Create a timestamped probe note to verify write access."),
+) -> None:
+    """Exercise the actual Home MCP JSON-RPC endpoint and report stage-level failures."""
+    config, _client, logger = _client_and_logger()
+    run = logger.start("home-mcp:smoke-test", {"url": url, "auth_token": bool(auth_token), "write_probe": write_probe})
+    try:
+        payload = _run_home_mcp_smoke_test(url=url, auth_token=auth_token, write_probe=write_probe)
+        payload["run_id"] = run.run_id
+        logger.write_artifact(run, "home_mcp_smoke_test.json", json.dumps(payload, indent=2, sort_keys=True))
+        status = "ok" if payload["ok"] else "error"
+        logger.finish(run, status=status, result=payload)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        if not payload["ok"]:
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        logger.finish(run, status="error", result={"error": str(exc)})
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @home_mcp_app.command("service-url")
 def home_mcp_service_url() -> None:
     """Print the current Cloudflare tunnel URL, if one is recorded."""
@@ -4316,6 +4343,156 @@ def _probe_home_mcp_health(url: str) -> dict[str, object]:
 
                 time.sleep(1)
     return {"ok": False, "status": "error", "response": None, "error": last_error, "attempts": 10}
+
+
+def _post_home_mcp_jsonrpc(url: str, payload: dict[str, object], *, auth_token: str | None = None, timeout: int = 5) -> dict[str, object]:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON-RPC response was not an object")
+    return parsed
+
+
+def _smoke_stage(
+    stages: list[dict[str, object]],
+    *,
+    name: str,
+    url: str,
+    payload: dict[str, object],
+    auth_token: str | None,
+    expect_result: bool = True,
+) -> dict[str, object] | None:
+    try:
+        response = _post_home_mcp_jsonrpc(url, payload, auth_token=auth_token)
+        error = response.get("error")
+        result = response.get("result")
+        ok = error is None and (result is not None if expect_result else True)
+        stage = {
+            "name": name,
+            "ok": ok,
+            "jsonrpc_error": error,
+            "result_keys": sorted(result.keys()) if isinstance(result, dict) else [],
+        }
+        stages.append(stage)
+        return result if isinstance(result, dict) else None
+    except Exception as exc:
+        stages.append({"name": name, "ok": False, "error": str(exc)})
+        return None
+
+
+def _run_home_mcp_smoke_test(*, url: str, auth_token: str | None = None, write_probe: bool = False) -> dict[str, object]:
+    parsed_url = urlparse(url)
+    health_path = parsed_url.path.removesuffix("/mcp").rstrip("/") + "/health"
+    health_url = urlunparse(parsed_url._replace(path=health_path, query="", fragment=""))
+    stages: list[dict[str, object]] = []
+    health = _probe_home_mcp_health(health_url)
+    stages.append({"name": "health", "ok": bool(health["ok"]), "status": health["status"], "error": health["error"]})
+
+    initialize = _smoke_stage(
+        stages,
+        name="initialize",
+        url=url,
+        auth_token=auth_token,
+        payload={"jsonrpc": "2.0", "id": "smoke-initialize", "method": "initialize", "params": {}},
+    )
+    tools = _smoke_stage(
+        stages,
+        name="tools/list",
+        url=url,
+        auth_token=auth_token,
+        payload={"jsonrpc": "2.0", "id": "smoke-tools", "method": "tools/list", "params": {}},
+    )
+    roots = _smoke_stage(
+        stages,
+        name="tool:list_allowed_roots",
+        url=url,
+        auth_token=auth_token,
+        payload={
+            "jsonrpc": "2.0",
+            "id": "smoke-roots",
+            "method": "tools/call",
+            "params": {"name": "list_allowed_roots", "arguments": {}},
+        },
+    )
+    recipe_standard = _smoke_stage(
+        stages,
+        name="tool:recipe_standard",
+        url=url,
+        auth_token=auth_token,
+        payload={
+            "jsonrpc": "2.0",
+            "id": "smoke-recipe-standard",
+            "method": "tools/call",
+            "params": {"name": "recipe_standard", "arguments": {}},
+        },
+    )
+    search_recipes = _smoke_stage(
+        stages,
+        name="tool:search_recipes",
+        url=url,
+        auth_token=auth_token,
+        payload={
+            "jsonrpc": "2.0",
+            "id": "smoke-search-recipes",
+            "method": "tools/call",
+            "params": {"name": "search_recipes", "arguments": {"query": "sourdough", "limit": 5}},
+        },
+    )
+
+    write_result: dict[str, object] | None = None
+    if write_probe:
+        write_result = _smoke_stage(
+            stages,
+            name="tool:create_markdown_note",
+            url=url,
+            auth_token=auth_token,
+            payload={
+                "jsonrpc": "2.0",
+                "id": "smoke-write",
+                "method": "tools/call",
+                "params": {
+                    "name": "create_markdown_note",
+                    "arguments": {
+                        "root_id": "projects",
+                        "folder": "_smoke_tests",
+                        "title": "Home MCP smoke test",
+                        "body": "Automated write probe from `lagent home-mcp smoke-test --write-probe`.",
+                        "tags": ["smoke-test", "home-mcp"],
+                    },
+                },
+            },
+        )
+
+    tool_names: list[str] = []
+    if isinstance(tools, dict):
+        raw_tools = tools.get("tools")
+        if isinstance(raw_tools, list):
+            tool_names = sorted(str(tool.get("name")) for tool in raw_tools if isinstance(tool, dict) and tool.get("name"))
+
+    ok = all(bool(stage.get("ok")) for stage in stages)
+    return {
+        "ok": ok,
+        "url": url,
+        "auth_token_used": bool(auth_token),
+        "write_probe": write_probe,
+        "stage_count": len(stages),
+        "stages": stages,
+        "server": initialize.get("serverInfo") if isinstance(initialize, dict) else None,
+        "tool_count": len(tool_names),
+        "required_tools_present": {
+            name: name in tool_names
+            for name in ["list_allowed_roots", "recipe_standard", "search_recipes", "create_markdown_note", "memory_status"]
+        },
+        "roots_ok": roots is not None,
+        "recipe_standard_ok": recipe_standard is not None,
+        "search_recipes_ok": search_recipes is not None,
+        "write_result": write_result,
+    }
 
 
 if __name__ == "__main__":

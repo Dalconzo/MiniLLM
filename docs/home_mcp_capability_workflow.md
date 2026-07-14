@@ -103,6 +103,8 @@ This bridge should remain optional and explicit. The recipe book must still be u
 - Add tests before widening the scope.
 - Verify the terminal command and the MCP tool stay in sync.
 - Confirm the tunnel or launchd path still works after the change.
+- Run `lagent home-mcp smoke-test --url http://127.0.0.1:8765/mcp` against the running service before testing from ChatGPT.
+- Use `lagent home-mcp smoke-test --write-probe` only when a durable create-path probe is needed; it writes under `projects/_smoke_tests`.
 - Document the final operator command in `README.md` if needed.
 - Keep the structured recipe draft and recipe card schemas aligned.
 

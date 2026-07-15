@@ -1220,6 +1220,7 @@ def memory_context(
     subject: str | None = typer.Option(None, "--subject", help="Optional subject filter."),
     effort: int = typer.Option(2, "--effort", min=1, max=5, help="Retrieval effort level, 1-5."),
     allow_cross_domain: bool = typer.Option(False, "--allow-cross-domain", help="Allow explicit cross-domain expansion."),
+    explain: bool = typer.Option(False, "--explain", help="Write context/ranking explanation artifacts."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """Build an agent-facing memory context pack with provenance and controlled disclosure."""
@@ -1234,6 +1235,7 @@ def memory_context(
             "subject": subject,
             "effort": effort,
             "allow_cross_domain": allow_cross_domain,
+            "explain": explain,
         },
     )
     memory_trace = MemoryTraceWriter(
@@ -1274,12 +1276,18 @@ def memory_context(
             "query": query,
             "depth": depth,
             "ranking_profile": result["ranking_profile"],
+            "domain_detection": result["domain_detection"],
+            "filters_applied": result["filters_applied"],
+            "governance": result["governance"],
+            "lenses": result["lenses"],
             "candidate_counts": result["candidate_counts"],
             "context_items": context_items,
         }
         memory_trace.write_json("context_pack.json", payload)
+        if explain:
+            memory_trace.write_json("context_explain.json", payload)
         memory_trace.finish(status="ok", result=payload)
-        if json_output:
+        if json_output or explain:
             typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         else:
             typer.echo(_render_memory_context(payload))
@@ -1293,8 +1301,11 @@ def memory_context(
             stage = "retrieve_candidates"
             source_ref = str(db_path)
         memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
-        memory_trace.finish(status="error", result={"error": error}, error=error)
-        typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        payload = {"status": "error", "query": query, "run_id": run.run_id, "error": error}
+        if explain:
+            memory_trace.write_json("context_explain.json", payload)
+        memory_trace.finish(status="error", result=payload, error=error)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True), err=True)
         raise typer.Exit(code=1)
 
 

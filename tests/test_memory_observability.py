@@ -707,6 +707,94 @@ def test_memory_review_promotes_user_candidate_but_blocks_assistant_suggestion(t
     assert "assistant suggestions stay separate" in blocked.stdout or "assistant suggestions stay separate" in blocked.stderr
 
 
+def test_memory_context_explain_writes_trace_artifact(tmp_path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_path = tmp_path / "raw"
+    export_dir = import_path / "export-1"
+    export_dir.mkdir(parents=True)
+    (export_dir / "conversations.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "conversation-context",
+                    "title": "Recipe context",
+                    "mapping": {
+                        "u": {
+                            "id": "u",
+                            "message": {
+                                "id": "u",
+                                "author": {"role": "user"},
+                                "content": {"parts": ["I want a sourdough recipe workflow with clear baking notes."]},
+                            },
+                        }
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    import_chatgpt_export(input_path=import_path, data_dir=data_dir, memory_dir=memory_dir)
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "agent.yaml").write_text(
+        textwrap.dedent(
+            """
+            app:
+              name: local-agent-lab
+              log_level: info
+            paths:
+              data_dir: data
+              logs_dir: data/logs
+              indexes_dir: data/indexes
+              memory_dir: data/memory
+              patches_dir: data/patches
+            ollama:
+              host: http://127.0.0.1:11434
+              request_timeout_seconds: 180
+            runtime:
+              default_task: chat
+              redact_before_model: true
+              save_full_prompts: true
+            models:
+              chat_small:
+                model: fake
+                task: chat
+                temperature: 0.1
+                max_tokens: 4096
+                routing_label: local
+            routing:
+              task_map:
+                chat: chat_small
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LAGENT_CONFIG", str(config_dir / "agent.yaml"))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["memory-context", "sourdough recipe baking notes", "--depth", "medium", "--explain", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+    assert payload["context_items"]
+    assert payload["domain_detection"]["primary_domain"] == "cooking_baking"
+    assert payload["candidate_counts"]["after_filters"] == 1
+
+    trace = read_memory_trace(data_dir / "logs", payload["run_id"])
+    assert "context_pack.json" in trace["artifacts"]
+    assert "context_explain.json" in trace["artifacts"]
+    explain = json.loads((data_dir / "logs" / payload["run_id"] / "context_explain.json").read_text(encoding="utf-8"))
+    assert explain["ranking_profile"] == "hybrid_memory_v1"
+    assert explain["context_items"][0]["source_id"].startswith("chk_")
+
+
 def test_memory_review_subjects_browses_candidate_queue_by_subject_and_traces(tmp_path, monkeypatch) -> None:
     data_dir = tmp_path / "data"
     memory_dir = data_dir / "memory"

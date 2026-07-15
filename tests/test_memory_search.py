@@ -83,6 +83,21 @@ def test_search_chatgpt_memory_returns_citations_and_score_breakdown(tmp_path) -
     assert result["results"][0]["validation_checks"]["temporal"]["status"] == "not_run"
 
 
+def test_search_chatgpt_memory_falls_back_for_natural_language_queries(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(
+        memory_dir=data_dir / "memory",
+        query="where exactly should we look when debugging the barcode workflow",
+    )
+
+    assert result["status"] == "ok"
+    assert result["count"] >= 1
+    assert any(item["field"] == "fts_strategy" and item["value"] == "broad_any_terms" for item in result["filters_applied"])
+    assert result["results"][0]["title"] == "Barcode parser debugging"
+
+
 def test_search_chatgpt_memory_effort_caps_disclosure_and_adds_validation(tmp_path) -> None:
     data_dir = tmp_path / "data"
     import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
@@ -273,7 +288,8 @@ def test_search_chatgpt_memory_blocks_curated_records_from_tombstoned_sources(tm
         tombstone_source(connection, source_kind="chatgpt_export", source_id=chunk_id, reason="private")
 
     second = search_chatgpt_memory(memory_dir=memory_dir, query="curated barcode")
-    assert second["count"] == 0
+    assert all(item["chunk_id"] != chunk_id for item in second["results"])
+    assert all(item["source_kind"] != "curated_memory" for item in second["results"])
 
 
 def test_search_chatgpt_memory_errors_when_database_missing(tmp_path) -> None:

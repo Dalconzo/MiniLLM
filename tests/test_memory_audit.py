@@ -8,6 +8,7 @@ from local_agent_lab.memory.audit import (
     tombstone_source,
 )
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
+from local_agent_lab.memory.curated import create_memory_record
 from local_agent_lab.memory.search import search_chatgpt_memory
 
 
@@ -70,6 +71,26 @@ def test_tombstoned_source_is_excluded_from_search(tmp_path) -> None:
 
     assert second["count"] == 0
     assert second["filters_applied"][0]["field"] == "exclude_source"
+
+
+def test_tombstoned_curated_memory_id_is_excluded_from_search(tmp_path) -> None:
+    memory_dir = _import_memory(tmp_path)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        record = create_memory_record(
+            connection,
+            record_type="decision",
+            title="Use barcode parser workflow",
+            body="The barcode parser workflow should be used for recipe-adjacent lab notes.",
+            trust_level="high",
+            record_id="mem_direct_block_test",
+        )
+        tombstone_source(connection, source_kind="curated_memory", source_id=record.id, reason="private")
+
+    result = search_chatgpt_memory(memory_dir=memory_dir, query="barcode parser workflow")
+
+    assert all(item["chunk_id"] != record.id for item in result["results"])
+    assert result["filters_applied"][0]["field"] == "exclude_source"
 
 
 def test_record_retrieval_event_stores_exposed_sources(tmp_path) -> None:

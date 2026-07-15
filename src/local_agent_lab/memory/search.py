@@ -47,8 +47,8 @@ def search_chatgpt_memory(
             source_ref=str(sqlite_path),
         )
 
-    fts_query = _fts_query(query)
-    if not fts_query:
+    fts_queries = _fts_queries(query)
+    if not fts_queries:
         raise MemoryObservationError(
             "memory search query did not contain searchable terms",
             stage="retrieve_candidates",
@@ -67,7 +67,7 @@ def search_chatgpt_memory(
             "messages.is_deleted = 0",
             "conversations.is_deleted = 0",
         ]
-        params: list[Any] = [fts_query]
+        params: list[Any] = [fts_queries[0][1]]
         excluded_ids = sorted(set(exclude_source_ids or []) | blocked_source_ids(connection))
         if excluded_ids:
             placeholders = ", ".join("?" for _ in excluded_ids)
@@ -178,8 +178,17 @@ def search_chatgpt_memory(
             ORDER BY bm25_score ASC
             LIMIT ?
         """
-        params.append(limit)
-        rows = connection.execute(sql, params).fetchall()
+        rows = []
+        fts_strategy = fts_queries[0][0]
+        for strategy, candidate_fts_query in fts_queries:
+            candidate_params = list(params)
+            candidate_params[0] = candidate_fts_query
+            rows = connection.execute(sql, [*candidate_params, limit]).fetchall()
+            fts_strategy = strategy
+            if rows:
+                break
+        if fts_strategy != "precise_all_terms":
+            filters_applied.append({"field": "fts_strategy", "value": fts_strategy})
         fts_results = [_row_to_hit(index, row) for index, row in enumerate(rows, start=1)]
         curated_results = _curated_hits(
             connection,
@@ -336,6 +345,8 @@ def _curated_hits(
         params.append(date_to)
     if exclude_source_ids:
         placeholders = ", ".join("?" for _ in exclude_source_ids)
+        where.append(f"memory_records.id NOT IN ({placeholders})")
+        params.extend(exclude_source_ids)
         where.append(f"(memory_records.source_ref IS NULL OR memory_records.source_ref NOT IN ({placeholders}))")
         params.extend(exclude_source_ids)
         where.append(
@@ -467,9 +478,62 @@ def _attach_effort_checks(hit: dict[str, Any], *, effort: int, query: str, query
     return projected
 
 
-def _fts_query(query: str) -> str:
+FTS_STOP_WORDS = {
+    "a",
+    "about",
+    "after",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "before",
+    "do",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "know",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "should",
+    "that",
+    "the",
+    "this",
+    "to",
+    "what",
+    "when",
+    "where",
+    "with",
+}
+
+
+def _fts_queries(query: str) -> list[tuple[str, str]]:
+    tokens = _search_tokens(query)
+    if not tokens:
+        return []
+    precise = " ".join(_quoted_fts_token(token) for token in tokens)
+    if len(tokens) == 1:
+        return [("precise_all_terms", precise)]
+    broad = " OR ".join(_quoted_fts_token(token) for token in tokens)
+    return [("precise_all_terms", precise), ("broad_any_terms", broad)]
+
+
+def _search_tokens(query: str) -> list[str]:
     tokens = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]*", query)
-    return " ".join(f'"{token.replace(chr(34), chr(34) + chr(34))}"' for token in tokens)
+    filtered = [token for token in tokens if token.lower() not in FTS_STOP_WORDS]
+    return filtered or tokens
+
+
+def _quoted_fts_token(token: str) -> str:
+    return f'"{token.replace(chr(34), chr(34) + chr(34))}"'
 
 
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:

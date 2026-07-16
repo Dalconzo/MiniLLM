@@ -5,12 +5,15 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from local_agent_lab.evals.fixtures import MemoryEvalConversation, UsagePromptCase, memory_eval_conversations, memory_usage_prompt_cases
+from local_agent_lab.evals.runner import score_expectations, summarize_usage_cases
+
 from .audit import record_retrieval_event, retrieval_exposures_for_run
 from .chatgpt_ingest import import_chatgpt_export
 from .candidates import list_candidate_memories
 from .curated import create_memory_record, promote_chunk_to_memory_record
 from .search import search_chatgpt_memory
-from .subjects import assign_conversation_subject
+from .subjects import assign_conversation_subject, get_subject
 
 
 def run_memory_eval(work_dir: Path) -> dict[str, Any]:
@@ -20,6 +23,8 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
     memory_dir = data_dir / "memory"
     import_report = import_chatgpt_export(input_path=input_path, data_dir=data_dir, memory_dir=memory_dir)
     db_path = memory_dir / "chatgpt_memory.sqlite3"
+
+    _prepare_eval_memory_state(db_path)
 
     checks: list[dict[str, Any]] = []
     exact = search_chatgpt_memory(memory_dir=memory_dir, query="barcode parser")
@@ -35,11 +40,6 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
         )
     )
 
-    with sqlite3.connect(db_path) as connection:
-        conversation_id = connection.execute(
-            "SELECT id FROM conversations WHERE title = 'Lab automation parser'"
-        ).fetchone()[0]
-        assign_conversation_subject(connection, conversation_id, "Lab Automation", include_chunks=True)
     subject = search_chatgpt_memory(memory_dir=memory_dir, query="barcode", subject="Lab Automation")
     checks.append(_check("subject_filter", subject["count"] >= 1, {"count": subject["count"]}))
 
@@ -90,22 +90,6 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
         )
     )
 
-    with sqlite3.connect(db_path) as connection:
-        create_memory_record(
-            connection,
-            record_type="decision",
-            title="Portfolio rebalancing notes",
-            body="Rebalance index funds monthly and document the rationale.",
-            trust_level="canonical",
-        )
-        create_memory_record(
-            connection,
-            record_type="decision",
-            title="Old portfolio note",
-            body="This should no longer surface in high-risk search.",
-            trust_level="low",
-            status="stale",
-        )
     high_risk = search_chatgpt_memory(memory_dir=memory_dir, query="portfolio", depth="full", effort=4)
     checks.append(
         _check(
@@ -135,18 +119,29 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
         exposures = retrieval_exposures_for_run(connection, "memory_eval_run")
     checks.append(_check("audit_exposures", audit["exposures"] == len(exposures) >= 1, {"exposures": len(exposures)}))
 
+    usage_cases = [_run_usage_prompt_case(memory_dir, case) for case in memory_usage_prompt_cases()]
+    usage_summary = summarize_usage_cases(usage_cases)
     failed = [check for check in checks if check["status"] != "pass"]
+    failed_usage = [case for case in usage_cases if case["status"] != "pass"]
     return {
-        "status": "fail" if failed else "pass",
+        "status": "fail" if failed or failed_usage else "pass",
         "import_report": {
             "import_id": import_report["import_id"],
             "summary": import_report["summary"],
         },
         "checks": checks,
+        "usage_cases": usage_cases,
+        "usage_summary": usage_summary,
         "summary": {
             "checks": len(checks),
             "passed": len(checks) - len(failed),
             "failed": len(failed),
+            "usage_cases": len(usage_cases),
+            "usage_passed": len(usage_cases) - len(failed_usage),
+            "usage_failed": len(failed_usage),
+            "usage_score": usage_summary["score"],
+            "usage_max_score": usage_summary["max_score"],
+            "usage_score_pct": usage_summary["score_pct"],
         },
     }
 
@@ -154,47 +149,223 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
 def _write_eval_export(root: Path) -> Path:
     raw_dir = root / "raw" / "eval-export"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    export = [
-        {
-            "id": "eval-lab",
-            "title": "Lab automation parser",
-            "mapping": {
-                "u": {
-                    "id": "u",
-                    "message": {
-                        "id": "u",
-                        "author": {"role": "user"},
-                        "content": {"parts": ["Where is the barcode parser configured?"]},
-                    },
-                },
-                "a": {
-                    "id": "a",
-                    "message": {
-                        "id": "a",
-                        "author": {"role": "assistant"},
-                        "content": {"parts": ["Use the lab automation barcode parser workflow."]},
-                    },
-                },
-            },
-        },
-        {
-            "id": "eval-secret",
-            "title": "Credential note",
-            "mapping": {
-                "u": {
-                    "id": "secret",
-                    "message": {
-                        "id": "secret",
-                        "author": {"role": "user"},
-                        "content": {"parts": ["credential sk-abcdefghijklmnopqrstuvwxyz123456 should be redacted"]},
-                    },
-                }
-            },
-        },
-    ]
+    export = [_conversation_to_export_item(conversation) for conversation in memory_eval_conversations()]
     (raw_dir / "conversations.json").write_text(json.dumps(export), encoding="utf-8")
     return root / "raw"
 
 
 def _check(name: str, passed: bool, details: dict[str, Any]) -> dict[str, Any]:
     return {"name": name, "status": "pass" if passed else "fail", "details": details}
+
+
+def _prepare_eval_memory_state(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for conversation in memory_eval_conversations():
+            if conversation.subject is None:
+                continue
+            row = connection.execute("SELECT id FROM conversations WHERE source_conversation_id = ?", (conversation.id,)).fetchone()
+            if row is not None:
+                assign_conversation_subject(
+                    connection,
+                    row[0],
+                    conversation.subject,
+                    kind=conversation.subject_kind,
+                    include_chunks=True,
+                    source="eval_fixture",
+                )
+
+        home_mcp_subject = get_subject(connection, "Home MCP")
+        recipe_subject = get_subject(connection, "Recipes and Baking")
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Home MCP memory tools",
+            body="Home MCP should expose memory_status, memory_search, recipe tools, and trace run IDs through narrow JSON-RPC tools.",
+            subject_id=home_mcp_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-home-mcp",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Recipe card style",
+            body="Recipe cards should be concise and AI-readable, with confirmed ingredients and steps separated from assistant draft suggestions.",
+            subject_id=recipe_subject.id,
+            trust_level="high",
+            source_kind="eval_fixture",
+            source_ref="eval-recipe",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Portfolio rebalancing notes",
+            body="Rebalance index funds monthly and document the rationale.",
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-finance-current",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Old portfolio note",
+            body="Old portfolio note should no longer surface in high-risk search.",
+            trust_level="low",
+            status="stale",
+            source_kind="eval_fixture",
+            source_ref="eval-finance-stale",
+            created_by="eval",
+        )
+
+
+def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str, Any]:
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query=case.query,
+        subject=case.subject,
+        depth=case.depth,
+        effort=case.effort,
+        allow_cross_domain=case.allow_cross_domain,
+    )
+    searchable_text = _result_text(result)
+    source_kinds = {str(item.get("source_kind")) for item in result.get("results", [])}
+    filters = {(str(item.get("field")), _hashable_value(item.get("value"))) for item in result.get("filters_applied", [])}
+    governance_labels = set(result.get("governance", {}).get("labels", []))
+    first = result.get("results", [{}])[0] if result.get("results") else {}
+    expectations: list[tuple[str, bool, dict[str, Any] | None]] = [
+        ("min_results", int(result.get("count", 0)) >= case.min_results, {"count": result.get("count"), "min_results": case.min_results}),
+    ]
+    expectations.extend(
+        (
+            f"required_term:{term}",
+            term.lower() in searchable_text,
+            {"term": term},
+        )
+        for term in case.required_terms
+    )
+    expectations.extend(
+        (
+            f"forbidden_term:{term}",
+            term.lower() not in searchable_text,
+            {"term": term},
+        )
+        for term in case.forbidden_terms
+    )
+    expectations.extend(
+        (
+            f"source_kind:{source_kind}",
+            source_kind in source_kinds,
+            {"source_kinds": sorted(source_kinds)},
+        )
+        for source_kind in case.expected_source_kinds
+    )
+    if case.expected_primary_domain is not None:
+        expectations.append(
+            (
+                "primary_domain",
+                result.get("domain_detection", {}).get("primary_domain") == case.expected_primary_domain,
+                {"actual": result.get("domain_detection", {}).get("primary_domain"), "expected": case.expected_primary_domain},
+            )
+        )
+    expectations.extend(
+        (
+            f"filter:{field}",
+            (field, _hashable_value(value)) in filters,
+            {"filters": sorted((field, repr(value)) for field, value in filters), "expected": (field, value)},
+        )
+        for field, value in case.expected_filters
+    )
+    expectations.extend(
+        (
+            f"governance_label:{label}",
+            label in governance_labels,
+            {"labels": sorted(governance_labels)},
+        )
+        for label in case.expected_governance_labels
+    )
+    if case.require_score_breakdown:
+        expectations.append(
+            (
+                "score_breakdown",
+                bool(first.get("score_breakdown")),
+                {"score_breakdown": first.get("score_breakdown")},
+            )
+        )
+    if case.require_validation_checks:
+        expectations.append(
+            (
+                "validation_checks",
+                bool(first.get("validation_checks")),
+                {"validation_checks": first.get("validation_checks")},
+            )
+        )
+
+    scored = score_expectations(expectations)
+    return {
+        "id": case.id,
+        "category": case.category,
+        "complexity": case.complexity,
+        "prompt": case.prompt,
+        "query": case.query,
+        "subject": case.subject,
+        "status": scored["status"],
+        "score": scored["score"],
+        "max_score": scored["max_score"],
+        "score_pct": scored["score_pct"],
+        "expectations": scored["expectations"],
+        "result_summary": {
+            "count": result.get("count"),
+            "ranking_profile": result.get("ranking_profile"),
+            "domain_detection": result.get("domain_detection"),
+            "governance": result.get("governance"),
+            "filters_applied": result.get("filters_applied"),
+            "source_kinds": sorted(source_kinds),
+            "top_result": {
+                key: first.get(key)
+                for key in ("source_kind", "title", "role", "domain_primary", "domain_relation", "governance_reason", "trust_level")
+            },
+        },
+    }
+
+
+def _conversation_to_export_item(conversation: MemoryEvalConversation) -> dict[str, Any]:
+    mapping: dict[str, Any] = {}
+    for index, message in enumerate(conversation.messages):
+        mapping[message.id] = {
+            "id": message.id,
+            "message": {
+                "id": message.id,
+                "author": {"role": message.role},
+                "create_time": message.created_at,
+                "content": {"parts": [message.text]},
+                "metadata": {},
+            },
+            "parent": conversation.messages[index - 1].id if index else None,
+            "children": [conversation.messages[index + 1].id] if index + 1 < len(conversation.messages) else [],
+        }
+    return {
+        "id": conversation.id,
+        "title": conversation.title,
+        "create_time": None,
+        "update_time": None,
+        "mapping": mapping,
+    }
+
+
+def _result_text(result: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in result.get("results", []):
+        parts.extend(str(item.get(key) or "") for key in ("title", "snippet", "chunk_text", "role", "source_kind", "domain_primary"))
+    return "\n".join(parts).lower()
+
+
+def _hashable_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(value)
+    if isinstance(value, dict):
+        return tuple(sorted((key, _hashable_value(item)) for key, item in value.items()))
+    return value

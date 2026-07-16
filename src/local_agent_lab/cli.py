@@ -3242,9 +3242,19 @@ def _render_memory_eval(payload: dict[str, object]) -> str:
         f"Run ID: {payload['run_id']}",
         f"Status: {payload['status']}",
         f"Checks: {summary['passed']}/{summary['checks']} passed",
+        f"Usage: {summary['usage_score']}/{summary['usage_max_score']} points ({summary['usage_score_pct']:.1f}%)",
     ]
     for check in payload["checks"]:
         lines.append(f"- {check['status']} {check['name']}")
+    usage_summary = payload.get("usage_summary", {})
+    by_category = usage_summary.get("by_category", {}) if isinstance(usage_summary, dict) else {}
+    if by_category:
+        lines.append("Usage categories:")
+        for category, category_summary in by_category.items():
+            lines.append(
+                f"- {category}: {category_summary['score']}/{category_summary['max_score']} "
+                f"({category_summary['score_pct']:.1f}%)"
+            )
     return "\n".join(lines)
 
 

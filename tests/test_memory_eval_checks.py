@@ -6,6 +6,16 @@ def test_run_memory_eval_reports_passes(tmp_path) -> None:
 
     assert report["status"] == "pass"
     assert report["summary"]["failed"] == 0
+    assert report["summary"]["usage_failed"] == 0
+    assert report["usage_summary"]["score_pct"] == 100.0
+    assert {case["category"] for case in report["usage_cases"]} == {
+        "curated-memory",
+        "governance",
+        "high-risk",
+        "holistic",
+        "retrieval",
+    }
+    assert {case["complexity"] for case in report["usage_cases"]} == {1, 2, 3, 4}
     assert {check["name"] for check in report["checks"]} == {
         "assistant_user_separation",
         "exact_search",

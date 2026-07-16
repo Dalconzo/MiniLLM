@@ -8,7 +8,7 @@ from typing import Any
 from local_agent_lab.evals.fixtures import MemoryEvalConversation, UsagePromptCase, memory_eval_conversations, memory_usage_prompt_cases
 from local_agent_lab.evals.runner import score_expectations, summarize_usage_cases
 
-from .audit import record_retrieval_event, retrieval_exposures_for_run
+from .audit import record_retrieval_event, retrieval_exposures_for_run, tombstone_source
 from .chatgpt_ingest import import_chatgpt_export
 from .candidates import list_candidate_memories
 from .curated import create_memory_record, promote_chunk_to_memory_record
@@ -177,6 +177,10 @@ def _prepare_eval_memory_state(db_path: Path) -> None:
 
         home_mcp_subject = get_subject(connection, "Home MCP")
         recipe_subject = get_subject(connection, "Recipes and Baking")
+        health_subject = get_subject(connection, "Health Notes")
+        relationship_subject = get_subject(connection, "Relationship Notes")
+        legal_subject = get_subject(connection, "Legal Study")
+        open_loop_subject = get_subject(connection, "Baking Cameras")
         create_memory_record(
             connection,
             record_type="decision",
@@ -190,6 +194,16 @@ def _prepare_eval_memory_state(db_path: Path) -> None:
         )
         create_memory_record(
             connection,
+            record_type="workflow",
+            title="Transferable lab checklist",
+            body="Lab automation checklist: define inputs, capture timing, record failures, and keep every workflow step traceable.",
+            trust_level="high",
+            source_kind="eval_fixture",
+            source_ref="eval-cross-domain-lab-checklist",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
             record_type="preference",
             title="Recipe card style",
             body="Recipe cards should be concise and AI-readable, with confirmed ingredients and steps separated from assistant draft suggestions.",
@@ -197,6 +211,72 @@ def _prepare_eval_memory_state(db_path: Path) -> None:
             trust_level="high",
             source_kind="eval_fixture",
             source_ref="eval-recipe",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Sleep supplement caution",
+            body="Health supplement memories require cautious, source-backed handling; melatonin dose ideas are unverified until checked.",
+            subject_id=health_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-health",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Relationship context boundary",
+            body="Relationship notes should stay contextual and should not convert one vent about a partner or family conflict into a durable fact.",
+            subject_id=relationship_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-relationship",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="research_note",
+            title="Legal study caution",
+            body="Legal and LSAT notes require source authority and must not become current legal advice without checking current law.",
+            subject_id=legal_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-legal",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="open_loop",
+            title="Baking camera open loop",
+            body="Decide whether ESP32 cameras belong in v1 or later for baking captures.",
+            subject_id=open_loop_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-open-loop",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="lesson",
+            title="Sourdough 12 hour cadence",
+            body="Older note says the sourdough starter feeding cadence was every 12 hours.",
+            subject_id=recipe_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-conflict-old",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="lesson",
+            title="Sourdough 24 hour cadence",
+            body="Newer note says the sourdough starter feeding cadence is every 24 hours while the starter is sluggish.",
+            subject_id=recipe_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-conflict-new",
             created_by="eval",
         )
         create_memory_record(
@@ -220,6 +300,24 @@ def _prepare_eval_memory_state(db_path: Path) -> None:
             source_ref="eval-finance-stale",
             created_by="eval",
         )
+        blocked = create_memory_record(
+            connection,
+            record_type="research_note",
+            title="Blocked recipe spam source",
+            body="Blocked recipe spam source says to use one hundred ingredients and no steps.",
+            subject_id=recipe_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-blocked-source",
+            created_by="eval",
+        )
+        tombstone_source(
+            connection,
+            source_kind="memory_record",
+            source_id=blocked.id,
+            reason="eval tombstone for blocked source suppression",
+            deleted_by="eval",
+        )
 
 
 def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str, Any]:
@@ -233,6 +331,7 @@ def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str,
     )
     searchable_text = _result_text(result)
     source_kinds = {str(item.get("source_kind")) for item in result.get("results", [])}
+    domain_relations = {str(item.get("domain_relation")) for item in result.get("results", [])}
     filters = {(str(item.get("field")), _hashable_value(item.get("value"))) for item in result.get("filters_applied", [])}
     governance_labels = set(result.get("governance", {}).get("labels", []))
     first = result.get("results", [{}])[0] if result.get("results") else {}
@@ -262,6 +361,14 @@ def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str,
             {"source_kinds": sorted(source_kinds)},
         )
         for source_kind in case.expected_source_kinds
+    )
+    expectations.extend(
+        (
+            f"domain_relation:{domain_relation}",
+            domain_relation in domain_relations,
+            {"domain_relations": sorted(domain_relations)},
+        )
+        for domain_relation in case.expected_domain_relations
     )
     if case.expected_primary_domain is not None:
         expectations.append(
@@ -324,6 +431,7 @@ def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str,
             "governance": result.get("governance"),
             "filters_applied": result.get("filters_applied"),
             "source_kinds": sorted(source_kinds),
+            "domain_relations": sorted(domain_relations),
             "top_result": {
                 key: first.get(key)
                 for key in ("source_kind", "title", "role", "domain_primary", "domain_relation", "governance_reason", "trust_level")

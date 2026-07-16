@@ -37,6 +37,7 @@ class UsagePromptCase:
     forbidden_terms: tuple[str, ...] = ()
     expected_source_kinds: tuple[str, ...] = ()
     expected_primary_domain: str | None = None
+    expected_domain_relations: tuple[str, ...] = ()
     expected_filters: tuple[tuple[str, Any], ...] = ()
     expected_governance_labels: tuple[str, ...] = ()
     require_score_breakdown: bool = False
@@ -132,6 +133,83 @@ def memory_eval_conversations() -> tuple[MemoryEvalConversation, ...]:
                 ),
             ),
         ),
+        MemoryEvalConversation(
+            id="eval-health",
+            title="Sleep supplement caution",
+            subject="Health Notes",
+            messages=(
+                MemoryEvalMessage(
+                    id="health-u1",
+                    role="user",
+                    text=(
+                        "For health supplements I want cautious, source-backed notes. Melatonin dose ideas "
+                        "should stay unverified unless current evidence is checked."
+                    ),
+                ),
+                MemoryEvalMessage(
+                    id="health-a1",
+                    role="assistant",
+                    text="A supplement dose suggestion should be treated as assistant-only until the user confirms it.",
+                ),
+            ),
+        ),
+        MemoryEvalConversation(
+            id="eval-relationship",
+            title="Relationship context boundary",
+            subject="Relationship Notes",
+            messages=(
+                MemoryEvalMessage(
+                    id="relationship-u1",
+                    role="user",
+                    text=(
+                        "When discussing partner or family conflict, keep notes contextual and avoid treating "
+                        "one vent as a durable relationship fact."
+                    ),
+                ),
+            ),
+        ),
+        MemoryEvalConversation(
+            id="eval-legal",
+            title="Legal study caution",
+            subject="Legal Study",
+            messages=(
+                MemoryEvalMessage(
+                    id="legal-u1",
+                    role="user",
+                    text=(
+                        "For LSAT and legal case briefs, cite source authority and do not turn old legal notes "
+                        "into current legal advice."
+                    ),
+                ),
+            ),
+        ),
+        MemoryEvalConversation(
+            id="eval-projects",
+            title="Project catalog",
+            subject="Project Catalog",
+            messages=(
+                MemoryEvalMessage(
+                    id="projects-u1",
+                    role="user",
+                    text=(
+                        "Active build candidates include the recipe book project, the memory system project, "
+                        "and the Home MCP project."
+                    ),
+                ),
+            ),
+        ),
+        MemoryEvalConversation(
+            id="eval-open-loop",
+            title="Baking camera open loop",
+            subject="Baking Cameras",
+            messages=(
+                MemoryEvalMessage(
+                    id="open-loop-u1",
+                    role="user",
+                    text="TODO later: decide whether ESP32 cameras belong in v1 or later for baking captures.",
+                ),
+            ),
+        ),
     )
 
 
@@ -201,6 +279,110 @@ def memory_usage_prompt_cases() -> tuple[UsagePromptCase, ...]:
             expected_primary_domain="finance_investing",
             expected_governance_labels=("financial_caution",),
             require_validation_checks=True,
+        ),
+        UsagePromptCase(
+            id="high_risk_health",
+            category="high-risk",
+            complexity=3,
+            prompt="Find cautious health supplement memory without exposing assistant-only dosing advice as fact.",
+            query="melatonin supplement dose health evidence",
+            subject="Health Notes",
+            depth="full",
+            effort=4,
+            required_terms=("sleep supplement caution",),
+            expected_primary_domain="health_supplements",
+            expected_governance_labels=("health_caution",),
+            require_validation_checks=True,
+        ),
+        UsagePromptCase(
+            id="high_risk_relationship",
+            category="high-risk",
+            complexity=3,
+            prompt="Find relationship notes with context warnings rather than durable overclaims.",
+            query="partner family relationship conflict context",
+            subject="Relationship Notes",
+            depth="full",
+            effort=4,
+            required_terms=("relationship context boundary",),
+            expected_primary_domain="relationships_life",
+            expected_governance_labels=("relationship_context",),
+            require_validation_checks=True,
+        ),
+        UsagePromptCase(
+            id="high_risk_legal",
+            category="high-risk",
+            complexity=3,
+            prompt="Find legal-study memory with source-authority caution.",
+            query="LSAT legal case brief source authority",
+            subject="Legal Study",
+            depth="full",
+            effort=4,
+            required_terms=("legal study caution",),
+            expected_primary_domain="law_lsat",
+            expected_governance_labels=("source_authority",),
+            require_validation_checks=True,
+        ),
+        UsagePromptCase(
+            id="project_catalog_lookup",
+            category="project-catalog",
+            complexity=2,
+            prompt="Catalog active projects from memory without needing the real private export.",
+            query="active build candidates memory system Home MCP project catalog",
+            subject="Project Catalog",
+            depth="full",
+            required_terms=("project catalog",),
+            expected_primary_domain="ai_memory_systems",
+            expected_filters=(("subject", "Project Catalog"),),
+        ),
+        UsagePromptCase(
+            id="open_loop_lookup",
+            category="lifecycle",
+            complexity=2,
+            prompt="Find unresolved future work about baking cameras.",
+            query="TODO later ESP32 cameras baking captures",
+            subject="Baking Cameras",
+            depth="full",
+            required_terms=("baking camera open loop",),
+            expected_primary_domain="cooking_baking",
+            expected_filters=(("subject", "Baking Cameras"),),
+        ),
+        UsagePromptCase(
+            id="source_conflict_lookup",
+            category="source-conflict",
+            complexity=4,
+            prompt="Retrieve conflicting sourdough cadence notes so a later layer can reconcile them.",
+            query="sourdough feeding cadence 12 hour 24 hour conflict",
+            subject="Recipes and Baking",
+            depth="full",
+            effort=4,
+            required_terms=("sourdough 12 hour cadence", "sourdough 24 hour cadence"),
+            expected_primary_domain="cooking_baking",
+            expected_source_kinds=("curated_memory",),
+        ),
+        UsagePromptCase(
+            id="cross_domain_transfer",
+            category="cross-domain",
+            complexity=4,
+            prompt="Find an adjacent-domain lab checklist that may transfer to a baking workflow.",
+            query="baking checklist",
+            depth="full",
+            effort=4,
+            required_terms=("transferable lab checklist",),
+            expected_source_kinds=("curated_memory",),
+            expected_primary_domain="cooking_baking",
+            expected_domain_relations=("transfer",),
+        ),
+        UsagePromptCase(
+            id="blocked_source_suppression",
+            category="governance",
+            complexity=4,
+            prompt="Search for recipe spam and verify tombstoned memory is suppressed.",
+            query="blocked recipe spam source",
+            depth="full",
+            effort=4,
+            min_results=0,
+            forbidden_terms=("blocked recipe spam source",),
+            expected_primary_domain="cooking_baking",
         ),
         UsagePromptCase(
             id="holistic_recipe_agent_context",

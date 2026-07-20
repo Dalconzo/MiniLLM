@@ -619,7 +619,7 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
 
     rpc = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}})
     tool_names = {tool["name"] for tool in rpc["result"]["tools"]}
-    assert {"memory_status", "memory_search", "memory_review", "memory_subjects", "bridge_recipe_note_to_memory"} <= tool_names
+    assert {"memory_status", "memory_search", "memory_context", "memory_review", "memory_subjects", "bridge_recipe_note_to_memory"} <= tool_names
 
     status = server.memory_status(recent_limit=1)
     assert status["status"] == "ok"
@@ -644,6 +644,22 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     search = server.memory_search(query="rosemary", limit=5)
     assert search["count"] >= 1
     assert any(result["source_kind"] in {"curated_memory", "fts"} for result in search["results"])
+
+    context = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "context",
+            "method": "tools/call",
+            "params": {"name": "memory_context", "arguments": {"query": "rosemary", "limit": 5, "depth": "medium"}},
+        }
+    )
+    structured = context["result"]["structuredContent"]
+    assert structured["status"] == "ok"
+    assert structured["run_id"]
+    assert structured["trace_id"] == structured["run_id"]
+    assert structured["tool_name"] == "memory_context"
+    assert structured["retrieval_event_id"].startswith("ret_")
+    assert structured["context_items"]
 
     recipe = server.create_recipe_card(
         title="Bridge Test Focaccia",
@@ -758,7 +774,10 @@ def test_home_mcp_smoke_test_exercises_http_jsonrpc(tmp_path) -> None:
         assert payload["required_tools_present"]["list_allowed_roots"] is True
         assert payload["required_tools_present"]["recipe_standard"] is True
         assert payload["required_tools_present"]["search_recipes"] is True
+        assert payload["required_tools_present"]["memory_status"] is True
+        assert payload["required_tools_present"]["memory_context"] is True
         assert payload["write_result"] is None
+        assert payload["memory_status_ok"] is True
         assert {stage["name"] for stage in payload["stages"]} >= {
             "health",
             "initialize",
@@ -766,6 +785,7 @@ def test_home_mcp_smoke_test_exercises_http_jsonrpc(tmp_path) -> None:
             "tool:list_allowed_roots",
             "tool:recipe_standard",
             "tool:search_recipes",
+            "tool:memory_status",
         }
     finally:
         httpd.shutdown()

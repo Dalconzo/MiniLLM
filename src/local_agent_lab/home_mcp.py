@@ -17,7 +17,7 @@ import yaml
 from .config import AppConfig
 from .logging.run_logger import RunContext, RunLogger
 from .memory.analysis import analyze_memory_corpus
-from .memory.audit import init_audit_schema
+from .memory.audit import init_audit_schema, record_retrieval_event
 from .memory.candidates import (
     CandidateMemory,
     get_candidate_memory,
@@ -1348,6 +1348,52 @@ class HomeMCPServer:
             allow_cross_domain=allow_cross_domain,
         )
 
+    def memory_context(
+        self,
+        *,
+        query: str,
+        depth: str = "medium",
+        limit: int = 6,
+        subject: str | None = None,
+        effort: int = 2,
+        allow_cross_domain: bool = False,
+        run_id: str,
+    ) -> dict[str, Any]:
+        result = search_chatgpt_memory(
+            memory_dir=self.config.paths["memory_dir"],
+            query=query,
+            limit=limit,
+            subject=subject,
+            depth=depth,
+            effort=effort,
+            allow_cross_domain=allow_cross_domain,
+        )
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        with sqlite3.connect(db_path) as connection:
+            audit = record_retrieval_event(
+                connection,
+                run_id=run_id,
+                query=query,
+                command="home-mcp:memory_context",
+                filters=result["filters_applied"],
+                ranking_profile=result["ranking_profile"],
+                disclosure_depth=depth,
+                results=result["results"],
+            )
+        return {
+            "status": "ok",
+            "retrieval_event_id": audit["retrieval_event_id"],
+            "query": query,
+            "depth": depth,
+            "ranking_profile": result["ranking_profile"],
+            "domain_detection": result["domain_detection"],
+            "filters_applied": result["filters_applied"],
+            "governance": result["governance"],
+            "lenses": result["lenses"],
+            "candidate_counts": result["candidate_counts"],
+            "context_items": [_memory_context_item(item) for item in result["results"]],
+        }
+
     def memory_list(self, *, record_type: str | None = None, limit: int | None = None) -> dict[str, Any]:
         db_path = memory_db_path(self.config.paths["memory_dir"])
         if not db_path.exists():
@@ -1811,6 +1857,23 @@ class HomeMCPServer:
                 },
             ),
             _tool_definition(
+                "memory_context",
+                "Build an agent-facing memory context packet with provenance and controlled disclosure.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "depth": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "subject": {"type": "string"},
+                        "effort": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "allow_cross_domain": {"type": "boolean"},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
                 "memory_list",
                 "List curated memory records.",
                 {
@@ -1908,7 +1971,11 @@ class HomeMCPServer:
                 if not tool_name:
                     raise HomeMCPError("tool name is required", stage="tools/call", error_code="missing_tool_name")
                 trace.trace("call_tool", "Dispatching tool call.", details={"tool": tool_name})
-                result = self.call_tool(str(tool_name), dict(arguments))
+                result = self.call_tool(str(tool_name), dict(arguments), run_id=run.run_id)
+                result.setdefault("run_id", run.run_id)
+                result.setdefault("trace_id", run.run_id)
+                result.setdefault("trace_artifact_dir", str(run.run_dir))
+                result.setdefault("tool_name", str(tool_name))
                 response = _jsonrpc_ok(request_id, _format_tool_result(result))
                 trace.trace("render_response", "Returning tool result.", details={"tool": tool_name})
                 trace.write_json("result.json", response)
@@ -1940,7 +2007,7 @@ class HomeMCPServer:
             trace.finish(status="error", result=response, error=error)
             return response
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call_tool(self, name: str, arguments: dict[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
         if name == "list_allowed_roots":
             return self.list_allowed_roots()
         if name == "list_files":
@@ -2126,6 +2193,18 @@ class HomeMCPServer:
                 depth=str(arguments.get("depth", "medium")),
                 effort=int(arguments.get("effort", 2)),
                 allow_cross_domain=bool(arguments.get("allow_cross_domain", False)),
+            )
+        if name == "memory_context":
+            if run_id is None:
+                raise HomeMCPError("run_id is required for memory_context", stage="memory_context", error_code="missing_run_id")
+            return self.memory_context(
+                query=str(arguments["query"]),
+                depth=str(arguments.get("depth", "medium")),
+                limit=int(arguments.get("limit", 6)),
+                subject=str(arguments["subject"]) if arguments.get("subject") else None,
+                effort=int(arguments.get("effort", 2)),
+                allow_cross_domain=bool(arguments.get("allow_cross_domain", False)),
+                run_id=run_id,
             )
         if name == "memory_list":
             return self.memory_list(
@@ -2742,6 +2821,23 @@ def _compare_recipe_attempts(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         "latest_next_time": latest.get("next_time"),
         "changes": changes,
     }
+
+
+def _memory_context_item(result: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "source_kind": result["source_kind"],
+        "source_id": result["chunk_id"],
+        "conversation_id": result.get("conversation_id"),
+        "message_id": result.get("message_id"),
+        "title": result["title"],
+        "score": result["score"],
+        "score_breakdown": result["score_breakdown"],
+        "disclosure_tier": result["disclosure_tier"],
+        "exposed_fields": result["exposed_fields"],
+    }
+    if "snippet" in result:
+        payload["snippet"] = result["snippet"]
+    return payload
 
 
 def _tool_definition(name: str, description: str, input_schema: dict[str, Any]) -> dict[str, Any]:

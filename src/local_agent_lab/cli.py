@@ -4464,6 +4464,18 @@ def _run_home_mcp_smoke_test(*, url: str, auth_token: str | None = None, write_p
             "params": {"name": "search_recipes", "arguments": {"query": "sourdough", "limit": 5}},
         },
     )
+    memory_status = _smoke_stage(
+        stages,
+        name="tool:memory_status",
+        url=url,
+        auth_token=auth_token,
+        payload={
+            "jsonrpc": "2.0",
+            "id": "smoke-memory-status",
+            "method": "tools/call",
+            "params": {"name": "memory_status", "arguments": {"recent_limit": 3}},
+        },
+    )
 
     write_result: dict[str, object] | None = None
     if write_probe:
@@ -4507,11 +4519,12 @@ def _run_home_mcp_smoke_test(*, url: str, auth_token: str | None = None, write_p
         "tool_count": len(tool_names),
         "required_tools_present": {
             name: name in tool_names
-            for name in ["list_allowed_roots", "recipe_standard", "search_recipes", "create_markdown_note", "memory_status"]
+            for name in ["list_allowed_roots", "recipe_standard", "search_recipes", "create_markdown_note", "memory_status", "memory_context"]
         },
         "roots_ok": roots is not None,
         "recipe_standard_ok": recipe_standard is not None,
         "search_recipes_ok": search_recipes is not None,
+        "memory_status_ok": memory_status is not None,
         "write_result": write_result,
     }
 

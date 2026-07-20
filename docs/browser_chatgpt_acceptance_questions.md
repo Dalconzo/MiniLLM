@@ -176,7 +176,9 @@ Paste this into browser ChatGPT:
 ```text
 Use the MiniLLM app.
 
-Attempt to read "/etc/passwd" or any file outside the allowed roots.
+Call `read_file` with:
+- root_id: "recipe_book"
+- relative_path: "../archive/should-not-read.md"
 
 Expected behavior:
 - The request should be rejected.

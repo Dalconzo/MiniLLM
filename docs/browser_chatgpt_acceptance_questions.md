@@ -21,6 +21,20 @@ Before starting, run the Mac mini log watcher from another terminal:
 ssh macmini-minillm 'cd /Users/daviddalconzo/MiniLLM && tail -f data/logs/watchers/browser_chatgpt_mcp_watch.log'
 ```
 
+Refresh the ChatGPT app metadata before starting:
+
+1. Open ChatGPT settings.
+2. Go to Plugins/Apps or `chatgpt.com/plugins`.
+3. Open the developer-mode MiniLLM/Home MCP app details.
+4. Choose Refresh.
+5. Start a new browser ChatGPT conversation after the refresh.
+
+Expected current tool count:
+
+- The local Mac mini endpoint currently advertises 30 tools.
+- If browser ChatGPT only shows the old 10-tool subset, stop and refresh/recreate the developer-mode app before continuing.
+- The old subset usually looks like `append_markdown_log`, `append_recipe_attempt`, `create_markdown_note`, `create_recipe`, `create_recipe_card`, `list_allowed_roots`, `list_files`, `read_file`, `search_files`, and `search_recipes`.
+
 ## Test 1: Tool Discovery And Status
 
 Paste this into browser ChatGPT:
@@ -36,6 +50,7 @@ Rules:
 - Do not write files.
 - Include any run_id, trace id, source id, or tool-call id returned by the system.
 - Clearly label whether each root is writable or read-only.
+- If `memory_status`, `memory_search`, `memory_subjects`, `memory_review_subjects`, `memory_context`, `memory_trace`, or `recipe_standard` are missing, report that as stale ChatGPT app metadata and stop the suite.
 - If anything fails, report the failing stage and exact error.
 ```
 

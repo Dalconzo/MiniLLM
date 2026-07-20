@@ -8,6 +8,7 @@ Overall pass requires:
 
 - Browser ChatGPT can invoke the MiniLLM/Home MCP app.
 - Tool discovery succeeds.
+- Browser ChatGPT sees the current tool surface, including memory tools and `recipe_standard`.
 - Read-only tools work without writes.
 - The disposable recipe write creates only one allowed file under `recipe_book`.
 - Unsafe filesystem access is rejected.
@@ -18,6 +19,7 @@ Overall pass requires:
 Record a failure if:
 
 - ChatGPT cannot see or call the app.
+- ChatGPT sees only the old 10-tool subset. This indicates stale app metadata or an app-tool allowlist, not a Mac mini server failure.
 - The app setup succeeds but all tool calls fail before reaching Home MCP.
 - The service returns no traceable metadata and no useful error stage.
 - A write occurs outside an allowed writable root.
@@ -40,8 +42,42 @@ Expected properties:
 Failure localization:
 
 - No app visible: ChatGPT app setup or tunnel registration issue.
+- Only old notes/recipe tools visible: refresh/recreate the developer-mode app metadata in ChatGPT.
 - App visible but no roots: MCP initialize/tool dispatch issue.
 - Roots visible but memory status fails: memory DB/config issue.
+
+Current known-good local endpoint tool list:
+
+- `recipe_standard`
+- `list_allowed_roots`
+- `list_files`
+- `search_files`
+- `search_notes`
+- `list_recent_files`
+- `search_recipes`
+- `get_recipe`
+- `browse_recipes`
+- `draft_recipe_card`
+- `read_file`
+- `create_markdown_note`
+- `append_markdown_log`
+- `create_recipe`
+- `create_recipe_card`
+- `append_recipe_attempt`
+- `compare_recipe_attempts`
+- `memory_status`
+- `create_project_note`
+- `memory_analyze`
+- `memory_subjects`
+- `memory_candidates`
+- `memory_review_subjects`
+- `memory_review`
+- `memory_search`
+- `memory_context`
+- `memory_list`
+- `memory_open_loops`
+- `memory_trace`
+- `bridge_recipe_note_to_memory`
 
 ## Test 2: Recipe Standard And Search
 

@@ -1425,7 +1425,12 @@ class HomeMCPServer:
         return {"status": "ok", "count": len(loops), "open_loops": loops}
 
     def memory_trace(self, *, run_id: str) -> dict[str, Any]:
-        return read_memory_trace(self.config.logs_dir, run_id)
+        try:
+            trace = read_memory_trace(self.logger.logs_dir, run_id)
+        except (FileNotFoundError, MemoryObservationError):
+            trace = read_memory_trace(self.config.logs_dir, run_id)
+        trace.setdefault("status", "ok")
+        return trace
 
     def bridge_recipe_note_to_memory(
         self,

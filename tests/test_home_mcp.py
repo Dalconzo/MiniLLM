@@ -660,6 +660,18 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert structured["tool_name"] == "memory_context"
     assert structured["retrieval_event_id"].startswith("ret_")
     assert structured["context_items"]
+    trace = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "trace",
+            "method": "tools/call",
+            "params": {"name": "memory_trace", "arguments": {"run_id": structured["run_id"]}},
+        }
+    )
+    trace_content = trace["result"]["structuredContent"]
+    assert trace_content["status"] == "ok"
+    assert trace_content["run_id"] == structured["run_id"]
+    assert trace_content["tool_name"] == "memory_trace"
 
     recipe = server.create_recipe_card(
         title="Bridge Test Focaccia",

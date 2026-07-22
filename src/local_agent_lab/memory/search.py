@@ -555,6 +555,8 @@ def _effort_depth_cap(depth: str, effort: int) -> str:
         3: "close",
     }.get(effort, "full")
     tiers = ("far", "medium", "close", "full")
+    if depth not in tiers:
+        raise ValueError(f"depth must be one of: {', '.join(tiers)}")
     return tiers[min(tiers.index(depth), tiers.index(effort_depth))]
 
 

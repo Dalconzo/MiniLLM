@@ -1999,6 +1999,18 @@ class HomeMCPServer:
             trace.write_json("result.json", response)
             trace.finish(status="error", result=response, error=exc.to_dict())
             return response
+        except ValueError as exc:
+            error = {
+                "message": str(exc),
+                "stage": "tools/call",
+                "error_code": "invalid_argument",
+                "source_ref": None,
+            }
+            response = _jsonrpc_error(request_id, -32602, str(exc), error)
+            trace.trace("dispatch_error", str(exc), level="error", details={"error": error})
+            trace.write_json("result.json", response)
+            trace.finish(status="error", result=response, error=error)
+            return response
         except Exception as exc:
             error = {
                 "message": str(exc),

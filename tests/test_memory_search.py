@@ -171,6 +171,14 @@ def test_search_chatgpt_memory_depth_caps_disclosure_tier(tmp_path) -> None:
     assert "snippet" not in result["results"][0]
 
 
+def test_search_chatgpt_memory_rejects_invalid_depth_before_effort_cap(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    with pytest.raises(ValueError, match="depth must be one of: far, medium, close, full"):
+        search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", depth="deep")
+
+
 def test_search_chatgpt_memory_includes_curated_memory_records(tmp_path) -> None:
     data_dir = tmp_path / "data"
     memory_dir = data_dir / "memory"

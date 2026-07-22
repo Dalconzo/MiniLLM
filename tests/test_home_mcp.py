@@ -673,6 +673,19 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert trace_content["run_id"] == structured["run_id"]
     assert trace_content["tool_name"] == "memory_trace"
 
+    invalid_depth = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "context-invalid-depth",
+            "method": "tools/call",
+            "params": {"name": "memory_context", "arguments": {"query": "rosemary", "depth": "deep"}},
+        }
+    )
+    assert invalid_depth["error"]["code"] == -32602
+    assert invalid_depth["error"]["data"]["stage"] == "tools/call"
+    assert invalid_depth["error"]["data"]["error_code"] == "invalid_argument"
+    assert "depth must be one of: far, medium, close, full" in invalid_depth["error"]["message"]
+
     recipe = server.create_recipe_card(
         title="Bridge Test Focaccia",
         body="Ingredients:\n- flour\n- rosemary\n\nSteps:\n- mix\n- bake\n",

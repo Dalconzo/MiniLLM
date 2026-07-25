@@ -1745,6 +1745,7 @@ def memory_candidates(
     domain: str | None = typer.Option(None, "--domain", help="Optional domain filter."),
     source_role: str | None = typer.Option(None, "--source-role", help="Optional source role filter."),
     assistant_only: bool = typer.Option(False, "--assistant-only", help="Only show assistant-suggested candidates."),
+    quality_filter: str = typer.Option("all", "--quality-filter", help="Candidate quality filter: all, user_only, or high_signal."),
     limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum candidates to list."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -1758,6 +1759,7 @@ def memory_candidates(
             "domain": domain,
             "source_role": source_role,
             "assistant_only": assistant_only,
+            "quality_filter": quality_filter,
             "limit": limit,
         },
     )
@@ -1786,6 +1788,7 @@ def memory_candidates(
                 "domain": domain,
                 "source_role": source_role,
                 "assistant_only": assistant_only,
+                "quality_filter": quality_filter,
                 "limit": limit,
             },
         )
@@ -1798,10 +1801,24 @@ def memory_candidates(
                     domain=domain,
                     source_role=source_role,
                     assistant_suggestion=True if assistant_only else None,
+                    quality_filter=quality_filter,
                     limit=limit,
                 )
             ]
-        payload = {"status": "ok", "run_id": run.run_id, "count": len(candidates), "candidate_memories": candidates}
+        payload = {
+            "status": "ok",
+            "run_id": run.run_id,
+            "count": len(candidates),
+            "candidate_memories": candidates,
+            "filters": {
+                "review_status": review_status,
+                "domain": domain,
+                "source_role": source_role,
+                "assistant_only": assistant_only,
+                "quality_filter": quality_filter,
+                "limit": limit,
+            },
+        }
         memory_trace.trace("render_output", "Rendering candidate memories.", details={"count": len(candidates)})
         memory_trace.write_json("candidate_memories.json", payload)
         memory_trace.finish(status="ok", result=payload)
@@ -1834,6 +1851,7 @@ def memory_review(
     subject_kind: str = typer.Option("subject", "--subject-kind", help="Subject kind: subject, project, or workflow."),
     source_role: str | None = typer.Option(None, "--source-role", help="Optional source role filter."),
     assistant_only: bool = typer.Option(False, "--assistant-only", help="Only show assistant-suggested candidates."),
+    quality_filter: str = typer.Option("all", "--quality-filter", help="Candidate quality filter: all, user_only, or high_signal."),
     limit: int | None = typer.Option(20, "--limit", min=1, help="Maximum candidates to list."),
     note: str | None = typer.Option(None, "--note", help="Optional review note."),
     record_type: str | None = typer.Option(None, "--record-type", help="Curated record type to create on promote."),
@@ -1856,6 +1874,7 @@ def memory_review(
             "subject_kind": subject_kind,
             "source_role": source_role,
             "assistant_only": assistant_only,
+            "quality_filter": quality_filter,
             "limit": limit,
         },
     )
@@ -1891,6 +1910,7 @@ def memory_review(
                 "subject_kind": subject_kind,
                 "source_role": source_role,
                 "assistant_only": assistant_only,
+                "quality_filter": quality_filter,
                 "limit": limit,
             },
         )
@@ -1909,6 +1929,7 @@ def memory_review(
                     assistant_suggestion=True if assistant_only else None,
                     subject=subject,
                     subject_kind=subject_kind,
+                    quality_filter=quality_filter,
                     limit=limit,
                 )
 
@@ -1926,6 +1947,7 @@ def memory_review(
                         "subject_kind": subject_kind,
                         "source_role": source_role,
                         "assistant_only": assistant_only,
+                        "quality_filter": quality_filter,
                         "limit": limit,
                     },
                 }
@@ -2022,6 +2044,7 @@ def memory_review_subjects(
     review_status: str | None = typer.Option("pending", "--status", help="Optional status filter."),
     source_role: str | None = typer.Option(None, "--source-role", help="Optional source role filter."),
     assistant_only: bool = typer.Option(False, "--assistant-only", help="Only show assistant-suggested candidates."),
+    quality_filter: str = typer.Option("high_signal", "--quality-filter", help="Candidate quality filter: all, user_only, or high_signal."),
     subject_limit: int = typer.Option(20, "--subject-limit", min=1, help="Maximum subjects to list."),
     candidate_limit: int = typer.Option(20, "--candidate-limit", min=1, help="Maximum candidates to show for a selected subject."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
@@ -2037,6 +2060,7 @@ def memory_review_subjects(
             "review_status": review_status,
             "source_role": source_role,
             "assistant_only": assistant_only,
+            "quality_filter": quality_filter,
             "subject_limit": subject_limit,
             "candidate_limit": candidate_limit,
             "db_path": str(db_path),
@@ -2068,10 +2092,12 @@ def memory_review_subjects(
                 "review_status": review_status,
                 "source_role": source_role,
                 "assistant_only": assistant_only,
+                "quality_filter": quality_filter,
                 "subject_limit": subject_limit,
                 "candidate_limit": candidate_limit,
             },
         )
+        effective_quality_filter = "all" if assistant_only and quality_filter == "high_signal" else quality_filter
         with sqlite3.connect(db_path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             subject_summaries = [
@@ -2081,6 +2107,7 @@ def memory_review_subjects(
                     review_status=review_status,
                     source_role=source_role,
                     assistant_suggestion=True if assistant_only else None,
+                    quality_filter=effective_quality_filter,
                     kind=kind,
                     limit=subject_limit,
                 )
@@ -2098,6 +2125,7 @@ def memory_review_subjects(
                         review_status=review_status,
                         source_role=source_role,
                         assistant_suggestion=True if assistant_only else None,
+                        quality_filter=effective_quality_filter,
                         limit=candidate_limit,
                     )
                 ]
@@ -2132,6 +2160,8 @@ def memory_review_subjects(
                 "review_status": review_status,
                 "source_role": source_role,
                 "assistant_only": assistant_only,
+                "quality_filter": quality_filter,
+                "effective_quality_filter": effective_quality_filter,
                 "subject_limit": subject_limit,
                 "candidate_limit": candidate_limit,
             },

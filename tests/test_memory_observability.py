@@ -815,7 +815,23 @@ def test_memory_review_subjects_browses_candidate_queue_by_subject_and_traces(tm
                                 "author": {"role": "user"},
                                 "content": {"parts": ["We should use a local dashboard for memory review."]},
                             },
-                        }
+                        },
+                        "u2": {
+                            "id": "u2",
+                            "message": {
+                                "id": "u2",
+                                "author": {"role": "user"},
+                                "content": {"parts": ["do it"]},
+                            },
+                        },
+                        "a": {
+                            "id": "a",
+                            "message": {
+                                "id": "a",
+                                "author": {"role": "assistant"},
+                                "content": {"parts": ["You could make a dashboard for memory review."]},
+                            },
+                        },
                     },
                 }
             ]
@@ -875,7 +891,14 @@ def test_memory_review_subjects_browses_candidate_queue_by_subject_and_traces(tm
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["selected_subject"]["name"] == "Memory Ops"
-    assert payload["candidate_memories"]
+    assert payload["filters"]["quality_filter"] == "high_signal"
+    assert [item["content"] for item in payload["candidate_memories"]] == ["We should use a local dashboard for memory review."]
+
+    full_queue = runner.invoke(app, ["memory-review-subjects", "--subject", "Memory Ops", "--quality-filter", "all", "--json"])
+    assert full_queue.exit_code == 0
+    full_payload = json.loads(full_queue.stdout)
+    assert full_payload["filters"]["quality_filter"] == "all"
+    assert len(full_payload["candidate_memories"]) == 3
 
     trace = read_memory_trace(data_dir / "logs", payload["run_id"])
     stages = [event["stage"] for event in trace["trace_events"]]

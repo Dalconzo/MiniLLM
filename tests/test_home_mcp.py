@@ -696,6 +696,73 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert bridged["memory_record"]["source_ref"] == recipe["file_id"]
 
 
+def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    seed = _seed_memory_database(config.paths["memory_dir"])
+
+    with sqlite3.connect(seed["db_path"]) as connection:
+        for candidate_id, source_role, memory_type, confidence, assistant_suggestion, content in [
+            ("cand_contextless", "user", "procedure", 0.9, 0, "do it"),
+            ("cand_assistant", "assistant", "assistant_suggestion", 0.35, 1, "You could use this as a recipe memory."),
+        ]:
+            connection.execute(
+                """
+                INSERT INTO candidate_memories (
+                    id, import_id, conversation_id, message_id, chunk_id, source_kind, source_ref,
+                    source_role, memory_type, reason_type, domain_primary, domains_json, confidence,
+                    valid_from, valid_to, last_confirmed_at, review_status, review_notes, origin,
+                    assistant_suggestion, source_links_json, content, metadata_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                """,
+                (
+                    candidate_id,
+                    seed["import_id"],
+                    seed["conversation_id"],
+                    seed["message_id"],
+                    seed["chunk_id"],
+                    "chatgpt_export",
+                    seed["chunk_id"],
+                    source_role,
+                    memory_type,
+                    "unknown",
+                    "cooking_baking",
+                    json.dumps(["cooking_baking"], sort_keys=True),
+                    confidence,
+                    "2026-07-01T00:00:00+00:00",
+                    None,
+                    None,
+                    "pending",
+                    None,
+                    "chatgpt_export",
+                    assistant_suggestion,
+                    json.dumps(
+                        {
+                            "conversation_id": seed["conversation_id"],
+                            "message_id": seed["message_id"],
+                            "chunk_id": seed["chunk_id"],
+                            "source_kind": "chatgpt_export",
+                            "source_role": source_role,
+                        },
+                        sort_keys=True,
+                    ),
+                    content,
+                    json.dumps({"message_turn_index": 1, "chunk_index": 1}, sort_keys=True),
+                ),
+            )
+
+    server = build_home_mcp_server(config)
+    filtered = server.memory_review_subjects(subject="Cooking and Baking", candidate_limit=10)
+    assert filtered["filters"]["quality_filter"] == "high_signal"
+    assert filtered["filters"]["effective_quality_filter"] == "high_signal"
+    assert [item["id"] for item in filtered["candidate_memories"]] == [seed["candidate_id"]]
+
+    full = server.memory_review_subjects(subject="Cooking and Baking", quality_filter="all", candidate_limit=10)
+    assert full["filters"]["quality_filter"] == "all"
+    assert {item["id"] for item in full["candidate_memories"]} == {seed["candidate_id"], "cand_contextless", "cand_assistant"}
+
+
 def test_memory_search_renderer_handles_curated_results() -> None:
     rendered = _render_memory_search(
         {

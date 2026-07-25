@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 CANDIDATE_SCHEMA_VERSION = 5
 VALID_REVIEW_STATUSES = ("pending", "approved", "rejected", "merged")
+VALID_QUALITY_FILTERS = ("all", "user_only", "high_signal")
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,7 @@ def list_candidate_memories(
     assistant_suggestion: bool | None = None,
     subject: str | None = None,
     subject_kind: str | None = None,
+    quality_filter: str = "all",
     limit: int | None = None,
 ) -> list[CandidateMemory]:
     init_candidate_memory_schema(connection)
@@ -189,6 +191,10 @@ def list_candidate_memories(
     if assistant_suggestion is not None:
         where.append("assistant_suggestion = ?")
         params.append(1 if assistant_suggestion else 0)
+    quality_clause, quality_params = _candidate_quality_clause(quality_filter)
+    if quality_clause:
+        where.append(quality_clause)
+        params.extend(quality_params)
     if subject is not None:
         subject_clause, subject_params = _subject_filter_clause(
             connection,
@@ -239,6 +245,7 @@ def list_candidate_subjects(
     review_status: str | None = "pending",
     source_role: str | None = None,
     assistant_suggestion: bool | None = None,
+    quality_filter: str = "all",
     kind: str | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -255,6 +262,10 @@ def list_candidate_subjects(
     if assistant_suggestion is not None:
         match_parts.append("cm.assistant_suggestion = ?")
         match_params.append(1 if assistant_suggestion else 0)
+    quality_clause, quality_params = _candidate_quality_clause(quality_filter, table_alias="cm")
+    if quality_clause:
+        match_parts.append(quality_clause)
+        match_params.extend(quality_params)
     if kind is not None:
         match_parts.append("s.kind = ?")
         match_params.append(_normalize_kind(kind))
@@ -396,12 +407,14 @@ def get_candidate_subject_summary(
     review_status: str | None = "pending",
     source_role: str | None = None,
     assistant_suggestion: bool | None = None,
+    quality_filter: str = "all",
 ) -> dict[str, Any]:
     subjects = list_candidate_subjects(
         connection,
         review_status=review_status,
         source_role=source_role,
         assistant_suggestion=assistant_suggestion,
+        quality_filter=quality_filter,
         kind=kind,
         limit=None,
     )
@@ -474,6 +487,7 @@ def list_candidate_memories_for_subject(
     review_status: str | None = "pending",
     source_role: str | None = None,
     assistant_suggestion: bool | None = None,
+    quality_filter: str = "all",
     limit: int | None = None,
 ) -> list[CandidateMemory]:
     init_candidate_memory_schema(connection)
@@ -489,6 +503,10 @@ def list_candidate_memories_for_subject(
     if assistant_suggestion is not None:
         where.append("assistant_suggestion = ?")
         params.append(1 if assistant_suggestion else 0)
+    quality_clause, quality_params = _candidate_quality_clause(quality_filter)
+    if quality_clause:
+        where.append(quality_clause)
+        params.extend(quality_params)
 
     subject_clause, subject_params = _subject_filter_clause(connection, subject_name, subject_kind=kind)
     where.append(subject_clause)
@@ -743,6 +761,41 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _candidate_quality_clause(quality_filter: str, *, table_alias: str | None = None) -> tuple[str, list[Any]]:
+    normalized = _validate_quality_filter(quality_filter)
+    if normalized == "all":
+        return "", []
+
+    prefix = f"{table_alias}." if table_alias else ""
+    user_clause = f"{prefix}source_role = ? AND {prefix}assistant_suggestion = 0"
+    params: list[Any] = ["user"]
+    if normalized == "user_only":
+        return user_clause, params
+
+    content_expr = f"LOWER(TRIM({prefix}content))"
+    high_signal_parts = [
+        user_clause,
+        f"{prefix}confidence >= ?",
+        f"LENGTH(TRIM({prefix}content)) >= ?",
+        f"{prefix}memory_type IN (?, ?, ?, ?, ?, ?)",
+        f"{content_expr} NOT IN ({', '.join('?' for _ in _CONTEXTLESS_CANDIDATES)})",
+    ]
+    params.extend(
+        [
+            0.6,
+            16,
+            "preference",
+            "decision",
+            "failure",
+            "workaround",
+            "procedure",
+            "episodic",
+            *_CONTEXTLESS_CANDIDATES,
+        ]
+    )
+    return " AND ".join(f"({part})" for part in high_signal_parts), params
+
+
 def _validate_review_status(review_status: str) -> str:
     normalized = review_status.strip().lower().replace("-", "_").replace(" ", "_")
     if normalized not in VALID_REVIEW_STATUSES:
@@ -750,5 +803,30 @@ def _validate_review_status(review_status: str) -> str:
     return normalized
 
 
+def _validate_quality_filter(quality_filter: str) -> str:
+    normalized = quality_filter.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized not in VALID_QUALITY_FILTERS:
+        raise ValueError(f"invalid candidate quality filter: {quality_filter}")
+    return normalized
+
+
 def _normalize_kind(kind: str) -> str:
     return validate_subject_kind(kind)
+
+
+_CONTEXTLESS_CANDIDATES = (
+    "like this?",
+    "like this",
+    "yes",
+    "no",
+    "ok",
+    "okay",
+    "sure",
+    "thanks",
+    "thank you",
+    "continue",
+    "do it",
+    "try again",
+    "what next?",
+    "what's next?",
+)

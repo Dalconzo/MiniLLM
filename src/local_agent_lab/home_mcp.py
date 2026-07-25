@@ -1092,6 +1092,7 @@ class HomeMCPServer:
         assistant_suggestion: bool | None = None,
         subject: str | None = None,
         subject_kind: str | None = None,
+        quality_filter: str = "all",
         limit: int | None = None,
     ) -> dict[str, Any]:
         db_path = memory_db_path(self.config.paths["memory_dir"])
@@ -1114,10 +1115,25 @@ class HomeMCPServer:
                     assistant_suggestion=assistant_suggestion,
                     subject=subject,
                     subject_kind=subject_kind,
+                    quality_filter=quality_filter,
                     limit=limit,
                 )
             ]
-        return {"status": "ok", "count": len(candidates), "candidate_memories": candidates}
+        return {
+            "status": "ok",
+            "count": len(candidates),
+            "candidate_memories": candidates,
+            "filters": {
+                "review_status": review_status,
+                "domain": domain,
+                "source_role": source_role,
+                "assistant_suggestion": assistant_suggestion,
+                "subject": subject,
+                "subject_kind": subject_kind,
+                "quality_filter": quality_filter,
+                "limit": limit,
+            },
+        }
 
     def memory_review_subjects(
         self,
@@ -1127,6 +1143,7 @@ class HomeMCPServer:
         review_status: str | None = "pending",
         source_role: str | None = None,
         assistant_only: bool = False,
+        quality_filter: str = "high_signal",
         subject_limit: int = 20,
         candidate_limit: int = 20,
     ) -> dict[str, Any]:
@@ -1138,6 +1155,7 @@ class HomeMCPServer:
                 error_code="memory_database_not_found",
                 source_ref=str(db_path),
             )
+        effective_quality_filter = "all" if assistant_only and quality_filter == "high_signal" else quality_filter
         with sqlite3.connect(db_path) as connection:
             connection.row_factory = sqlite3.Row
             init_subject_schema(connection)
@@ -1147,6 +1165,7 @@ class HomeMCPServer:
                 review_status=review_status,
                 source_role=source_role,
                 assistant_suggestion=True if assistant_only else None,
+                quality_filter=effective_quality_filter,
                 kind=kind,
                 limit=subject_limit,
             )
@@ -1162,6 +1181,7 @@ class HomeMCPServer:
                         review_status=review_status,
                         source_role=source_role,
                         assistant_suggestion=True if assistant_only else None,
+                        quality_filter=effective_quality_filter,
                         limit=candidate_limit,
                     )
                 ]
@@ -1194,6 +1214,8 @@ class HomeMCPServer:
                 "review_status": review_status,
                 "source_role": source_role,
                 "assistant_only": assistant_only,
+                "quality_filter": quality_filter,
+                "effective_quality_filter": effective_quality_filter,
                 "subject_limit": subject_limit,
                 "candidate_limit": candidate_limit,
             },
@@ -1210,6 +1232,7 @@ class HomeMCPServer:
         subject_kind: str = "subject",
         source_role: str | None = None,
         assistant_only: bool = False,
+        quality_filter: str = "all",
         limit: int | None = 20,
         note: str | None = None,
         record_type: str | None = None,
@@ -1243,6 +1266,7 @@ class HomeMCPServer:
                     assistant_suggestion=True if assistant_only else None,
                     subject=subject,
                     subject_kind=subject_kind,
+                    quality_filter=quality_filter,
                     limit=limit,
                 )
 
@@ -1259,6 +1283,7 @@ class HomeMCPServer:
                         "subject_kind": subject_kind,
                         "source_role": source_role,
                         "assistant_only": assistant_only,
+                        "quality_filter": quality_filter,
                         "limit": limit,
                     },
                 }
@@ -1793,6 +1818,7 @@ class HomeMCPServer:
                         "assistant_suggestion": {"type": "boolean"},
                         "subject": {"type": "string"},
                         "subject_kind": {"type": "string"},
+                        "quality_filter": {"type": "string"},
                         "limit": {"type": "integer", "minimum": 1},
                     },
                     "additionalProperties": False,
@@ -1809,6 +1835,7 @@ class HomeMCPServer:
                         "review_status": {"type": "string"},
                         "source_role": {"type": "string"},
                         "assistant_only": {"type": "boolean"},
+                        "quality_filter": {"type": "string"},
                         "subject_limit": {"type": "integer", "minimum": 1},
                         "candidate_limit": {"type": "integer", "minimum": 1},
                     },
@@ -1829,6 +1856,7 @@ class HomeMCPServer:
                         "subject_kind": {"type": "string"},
                         "source_role": {"type": "string"},
                         "assistant_only": {"type": "boolean"},
+                        "quality_filter": {"type": "string"},
                         "limit": {"type": "integer", "minimum": 1},
                         "note": {"type": "string"},
                         "record_type": {"type": "string"},
@@ -2166,6 +2194,7 @@ class HomeMCPServer:
                 assistant_suggestion=bool(assistant_suggestion) if assistant_suggestion is not None else None,
                 subject=str(arguments["subject"]) if arguments.get("subject") else None,
                 subject_kind=str(arguments["subject_kind"]) if arguments.get("subject_kind") else None,
+                quality_filter=str(arguments["quality_filter"]) if arguments.get("quality_filter") else "all",
                 limit=_optional_int(arguments.get("limit")),
             )
         if name == "memory_review_subjects":
@@ -2175,6 +2204,7 @@ class HomeMCPServer:
                 review_status=str(arguments["review_status"]) if arguments.get("review_status") is not None else "pending",
                 source_role=str(arguments["source_role"]) if arguments.get("source_role") else None,
                 assistant_only=bool(arguments.get("assistant_only", False)),
+                quality_filter=str(arguments["quality_filter"]) if arguments.get("quality_filter") else "high_signal",
                 subject_limit=int(arguments.get("subject_limit", 20)),
                 candidate_limit=int(arguments.get("candidate_limit", 20)),
             )
@@ -2188,6 +2218,7 @@ class HomeMCPServer:
                 subject_kind=str(arguments["subject_kind"]) if arguments.get("subject_kind") else "subject",
                 source_role=str(arguments["source_role"]) if arguments.get("source_role") else None,
                 assistant_only=bool(arguments.get("assistant_only", False)),
+                quality_filter=str(arguments["quality_filter"]) if arguments.get("quality_filter") else "all",
                 limit=_optional_int(arguments.get("limit")),
                 note=str(arguments["note"]) if arguments.get("note") else None,
                 record_type=str(arguments["record_type"]) if arguments.get("record_type") else None,

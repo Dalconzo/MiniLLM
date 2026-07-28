@@ -618,8 +618,26 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     server = build_home_mcp_server(config)
 
     rpc = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}})
-    tool_names = {tool["name"] for tool in rpc["result"]["tools"]}
-    assert {"memory_status", "memory_search", "memory_context", "memory_review", "memory_subjects", "bridge_recipe_note_to_memory"} <= tool_names
+    tools = rpc["result"]["tools"]
+    tool_names = {tool["name"] for tool in tools}
+    assert {
+        "memory_status",
+        "memory_search",
+        "memory_context",
+        "memory_review",
+        "memory_subjects",
+        "bridge_recipe_note_to_memory",
+        "submit_agent_feedback",
+    } <= tool_names
+    schemas = {tool["name"]: tool["inputSchema"]["properties"] for tool in tools}
+    assert schemas["memory_context"]["depth"]["enum"] == ["far", "medium", "close", "full"]
+    assert schemas["memory_search"]["depth"]["enum"] == ["far", "medium", "close", "full"]
+    assert schemas["memory_review_subjects"]["quality_filter"]["enum"] == ["all", "user_only", "high_signal"]
+    assert schemas["memory_review_subjects"]["review_status"]["enum"] == ["pending", "approved", "rejected", "merged"]
+    assert schemas["memory_review"]["action"]["enum"] == ["list", "show", "approve", "reject", "promote"]
+    assert "high" in schemas["memory_review"]["trust_level"]["enum"]
+    assert "retrieval_noise" in schemas["submit_agent_feedback"]["category"]["enum"]
+    assert schemas["submit_agent_feedback"]["severity"]["enum"] == ["low", "medium", "high", "critical"]
 
     status = server.memory_status(recent_limit=1)
     assert status["status"] == "ok"
@@ -673,6 +691,66 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert trace_content["run_id"] == structured["run_id"]
     assert trace_content["tool_name"] == "memory_trace"
 
+    feedback_response = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "feedback",
+            "method": "tools/call",
+            "params": {
+                "name": "submit_agent_feedback",
+                "arguments": {
+                    "run_id": structured["run_id"],
+                    "trace_id": structured["trace_id"],
+                    "component": "memory_context",
+                    "category": "retrieval_noise",
+                    "severity": "medium",
+                    "observed_behavior": "Returned weak baking-adjacent history.",
+                    "expected_behavior": "Prefer canonical cooking constraints and outcomes.",
+                    "relevant_source_ids": ["chk_noise"],
+                    "confidence": 0.9,
+                },
+            },
+        }
+    )
+    feedback = feedback_response["result"]["structuredContent"]
+    assert feedback["status"] == "ok"
+    assert feedback["feedback"]["id"].startswith("afbk_")
+    assert feedback["feedback"]["run_id"] == structured["run_id"]
+    assert feedback["feedback"]["category"] == "retrieval_noise"
+    assert feedback["feedback"]["build_sha"] is not None
+    assert feedback["immutability"]["append_only"] is True
+    assert feedback["immutability"]["mutates_memory_truth"] is False
+    with sqlite3.connect(seed["db_path"]) as connection:
+        row = connection.execute(
+            "SELECT category, severity, relevant_source_ids_json FROM agent_feedback WHERE id = ?",
+            (feedback["feedback"]["id"],),
+        ).fetchone()
+    assert row[0] == "retrieval_noise"
+    assert row[1] == "medium"
+    assert json.loads(row[2]) == ["chk_noise"]
+
+    invalid_feedback = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "feedback-invalid",
+            "method": "tools/call",
+            "params": {
+                "name": "submit_agent_feedback",
+                "arguments": {
+                    "run_id": structured["run_id"],
+                    "component": "memory_context",
+                    "category": "changes_code",
+                    "severity": "medium",
+                    "observed_behavior": "bad",
+                    "expected_behavior": "good",
+                    "confidence": 0.5,
+                },
+            },
+        }
+    )
+    assert invalid_feedback["error"]["code"] == -32602
+    assert invalid_feedback["error"]["data"]["error_code"] == "invalid_argument"
+
     invalid_depth = server.dispatch_jsonrpc(
         {
             "jsonrpc": "2.0",
@@ -702,9 +780,39 @@ def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) ->
     seed = _seed_memory_database(config.paths["memory_dir"])
 
     with sqlite3.connect(seed["db_path"]) as connection:
-        for candidate_id, source_role, memory_type, confidence, assistant_suggestion, content in [
-            ("cand_contextless", "user", "procedure", 0.9, 0, "do it"),
-            ("cand_assistant", "assistant", "assistant_suggestion", 0.35, 1, "You could use this as a recipe memory."),
+        for candidate_id, source_role, memory_type, confidence, assistant_suggestion, domain, domains, content in [
+            ("cand_contextless", "user", "procedure", 0.9, 0, "cooking_baking", ["cooking_baking"], "do it"),
+            ("cand_question", "user", "procedure", 0.91, 0, "cooking_baking", ["cooking_baking"], "Is this enough filling for the cake?"),
+            (
+                "cand_duplicate",
+                "user",
+                "procedure",
+                0.89,
+                0,
+                "cooking_baking",
+                ["cooking_baking"],
+                "Please draft a rosemary focaccia recipe with notes.",
+            ),
+            (
+                "cand_incidental",
+                "user",
+                "preference",
+                0.92,
+                0,
+                "career_work",
+                ["career_work"],
+                "I want a more stable career path and sometimes baking is part of the life rhythm I imagine.",
+            ),
+            (
+                "cand_assistant",
+                "assistant",
+                "assistant_suggestion",
+                0.35,
+                1,
+                "cooking_baking",
+                ["cooking_baking"],
+                "You could use this as a recipe memory.",
+            ),
         ]:
             connection.execute(
                 """
@@ -727,8 +835,8 @@ def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) ->
                     source_role,
                     memory_type,
                     "unknown",
-                    "cooking_baking",
-                    json.dumps(["cooking_baking"], sort_keys=True),
+                    domain,
+                    json.dumps(domains, sort_keys=True),
                     confidence,
                     "2026-07-01T00:00:00+00:00",
                     None,
@@ -760,7 +868,14 @@ def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) ->
 
     full = server.memory_review_subjects(subject="Cooking and Baking", quality_filter="all", candidate_limit=10)
     assert full["filters"]["quality_filter"] == "all"
-    assert {item["id"] for item in full["candidate_memories"]} == {seed["candidate_id"], "cand_contextless", "cand_assistant"}
+    assert {item["id"] for item in full["candidate_memories"]} == {
+        seed["candidate_id"],
+        "cand_contextless",
+        "cand_question",
+        "cand_duplicate",
+        "cand_incidental",
+        "cand_assistant",
+    }
 
 
 def test_memory_search_renderer_handles_curated_results() -> None:

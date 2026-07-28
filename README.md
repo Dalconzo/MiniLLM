@@ -4,6 +4,21 @@
 
 The design target is practical local usefulness with small models, explicit retrieval, conservative defaults, and CLI workflows that hold up over SSH.
 
+## Current Design Authority
+
+The current architecture authority is `mac_mini_llm_consolidated_specs/`.
+When requirements conflict, use this precedence:
+
+1. `SECURITY_MODEL.md`
+2. `AI_MEMORY_CONTRACT.md`
+3. `SYSTEM_ARCHITECTURE.md`
+4. `BUILD_FEEDBACK_LOOP.md`
+5. `ROADMAP.md`
+6. ADRs under `mac_mini_llm_consolidated_specs/adr/`
+7. Older source specs in the repository
+
+Older documents such as `local_mac_mini_agent_codex_spec.md`, `adaptive_memory_full_history_spec.md`, `evolving_object_memory_architecture.md`, `home_mcp_scope_for_codex.md`, and `Adaptive Stigmergic Memory Prototype.pdf` are design history unless the consolidated specs or an ADR explicitly preserve a requirement.
+
 ## Current Scope
 
 This repo now implements Phase 0 through Phase 5 from the spec:

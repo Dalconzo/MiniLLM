@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,6 +21,8 @@ from .memory.analysis import analyze_memory_corpus
 from .memory.audit import init_audit_schema, record_retrieval_event
 from .memory.candidates import (
     CandidateMemory,
+    VALID_QUALITY_FILTERS,
+    VALID_REVIEW_STATUSES,
     get_candidate_memory,
     list_candidate_memories,
     list_candidate_memories_for_subject,
@@ -29,8 +32,16 @@ from .memory.candidates import (
 )
 from .memory.chatgpt_ingest import init_chatgpt_memory_schema
 from .memory.curated import MemoryRecord, create_memory_record, init_curated_memory_schema, list_memory_records
-from .memory.feedback import init_feedback_schema, list_open_loops
+from .memory.feedback import (
+    VALID_AGENT_FEEDBACK_CATEGORIES,
+    VALID_AGENT_FEEDBACK_SEVERITIES,
+    init_feedback_schema,
+    list_open_loops,
+    record_agent_feedback,
+)
 from .memory.observability import MemoryObservationError, memory_db_path, read_memory_trace, summarize_memory_status
+from .memory.ontology import CURATED_RECORD_TYPES, VALID_SUBJECT_KINDS, VALID_TRUST_LEVELS
+from .memory.ranking import DEFAULT_RANKING_PROFILE, DISCLOSURE_TIERS
 from .memory.search import search_chatgpt_memory
 from .memory.subjects import init_subject_schema, list_subjects, normalize_subject_slug, upsert_subject
 from .tools.file_tools import redact_text
@@ -51,6 +62,8 @@ MAX_SEARCH_FILES = 250
 HOME_MCP_AUTH_MODES = {"none", "bearer", "oauth", "mixed"}
 HOME_MCP_OAUTH_RESOURCE_PATHS = {"/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"}
 HOME_MCP_OAUTH_AUTH_SERVER_PATHS = {"/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"}
+MEMORY_SOURCE_ROLE_ENUM = ("user", "assistant", "system", "tool", "unknown")
+MEMORY_REVIEW_ACTION_ENUM = ("list", "show", "approve", "reject", "promote")
 
 
 def _default_curated_record_type(memory_type: str) -> str:
@@ -1449,6 +1462,54 @@ class HomeMCPServer:
             loops = list_open_loops(connection, limit=limit)
         return {"status": "ok", "count": len(loops), "open_loops": loops}
 
+    def submit_agent_feedback(
+        self,
+        *,
+        run_id: str,
+        component: str,
+        category: str,
+        severity: str,
+        observed_behavior: str,
+        expected_behavior: str,
+        confidence: float,
+        trace_id: str | None = None,
+        relevant_source_ids: list[str] | None = None,
+        downstream_effect: str | None = None,
+        suggested_direction: str | None = None,
+    ) -> dict[str, Any]:
+        db_path = memory_db_path(self.config.paths["memory_dir"])
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as connection:
+            feedback = record_agent_feedback(
+                connection,
+                run_id=run_id,
+                trace_id=trace_id,
+                component=component,
+                category=category,
+                severity=severity,
+                observed_behavior=observed_behavior,
+                expected_behavior=expected_behavior,
+                relevant_source_ids=relevant_source_ids,
+                confidence=confidence,
+                downstream_effect=downstream_effect,
+                suggested_direction=suggested_direction,
+                build_sha=_current_build_sha(),
+                tool_version="home_mcp_submit_agent_feedback_v1",
+                environment="home_mcp",
+                retrieval_profile=DEFAULT_RANKING_PROFILE,
+            )
+        return {
+            "status": "ok",
+            "feedback": feedback.to_dict(),
+            "immutability": {
+                "append_only": True,
+                "mutates_memory_truth": False,
+                "mutates_ranking": False,
+                "mutates_code": False,
+                "mutates_permissions": False,
+            },
+        }
+
     def memory_trace(self, *, run_id: str) -> dict[str, Any]:
         try:
             trace = read_memory_trace(self.logger.logs_dir, run_id)
@@ -1800,7 +1861,7 @@ class HomeMCPServer:
                 {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string"},
+                        "kind": {"type": "string", "enum": list(VALID_SUBJECT_KINDS)},
                         "limit": {"type": "integer", "minimum": 1},
                     },
                     "additionalProperties": False,
@@ -1812,13 +1873,13 @@ class HomeMCPServer:
                 {
                     "type": "object",
                     "properties": {
-                        "review_status": {"type": "string"},
+                        "review_status": {"type": "string", "enum": list(VALID_REVIEW_STATUSES)},
                         "domain": {"type": "string"},
-                        "source_role": {"type": "string"},
+                        "source_role": {"type": "string", "enum": list(MEMORY_SOURCE_ROLE_ENUM)},
                         "assistant_suggestion": {"type": "boolean"},
                         "subject": {"type": "string"},
-                        "subject_kind": {"type": "string"},
-                        "quality_filter": {"type": "string"},
+                        "subject_kind": {"type": "string", "enum": list(VALID_SUBJECT_KINDS)},
+                        "quality_filter": {"type": "string", "enum": list(VALID_QUALITY_FILTERS)},
                         "limit": {"type": "integer", "minimum": 1},
                     },
                     "additionalProperties": False,
@@ -1831,11 +1892,11 @@ class HomeMCPServer:
                     "type": "object",
                     "properties": {
                         "subject": {"type": "string"},
-                        "kind": {"type": "string"},
-                        "review_status": {"type": "string"},
-                        "source_role": {"type": "string"},
+                        "kind": {"type": "string", "enum": list(VALID_SUBJECT_KINDS)},
+                        "review_status": {"type": "string", "enum": list(VALID_REVIEW_STATUSES)},
+                        "source_role": {"type": "string", "enum": list(MEMORY_SOURCE_ROLE_ENUM)},
                         "assistant_only": {"type": "boolean"},
-                        "quality_filter": {"type": "string"},
+                        "quality_filter": {"type": "string", "enum": list(VALID_QUALITY_FILTERS)},
                         "subject_limit": {"type": "integer", "minimum": 1},
                         "candidate_limit": {"type": "integer", "minimum": 1},
                     },
@@ -1849,19 +1910,19 @@ class HomeMCPServer:
                     "type": "object",
                     "properties": {
                         "candidate_id": {"type": "string"},
-                        "action": {"type": "string"},
-                        "review_status": {"type": "string"},
+                        "action": {"type": "string", "enum": list(MEMORY_REVIEW_ACTION_ENUM)},
+                        "review_status": {"type": "string", "enum": list(VALID_REVIEW_STATUSES)},
                         "domain": {"type": "string"},
                         "subject": {"type": "string"},
-                        "subject_kind": {"type": "string"},
-                        "source_role": {"type": "string"},
+                        "subject_kind": {"type": "string", "enum": list(VALID_SUBJECT_KINDS)},
+                        "source_role": {"type": "string", "enum": list(MEMORY_SOURCE_ROLE_ENUM)},
                         "assistant_only": {"type": "boolean"},
-                        "quality_filter": {"type": "string"},
+                        "quality_filter": {"type": "string", "enum": list(VALID_QUALITY_FILTERS)},
                         "limit": {"type": "integer", "minimum": 1},
                         "note": {"type": "string"},
-                        "record_type": {"type": "string"},
+                        "record_type": {"type": "string", "enum": list(CURATED_RECORD_TYPES)},
                         "title": {"type": "string"},
-                        "trust_level": {"type": "string"},
+                        "trust_level": {"type": "string", "enum": list(VALID_TRUST_LEVELS)},
                         "allow_assistant": {"type": "boolean"},
                     },
                     "additionalProperties": False,
@@ -1881,7 +1942,7 @@ class HomeMCPServer:
                         "date_to": {"type": "string"},
                         "exclude_source_ids": {"type": "array", "items": {"type": "string"}},
                         "exclude_subjects": {"type": "array", "items": {"type": "string"}},
-                        "depth": {"type": "string"},
+                        "depth": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
                         "effort": {"type": "integer", "minimum": 1, "maximum": 5},
                         "allow_cross_domain": {"type": "boolean"},
                     },
@@ -1896,7 +1957,7 @@ class HomeMCPServer:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "depth": {"type": "string"},
+                        "depth": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                         "subject": {"type": "string"},
                         "effort": {"type": "integer", "minimum": 1, "maximum": 5},
@@ -1930,6 +1991,36 @@ class HomeMCPServer:
                 },
             ),
             _tool_definition(
+                "submit_agent_feedback",
+                "Append downstream-agent feedback about a memory/tool run without mutating memory, ranking, code, or permissions.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                        "trace_id": {"type": "string"},
+                        "component": {"type": "string"},
+                        "category": {"type": "string", "enum": list(VALID_AGENT_FEEDBACK_CATEGORIES)},
+                        "severity": {"type": "string", "enum": list(VALID_AGENT_FEEDBACK_SEVERITIES)},
+                        "observed_behavior": {"type": "string"},
+                        "expected_behavior": {"type": "string"},
+                        "relevant_source_ids": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "downstream_effect": {"type": "string"},
+                        "suggested_direction": {"type": "string"},
+                    },
+                    "required": [
+                        "run_id",
+                        "component",
+                        "category",
+                        "severity",
+                        "observed_behavior",
+                        "expected_behavior",
+                        "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            ),
+            _tool_definition(
                 "memory_trace",
                 "Read a run trace by run_id.",
                 {
@@ -1948,11 +2039,11 @@ class HomeMCPServer:
                     "type": "object",
                     "properties": {
                         "file_id": {"type": "string"},
-                        "record_type": {"type": "string"},
+                        "record_type": {"type": "string", "enum": list(CURATED_RECORD_TYPES)},
                         "title": {"type": "string"},
-                        "trust_level": {"type": "string"},
+                        "trust_level": {"type": "string", "enum": list(VALID_TRUST_LEVELS)},
                         "subject": {"type": "string"},
-                        "subject_kind": {"type": "string"},
+                        "subject_kind": {"type": "string", "enum": list(VALID_SUBJECT_KINDS)},
                     },
                     "required": ["file_id"],
                     "additionalProperties": False,
@@ -2261,6 +2352,23 @@ class HomeMCPServer:
             )
         if name == "memory_open_loops":
             return self.memory_open_loops(limit=_optional_int(arguments.get("limit")))
+        if name == "submit_agent_feedback":
+            relevant_source_ids = arguments.get("relevant_source_ids")
+            if relevant_source_ids is not None and not isinstance(relevant_source_ids, list):
+                raise ValueError("relevant_source_ids must be a list of strings")
+            return self.submit_agent_feedback(
+                run_id=str(arguments["run_id"]),
+                trace_id=str(arguments["trace_id"]) if arguments.get("trace_id") else None,
+                component=str(arguments["component"]),
+                category=str(arguments["category"]),
+                severity=str(arguments["severity"]),
+                observed_behavior=str(arguments["observed_behavior"]),
+                expected_behavior=str(arguments["expected_behavior"]),
+                relevant_source_ids=[str(item) for item in relevant_source_ids] if isinstance(relevant_source_ids, list) else None,
+                confidence=float(arguments["confidence"]),
+                downstream_effect=str(arguments["downstream_effect"]) if arguments.get("downstream_effect") else None,
+                suggested_direction=str(arguments["suggested_direction"]) if arguments.get("suggested_direction") else None,
+            )
         if name == "memory_trace":
             return self.memory_trace(run_id=str(arguments["run_id"]))
         if name == "bridge_recipe_note_to_memory":
@@ -2926,6 +3034,22 @@ def _optional_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _current_build_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 def utc_now() -> str:

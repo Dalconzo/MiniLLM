@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 CANDIDATE_SCHEMA_VERSION = 5
 VALID_REVIEW_STATUSES = ("pending", "approved", "rejected", "merged")
 VALID_QUALITY_FILTERS = ("all", "user_only", "high_signal")
+REVIEW_DEDUPE_SIMILARITY_THRESHOLD = 0.86
 
 
 @dataclass(frozen=True)
@@ -517,7 +518,7 @@ def list_candidate_memories_for_subject(
         if limit < 1:
             return []
         limit_clause = "LIMIT ?"
-        params.append(limit)
+        params.append(_high_signal_fetch_limit(limit) if _validate_quality_filter(quality_filter) == "high_signal" else limit)
 
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = connection.execute(
@@ -537,7 +538,12 @@ def list_candidate_memories_for_subject(
         """,
         params,
     ).fetchall()
-    return [_candidate_from_row(row) for row in rows]
+    candidates = [_candidate_from_row(row) for row in rows]
+    if _validate_quality_filter(quality_filter) == "high_signal":
+        candidates = _post_filter_high_signal_review_candidates(candidates, subject_name=subject_name)
+        if limit is not None:
+            candidates = candidates[:limit]
+    return candidates
 
 
 def _candidate_from_chunk(chunk: dict[str, Any]) -> dict[str, Any] | None:
@@ -796,6 +802,100 @@ def _candidate_quality_clause(quality_filter: str, *, table_alias: str | None = 
     return " AND ".join(f"({part})" for part in high_signal_parts), params
 
 
+def _high_signal_fetch_limit(limit: int) -> int:
+    return min(max(limit * 6, 50), 500)
+
+
+def _post_filter_high_signal_review_candidates(
+    candidates: list[CandidateMemory],
+    *,
+    subject_name: str | None = None,
+) -> list[CandidateMemory]:
+    filtered: list[CandidateMemory] = []
+    seen_token_sets: list[set[str]] = []
+    for candidate in candidates:
+        if _reject_high_signal_review_candidate(candidate, subject_name=subject_name):
+            continue
+        tokens = set(_dedupe_tokens(candidate.content))
+        if tokens and any(_jaccard_similarity(tokens, seen) >= REVIEW_DEDUPE_SIMILARITY_THRESHOLD for seen in seen_token_sets):
+            continue
+        filtered.append(candidate)
+        if tokens:
+            seen_token_sets.append(tokens)
+    return filtered
+
+
+def _reject_high_signal_review_candidate(candidate: CandidateMemory, *, subject_name: str | None = None) -> bool:
+    content = candidate.content.strip()
+    lowered = content.lower()
+    word_count = len(_dedupe_tokens(content))
+    if _is_context_dependent_fragment(lowered, word_count=word_count):
+        return True
+    if candidate.memory_type == "procedure" and "?" in content and word_count <= 24:
+        return True
+    if _is_subject_incidental_match(candidate, subject_name=subject_name):
+        return True
+    return False
+
+
+def _is_context_dependent_fragment(lowered_content: str, *, word_count: int) -> bool:
+    stripped = lowered_content.strip()
+    if stripped in _CONTEXTLESS_CANDIDATES:
+        return True
+    if word_count <= 3 and stripped.endswith("?"):
+        return True
+    if word_count <= 18 and _matches(
+        stripped,
+        r"^(is|are|was|were|does|do|did|can|could|should|would|will|what about|how much|how many)\b",
+    ):
+        durable_terms = (
+            "prefer",
+            "like",
+            "love",
+            "hate",
+            "dislike",
+            "failed",
+            "worked",
+            "always",
+            "usually",
+            "allergic",
+            "avoid",
+        )
+        return not any(term in stripped for term in durable_terms)
+    if word_count <= 20 and _matches(stripped, r"\b(enough|too much|too little|right amount|like this|this okay)\??$"):
+        return True
+    return False
+
+
+def _is_subject_incidental_match(candidate: CandidateMemory, *, subject_name: str | None) -> bool:
+    if subject_name is None:
+        return False
+    subject = normalize_subject_slug(subject_name)
+    if not any(term in subject for term in ("cook", "baking", "recipe", "food")):
+        return False
+    if "cooking_baking" not in candidate.domains:
+        return True
+    text = f"{candidate.metadata.get('conversation_title') or ''} {candidate.content}".lower()
+    cooking_signal_count = sum(1 for signal in _COOKING_BAKING_REVIEW_SIGNALS if signal in text)
+    if len(candidate.content) >= 360 and cooking_signal_count < 2:
+        return True
+    return False
+
+
+def _dedupe_tokens(content: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", content.lower())
+        if token not in _DEDUPE_STOP_WORDS
+    ]
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
 def _validate_review_status(review_status: str) -> str:
     normalized = review_status.strip().lower().replace("-", "_").replace(" ", "_")
     if normalized not in VALID_REVIEW_STATUSES:
@@ -830,3 +930,49 @@ _CONTEXTLESS_CANDIDATES = (
     "what next?",
     "what's next?",
 )
+
+_COOKING_BAKING_REVIEW_SIGNALS = (
+    "recipe",
+    "bake",
+    "baking",
+    "cook",
+    "cooking",
+    "oven",
+    "sauce",
+    "cake",
+    "dough",
+    "starter",
+    "sourdough",
+    "bread",
+    "dessert",
+    "filling",
+    "ganache",
+    "butter",
+    "flour",
+)
+
+_DEDUPE_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "for",
+    "from",
+    "i",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "we",
+    "with",
+}

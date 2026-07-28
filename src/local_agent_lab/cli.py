@@ -2632,6 +2632,19 @@ def _render_memory_status(payload: dict[str, object]) -> str:
         f"- candidates={counts.get('candidate_memories', 0)} curated={counts.get('memory_records', 0)} subjects={counts.get('subjects', 0)} embeddings={counts.get('chunk_embeddings', 0)}",
         f"- retrievals={counts.get('retrieval_events', 0)} exposures={counts.get('retrieval_exposures', 0)}",
     ]
+    embedding_coverage = sqlite_info.get("embedding_coverage")
+    if isinstance(embedding_coverage, dict):
+        active_model = embedding_coverage.get("active_model")
+        model_label = "none"
+        if isinstance(active_model, dict):
+            model_label = f"{active_model.get('provider')}:{active_model.get('model')} ({active_model.get('dimension')}d)"
+        lines.extend(
+            [
+                "Semantic Embeddings:",
+                f"- status={embedding_coverage.get('status')} coverage={float(embedding_coverage.get('coverage_ratio', 0.0)):.1%} embedded={embedding_coverage.get('embedded_chunks', 0)}/{embedding_coverage.get('total_chunks', 0)} missing={embedding_coverage.get('missing_chunks', 0)} stale={embedding_coverage.get('stale_chunks', 0)}",
+                f"- active_model={model_label}",
+            ]
+        )
     if latest_import:
         lines.extend(
             [

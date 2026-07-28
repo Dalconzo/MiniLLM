@@ -15,6 +15,7 @@ from local_agent_lab.memory.embeddings import (
     load_local_vector,
     register_embedding_model,
 )
+from local_agent_lab.memory.observability import summarize_memory_status
 
 
 def _write_export(root):
@@ -161,3 +162,41 @@ def test_blocked_chunks_are_not_returned_for_embedding(tmp_path) -> None:
         needing = list_chunks_needing_embeddings(connection, embedding_model_id=model_id)
 
     assert all(chunk.chunk_id != chunk_id for chunk in needing)
+
+
+def test_memory_status_reports_embedding_coverage(tmp_path) -> None:
+    db_path = _import_memory(tmp_path)
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    logs_dir = data_dir / "logs"
+    logs_dir.mkdir(parents=True)
+
+    initial = summarize_memory_status(data_dir=data_dir, memory_dir=memory_dir, logs_dir=logs_dir)
+    assert initial["sqlite"]["embedding_coverage"]["status"] == "missing_schema"
+    assert initial["sqlite"]["embedding_coverage"]["total_chunks"] == 2
+    assert initial["sqlite"]["embedding_coverage"]["coverage_ratio"] == 0.0
+
+    spec = fallback_model_spec(dimension=8)
+    with sqlite3.connect(db_path) as connection:
+        partial = embed_missing_chunks(connection, spec=spec, limit=1)
+        assert partial["embeddings_written"] == 1
+
+    partial_status = summarize_memory_status(data_dir=data_dir, memory_dir=memory_dir, logs_dir=logs_dir)
+    partial_coverage = partial_status["sqlite"]["embedding_coverage"]
+    assert partial_coverage["status"] == "partial"
+    assert partial_coverage["embedded_chunks"] == 1
+    assert partial_coverage["missing_chunks"] == 1
+    assert partial_coverage["coverage_ratio"] == 0.5
+    assert partial_coverage["active_model"]["model"] == "deterministic-token-hash"
+    assert partial_coverage["active_model"]["dimension"] == 8
+
+    with sqlite3.connect(db_path) as connection:
+        complete = embed_missing_chunks(connection, spec=spec)
+        assert complete["embeddings_written"] == 1
+
+    complete_status = summarize_memory_status(data_dir=data_dir, memory_dir=memory_dir, logs_dir=logs_dir)
+    complete_coverage = complete_status["sqlite"]["embedding_coverage"]
+    assert complete_coverage["status"] == "ok"
+    assert complete_coverage["embedded_chunks"] == 2
+    assert complete_coverage["missing_chunks"] == 0
+    assert complete_coverage["coverage_ratio"] == 1.0

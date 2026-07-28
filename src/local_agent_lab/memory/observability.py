@@ -165,6 +165,7 @@ def summarize_memory_status(*, data_dir: Path, memory_dir: Path, logs_dir: Path,
     if sqlite_path.exists():
         with sqlite3.connect(sqlite_path) as connection:
             sqlite_summary["counts"] = _sqlite_counts(connection)
+            sqlite_summary["embedding_coverage"] = _embedding_coverage_summary(connection)
             latest_import = connection.execute(
                 """
                 SELECT id, source_root, raw_manifest_path, imported_at, status, parser_version,
@@ -421,6 +422,146 @@ def _sqlite_counts(connection: sqlite3.Connection) -> dict[str, int]:
         except sqlite3.Error:
             counts[table] = 0
     return counts
+
+
+def _embedding_coverage_summary(connection: sqlite3.Connection) -> dict[str, Any]:
+    tables = _sqlite_tables(connection)
+    total_chunks = _safe_count(connection, "message_chunks", "is_deleted = 0") if "message_chunks" in tables else 0
+    if "embedding_models" not in tables or "chunk_embeddings" not in tables:
+        return {
+            "status": "missing_schema" if total_chunks else "empty",
+            "total_chunks": total_chunks,
+            "embedded_chunks": 0,
+            "missing_chunks": total_chunks,
+            "stale_chunks": 0,
+            "coverage_ratio": 0.0,
+            "active_model": None,
+            "models": [],
+        }
+
+    model_rows = connection.execute(
+        """
+        SELECT id, provider, model, dimension, normalize, created_at, metadata_json
+        FROM embedding_models
+        ORDER BY created_at DESC, id DESC
+        """
+    ).fetchall()
+    models: list[dict[str, Any]] = []
+    for row in model_rows:
+        model_id = str(row[0])
+        embedded_chunks = _embedded_chunk_count(connection, model_id=model_id)
+        stale_chunks = _stale_chunk_count(connection, model_id=model_id)
+        missing_chunks = max(total_chunks - embedded_chunks, 0)
+        models.append(
+            {
+                "id": model_id,
+                "provider": row[1],
+                "model": row[2],
+                "dimension": int(row[3]),
+                "normalize": bool(row[4]),
+                "created_at": row[5],
+                "metadata": _safe_json_object(row[6]),
+                "embedded_chunks": embedded_chunks,
+                "missing_chunks": missing_chunks,
+                "stale_chunks": stale_chunks,
+                "coverage_ratio": _coverage_ratio(embedded_chunks - stale_chunks, total_chunks),
+            }
+        )
+
+    active_model = models[0] if models else None
+    if active_model is None:
+        status = "empty" if total_chunks == 0 else "no_model"
+        embedded_chunks = 0
+        missing_chunks = total_chunks
+        stale_chunks = 0
+        coverage_ratio = 0.0
+    else:
+        embedded_chunks = int(active_model["embedded_chunks"])
+        missing_chunks = int(active_model["missing_chunks"])
+        stale_chunks = int(active_model["stale_chunks"])
+        coverage_ratio = float(active_model["coverage_ratio"])
+        status = "ok" if missing_chunks == 0 and stale_chunks == 0 else "partial"
+
+    return {
+        "status": status,
+        "total_chunks": total_chunks,
+        "embedded_chunks": embedded_chunks,
+        "missing_chunks": missing_chunks,
+        "stale_chunks": stale_chunks,
+        "coverage_ratio": coverage_ratio,
+        "active_model": active_model,
+        "models": models,
+    }
+
+
+def _sqlite_tables(connection: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
+        ).fetchall()
+    }
+
+
+def _safe_count(connection: sqlite3.Connection, table: str, where: str | None = None) -> int:
+    try:
+        sql = f"SELECT COUNT(*) FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        return int(connection.execute(sql).fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
+def _embedded_chunk_count(connection: sqlite3.Connection, *, model_id: str) -> int:
+    try:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM chunk_embeddings
+                JOIN message_chunks ON message_chunks.id = chunk_embeddings.chunk_id
+                WHERE chunk_embeddings.embedding_model_id = ?
+                  AND message_chunks.is_deleted = 0
+                """,
+                (model_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def _stale_chunk_count(connection: sqlite3.Connection, *, model_id: str) -> int:
+    try:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM chunk_embeddings
+                JOIN message_chunks ON message_chunks.id = chunk_embeddings.chunk_id
+                WHERE chunk_embeddings.embedding_model_id = ?
+                  AND chunk_embeddings.is_stale = 1
+                  AND message_chunks.is_deleted = 0
+                """,
+                (model_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def _coverage_ratio(usable_embeddings: int, total_chunks: int) -> float:
+    if total_chunks <= 0:
+        return 1.0
+    return round(max(usable_embeddings, 0) / total_chunks, 6)
+
+
+def _safe_json_object(value: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _count_candidates_for_import(connection: sqlite3.Connection, import_id: str) -> int:

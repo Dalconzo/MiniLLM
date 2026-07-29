@@ -31,6 +31,7 @@ from .memory.candidates import (
     init_candidate_memory_schema,
 )
 from .memory.chatgpt_ingest import init_chatgpt_memory_schema
+from .memory.context_packet import build_context_packet, compact_context_items
 from .memory.curated import MemoryRecord, create_memory_record, init_curated_memory_schema, list_memory_records
 from .memory.feedback import (
     VALID_AGENT_FEEDBACK_CATEGORIES,
@@ -1418,9 +1419,17 @@ class HomeMCPServer:
                 disclosure_depth=depth,
                 results=result["results"],
             )
+        context_items = compact_context_items(result["results"])
+        context_packet = build_context_packet(
+            query=query,
+            retrieval_event_id=audit["retrieval_event_id"],
+            search_result=result,
+            context_items=context_items,
+        )
         return {
             "status": "ok",
             "retrieval_event_id": audit["retrieval_event_id"],
+            "context_packet_id": context_packet["context_packet_id"],
             "query": query,
             "depth": depth,
             "ranking_profile": result["ranking_profile"],
@@ -1429,7 +1438,8 @@ class HomeMCPServer:
             "governance": result["governance"],
             "lenses": result["lenses"],
             "candidate_counts": result["candidate_counts"],
-            "context_items": [_memory_context_item(item) for item in result["results"]],
+            "context_items": context_items,
+            "context_packet": context_packet,
         }
 
     def memory_list(self, *, record_type: str | None = None, limit: int | None = None) -> dict[str, Any]:

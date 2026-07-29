@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
+from local_agent_lab.memory.context_packet import build_context_packet, compact_context_items
 from local_agent_lab.memory.curated import create_memory_record, promote_chunk_to_memory_record
 from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec
 from local_agent_lab.memory.observability import MemoryObservationError
@@ -82,6 +83,59 @@ def test_search_chatgpt_memory_returns_citations_and_score_breakdown(tmp_path) -
     assert all("domains" in item and "domain_primary" in item for item in result["results"])
     assert "operational" in result["lenses"] or "procedural" in result["lenses"]
     assert result["results"][0]["validation_checks"]["temporal"]["status"] == "not_run"
+
+
+def test_context_packet_v2_separates_evidence_belief_and_provenance(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Recipe cards stay compact",
+            body="Recipe cards should keep confirmed ingredients separate from assistant draft suggestions.",
+            subject_id=subject.id,
+            trust_level="high",
+            source_kind="manual",
+            source_ref="recipe-standard",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="what recipe context should the assistant know",
+        subject="Recipes and Baking",
+        depth="full",
+    )
+    context_items = compact_context_items(result["results"])
+    packet = build_context_packet(
+        query=result["query"],
+        retrieval_event_id="ret_test",
+        search_result=result,
+        context_items=context_items,
+    )
+
+    assert packet["schema_version"] == 2
+    assert packet["context_packet_id"].startswith("ctx_")
+    assert packet["task"]["query"] == result["query"]
+    assert packet["relevant_preferences"]
+    assert packet["provenance"]["retrieval_event_id"] == "ret_test"
+    assert packet["provenance"]["source_ids"]
+    assert set(packet) >= {
+        "critical_constraints",
+        "current_state",
+        "relevant_preferences",
+        "relevant_outcomes",
+        "failures_and_lessons",
+        "contradictions_and_qualifications",
+        "inferred_patterns",
+        "analogies",
+        "uncertainty",
+        "omitted_but_available",
+        "provenance",
+    }
+    assert all("source_ids" in item and "epistemic_status" in item for item in packet["relevant_preferences"])
 
 
 def test_search_chatgpt_memory_falls_back_for_natural_language_queries(tmp_path) -> None:

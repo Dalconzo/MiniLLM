@@ -74,6 +74,7 @@ from .memory.candidates import (
     update_candidate_review,
 )
 from .memory.curated import create_memory_record, get_memory_record, list_memory_records, promote_chunk_to_memory_record
+from .memory.context_packet import build_context_packet, compact_context_items
 from .memory.embeddings import embed_missing_chunks, fallback_model_spec
 from .memory.feedback import feedback_summary, list_open_loops, record_memory_feedback
 from .memory.eval_checks import run_memory_eval
@@ -1257,7 +1258,7 @@ def memory_context(
             effort=effort,
             allow_cross_domain=allow_cross_domain,
         )
-        context_items = [_context_item(item) for item in result["results"]]
+        context_items = compact_context_items(result["results"])
         with sqlite3.connect(db_path) as connection:
             audit = record_retrieval_event(
                 connection,
@@ -1269,10 +1270,17 @@ def memory_context(
                 disclosure_depth=depth,
                 results=result["results"],
             )
+        context_packet = build_context_packet(
+            query=query,
+            retrieval_event_id=audit["retrieval_event_id"],
+            search_result=result,
+            context_items=context_items,
+        )
         payload = {
             "status": "ok",
             "run_id": run.run_id,
             "retrieval_event_id": audit["retrieval_event_id"],
+            "context_packet_id": context_packet["context_packet_id"],
             "query": query,
             "depth": depth,
             "ranking_profile": result["ranking_profile"],
@@ -1282,6 +1290,7 @@ def memory_context(
             "lenses": result["lenses"],
             "candidate_counts": result["candidate_counts"],
             "context_items": context_items,
+            "context_packet": context_packet,
         }
         memory_trace.write_json("context_pack.json", payload)
         if explain:
@@ -3312,6 +3321,15 @@ def _render_memory_eval(payload: dict[str, object]) -> str:
             lines.append(
                 f"- {category}: {category_summary['score']}/{category_summary['max_score']} "
                 f"({category_summary['score_pct']:.1f}%)"
+            )
+    ab_report = payload.get("ab_report", {})
+    if isinstance(ab_report, dict) and ab_report.get("variants"):
+        lines.append(f"A/B winner: {ab_report.get('winner')}")
+        for variant in ab_report["variants"]:
+            metrics = variant.get("metrics", {})
+            lines.append(
+                f"- {variant['variant']}: {variant['status']} "
+                f"quality={metrics.get('answer_quality')} provenance={metrics.get('provenance_correctness')}"
             )
     return "\n".join(lines)
 

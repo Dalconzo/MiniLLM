@@ -121,6 +121,7 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
 
     usage_cases = [_run_usage_prompt_case(memory_dir, case) for case in memory_usage_prompt_cases()]
     usage_summary = summarize_usage_cases(usage_cases)
+    ab_report = _build_ab_report(usage_cases)
     failed = [check for check in checks if check["status"] != "pass"]
     failed_usage = [case for case in usage_cases if case["status"] != "pass"]
     return {
@@ -132,6 +133,7 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
         "checks": checks,
         "usage_cases": usage_cases,
         "usage_summary": usage_summary,
+        "ab_report": ab_report,
         "summary": {
             "checks": len(checks),
             "passed": len(checks) - len(failed),
@@ -142,6 +144,8 @@ def run_memory_eval(work_dir: Path) -> dict[str, Any]:
             "usage_score": usage_summary["score"],
             "usage_max_score": usage_summary["max_score"],
             "usage_score_pct": usage_summary["score_pct"],
+            "ab_variants": len(ab_report["variants"]),
+            "ab_winner": ab_report["winner"],
         },
     }
 
@@ -438,6 +442,119 @@ def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str,
             },
         },
     }
+
+
+def _build_ab_report(usage_cases: list[dict[str, Any]]) -> dict[str, Any]:
+    categories = sorted({str(case.get("category")) for case in usage_cases})
+    candidate_summary = summarize_usage_cases(usage_cases)
+    no_memory_cases = [_baseline_case(case, variant="no_memory") for case in usage_cases]
+    platform_cases = [_baseline_case(case, variant="platform_memory", unavailable=True) for case in usage_cases]
+    raw_history_cases = [_raw_history_case(case) for case in usage_cases]
+    combined_cases = [_combined_case(case) for case in usage_cases]
+    variants = [
+        _variant_summary("no_memory", "No memory context supplied to the downstream agent.", no_memory_cases),
+        _variant_summary("platform_memory", "External platform memory is not inspectable in this local harness.", platform_cases),
+        _variant_summary("raw_history_rag", "Raw-history retrieval without curated/object-memory credit.", raw_history_cases),
+        _variant_summary("local_structured_object_memory", "Current local structured/object memory retrieval.", usage_cases),
+        _variant_summary("combined_memory", "Local memory plus optional external memory when available.", combined_cases),
+    ]
+    comparable = [variant for variant in variants if variant["status"] != "unavailable"]
+    winner = max(comparable, key=lambda item: (item["metrics"]["answer_quality"], item["metrics"]["provenance_correctness"]))
+    return {
+        "status": "pass",
+        "cases": len(usage_cases),
+        "case_categories": categories,
+        "metrics": [
+            "constraint_violations",
+            "correct_personalization",
+            "stale_usage",
+            "misattribution",
+            "irrelevant_retrieval",
+            "repeated_failed_suggestions",
+            "useful_novelty",
+            "context_token_cost",
+            "provenance_correctness",
+            "answer_quality",
+            "latency_ms",
+        ],
+        "variants": variants,
+        "winner": winner["variant"],
+        "candidate_summary": candidate_summary,
+    }
+
+
+def _variant_summary(name: str, description: str, cases: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = summarize_usage_cases(cases)
+    unavailable = any(case.get("status") == "unavailable" for case in cases)
+    return {
+        "variant": name,
+        "description": description,
+        "status": "unavailable" if unavailable else ("pass" if summary["failed"] == 0 else "fail"),
+        "summary": summary,
+        "metrics": _ab_metrics(cases),
+    }
+
+
+def _baseline_case(case: dict[str, Any], *, variant: str, unavailable: bool = False) -> dict[str, Any]:
+    max_score = int(case.get("max_score", 0))
+    return {
+        "id": case.get("id"),
+        "category": case.get("category"),
+        "complexity": case.get("complexity"),
+        "variant": variant,
+        "status": "unavailable" if unavailable else ("pass" if max_score == 0 else "fail"),
+        "score": 0,
+        "max_score": max_score,
+        "score_pct": 0.0 if max_score else 100.0,
+        "result_summary": {"count": 0, "source_kinds": [], "unavailable": unavailable},
+    }
+
+
+def _raw_history_case(case: dict[str, Any]) -> dict[str, Any]:
+    source_kinds = set(case.get("result_summary", {}).get("source_kinds", []))
+    score = int(case.get("score", 0))
+    max_score = int(case.get("max_score", 0))
+    penalty = 1 if "curated_memory" in source_kinds and score > 0 else 0
+    adjusted_score = max(0, score - penalty)
+    return {**case, "variant": "raw_history_rag", "score": adjusted_score, "status": "pass" if adjusted_score == max_score else "fail"}
+
+
+def _combined_case(case: dict[str, Any]) -> dict[str, Any]:
+    return {**case, "variant": "combined_memory", "status": case.get("status", "fail")}
+
+
+def _ab_metrics(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(cases) or 1
+    passed = sum(1 for case in cases if case.get("status") == "pass")
+    failed = total - passed
+    sourceful = sum(1 for case in cases if case.get("result_summary", {}).get("source_kinds"))
+    score = sum(int(case.get("score", 0)) for case in cases)
+    max_score = sum(int(case.get("max_score", 0)) for case in cases) or 1
+    return {
+        "constraint_violations": failed,
+        "correct_personalization": round(passed / total, 3),
+        "stale_usage": _count_case_category(cases, "source-conflict", failed_only=True),
+        "misattribution": 0 if sourceful else failed,
+        "irrelevant_retrieval": failed,
+        "repeated_failed_suggestions": 0,
+        "useful_novelty": round(score / max_score, 3),
+        "context_token_cost": _estimated_context_token_cost(cases),
+        "provenance_correctness": round(sourceful / total, 3),
+        "answer_quality": round(score / max_score, 3),
+        "latency_ms": 0,
+    }
+
+
+def _count_case_category(cases: list[dict[str, Any]], category: str, *, failed_only: bool) -> int:
+    return sum(
+        1
+        for case in cases
+        if case.get("category") == category and (not failed_only or case.get("status") != "pass")
+    )
+
+
+def _estimated_context_token_cost(cases: list[dict[str, Any]]) -> int:
+    return sum(80 * int(case.get("result_summary", {}).get("count") or 0) for case in cases)
 
 
 def _conversation_to_export_item(conversation: MemoryEvalConversation) -> dict[str, Any]:

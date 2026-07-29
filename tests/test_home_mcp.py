@@ -240,6 +240,66 @@ def test_home_mcp_lists_roots_and_blocks_escape(tmp_path) -> None:
     assert exc_info.value.error_code == "path_escape"
 
 
+def test_home_mcp_security_acceptance_rejects_boundary_violations_and_audits(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+    recipe_root = server.roots_by_id["recipe_book"].path
+    recipe_root.mkdir(parents=True, exist_ok=True)
+    (recipe_root / ".secret.md").write_text("do not expose", encoding="utf-8")
+    outside = tmp_path / "outside-secret.md"
+    outside.write_text("outside", encoding="utf-8")
+    (recipe_root / "outside-link.md").symlink_to(outside)
+
+    hidden = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "hidden",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"file_id": "recipe_book:.secret.md"}},
+        }
+    )
+    assert hidden["error"]["data"]["error_code"] == "hidden_path_blocked"
+
+    symlink_escape = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "symlink",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"file_id": "recipe_book:outside-link.md"}},
+        }
+    )
+    assert symlink_escape["error"]["data"]["error_code"] == "path_escape"
+
+    unknown_root = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "unknown-root",
+            "method": "tools/call",
+            "params": {"name": "list_files", "arguments": {"root_id": "production_secrets"}},
+        }
+    )
+    assert unknown_root["error"]["data"]["error_code"] == "unknown_root"
+
+    arbitrary_shell = server.dispatch_jsonrpc(
+        {
+            "jsonrpc": "2.0",
+            "id": "shell",
+            "method": "tools/call",
+            "params": {"name": "shell", "arguments": {"command": "id"}},
+        }
+    )
+    assert arbitrary_shell["error"]["data"]["error_code"] == "unsupported_tool"
+
+    unsupported_method = server.dispatch_jsonrpc({"jsonrpc": "2.0", "id": "method", "method": "shell/exec", "params": {}})
+    assert unsupported_method["error"]["data"]["error_code"] == "unsupported_method"
+
+    assert not any(tool["name"] in {"shell", "exec", "run_command"} for tool in server.tools())
+    error_run_dirs = [path for path in server.logger.logs_dir.iterdir() if path.is_dir()]
+    assert error_run_dirs
+    assert any((path / "trace.jsonl").exists() and (path / "result.json").exists() for path in error_run_dirs)
+
+
 def test_home_mcp_creates_recipe_notes_and_appends_attempts(tmp_path) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)
@@ -677,6 +737,10 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert structured["trace_id"] == structured["run_id"]
     assert structured["tool_name"] == "memory_context"
     assert structured["retrieval_event_id"].startswith("ret_")
+    assert structured["context_packet_id"].startswith("ctx_")
+    assert structured["context_packet"]["schema_version"] == 2
+    assert structured["context_packet"]["provenance"]["retrieval_event_id"] == structured["retrieval_event_id"]
+    assert structured["context_packet"]["relevant_preferences"] or structured["context_packet"]["current_state"]
     assert structured["context_items"]
     trace = server.dispatch_jsonrpc(
         {

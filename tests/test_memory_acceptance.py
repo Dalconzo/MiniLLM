@@ -112,6 +112,10 @@ def test_acceptance_retrieval_context_and_audit_traces_are_explainable(tmp_path,
     context_payload = json.loads(context.stdout)
     assert context_payload["context_items"]
     assert context_payload["retrieval_event_id"].startswith("ret_")
+    assert context_payload["context_packet_id"].startswith("ctx_")
+    assert context_payload["context_packet"]["schema_version"] == 2
+    assert context_payload["context_packet"]["provenance"]["retrieval_event_id"] == context_payload["retrieval_event_id"]
+    assert "inferred_patterns" in context_payload["context_packet"]
     assert context_payload["governance"]["policy"] == "standard_v1"
     context_trace = read_memory_trace(tmp_path / "data" / "logs", context_payload["run_id"])
     assert {"context_pack.json", "context_explain.json"} <= set(context_trace["artifacts"])
@@ -152,6 +156,14 @@ def test_acceptance_status_review_and_lifecycle_surfaces_are_visible(tmp_path, m
     eval_payload = json.loads(eval_run.stdout)
     assert eval_payload["summary"]["usage_cases"] == 14
     assert eval_payload["summary"]["usage_score"] == eval_payload["summary"]["usage_max_score"] == 70
+    assert eval_payload["ab_report"]["winner"] in {"local_structured_object_memory", "combined_memory"}
+    assert {variant["variant"] for variant in eval_payload["ab_report"]["variants"]} == {
+        "no_memory",
+        "platform_memory",
+        "raw_history_rag",
+        "local_structured_object_memory",
+        "combined_memory",
+    }
 
 
 def _seed_eval_memory(tmp_path, monkeypatch) -> None:

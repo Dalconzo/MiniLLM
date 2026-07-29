@@ -10,6 +10,18 @@ def test_run_memory_eval_reports_passes(tmp_path) -> None:
     assert report["summary"]["usage_cases"] == 14
     assert report["summary"]["usage_score"] == report["summary"]["usage_max_score"] == 70
     assert report["usage_summary"]["score_pct"] == 100.0
+    assert report["ab_report"]["status"] == "pass"
+    assert report["ab_report"]["winner"] in {"local_structured_object_memory", "combined_memory"}
+    assert "constraint_violations" in report["ab_report"]["metrics"]
+    assert {variant["variant"] for variant in report["ab_report"]["variants"]} == {
+        "no_memory",
+        "platform_memory",
+        "raw_history_rag",
+        "local_structured_object_memory",
+        "combined_memory",
+    }
+    platform = next(variant for variant in report["ab_report"]["variants"] if variant["variant"] == "platform_memory")
+    assert platform["status"] == "unavailable"
     assert {case["category"] for case in report["usage_cases"]} == {
         "cross-domain",
         "curated-memory",

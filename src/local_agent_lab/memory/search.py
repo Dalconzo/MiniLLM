@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -220,6 +221,7 @@ def search_chatgpt_memory(
             hit_domains = classify_text_domains(
                 hit.get("title"),
                 hit.get("snippet"),
+                hit.get("subject_name"),
                 hit.get("role"),
             )
             allowed, relation = scope_candidate_domains(
@@ -546,11 +548,10 @@ def _curated_hits(
 
     where = ["memory_records.status = 'active'"]
     params: list[Any] = []
-    token_clauses = []
-    for token in tokens:
-        token_clauses.append("(memory_records.title LIKE ? OR memory_records.body LIKE ?)")
-        params.extend([f"%{token}%", f"%{token}%"])
-    where.append(f"({' OR '.join(token_clauses)})")
+    token_clauses, token_params = _curated_token_filter(tokens)
+    if token_clauses and not subject:
+        where.append(f"({' OR '.join(token_clauses)})")
+        params.extend(token_params)
     if title:
         where.append("memory_records.title LIKE ?")
         params.append(f"%{title}%")
@@ -579,14 +580,9 @@ def _curated_hits(
         )
         params.extend(exclude_source_ids)
     if subject and _table_exists(connection, "subjects"):
-        where.append(
-            """
-            memory_records.subject_id IN (
-                SELECT id FROM subjects WHERE slug = ? OR name LIKE ?
-            )
-            """
-        )
-        params.extend([normalize_subject_slug(subject), f"%{subject}%"])
+        subject_where, subject_params = _curated_subject_filter(subject)
+        where.append(subject_where)
+        params.extend(subject_params)
     if exclude_subjects and _table_exists(connection, "subjects"):
         subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
         placeholders = ", ".join("?" for _ in subject_slugs)
@@ -603,7 +599,7 @@ def _curated_hits(
         f"""
         SELECT
             id, record_type, title, body, subject_id, trust_level,
-            source_kind, source_ref, status, updated_at
+            source_kind, source_ref, provenance_json, status, updated_at
         FROM memory_records
         WHERE {' AND '.join(where)}
         ORDER BY updated_at DESC, title COLLATE NOCASE ASC
@@ -617,35 +613,152 @@ def _curated_hits(
     for index, row in enumerate(rows, start=1):
         redacted = redact_obvious_secrets(str(row[3])[:280])
         trust_level = str(row[5])
+        keyword_relevance = _curated_keyword_relevance(tokens, title=str(row[2] or ""), body=str(row[3] or ""))
+        subject_match = 1.0 if subject else 0.0
+        source_refs = _curated_source_refs(connection, str(row[0]))
+        provenance = _safe_json_loads(str(row[8] or "{}"))
+        subject_name = _curated_subject_name(connection, str(row[4]) if row[4] else None)
         hits.append(
             {
                 "rank": index,
                 "score": trust_scores.get(trust_level, 0.5),
-                "score_breakdown": {"fts_bm25": None},
-                "keyword_relevance": 0.75,
+                "score_breakdown": {
+                    "fts_bm25": None,
+                    "semantic_similarity": None,
+                    "source_trust": trust_scores.get(trust_level, 0.5),
+                    "personal_feedback": None,
+                },
+                "keyword_relevance": keyword_relevance,
+                "subject_match": subject_match,
                 "source_kind": "curated_memory",
+                "retrieval_sources": ["curated"],
                 "disclosure_tier": "medium",
                 "exposed_fields": ["title", "record_type", "snippet", "ids"],
                 "conversation_id": None,
                 "source_conversation_id": None,
                 "message_id": None,
                 "chunk_id": row[0],
+                "source_id": row[0],
+                "memory_record_id": row[0],
+                "record_type": row[1],
                 "title": redact_obvious_secrets(str(row[2]) or "").text,
                 "role": row[1],
                 "source_role": None,
                 "epistemic_status": "confirmed" if trust_level in {"canonical", "high"} else "user_reported",
-                    "confidence_basis": "multiple_sources_agree" if trust_level == "canonical" else "single_user_statement",
-                    "status": row[8],
-                    "trust_level": trust_level,
-                    "turn_index": None,
-                    "chunk_index": None,
-                    "message_created_at": row[9],
-                    "snippet": redacted.text,
-                    "redacted_secret_count": redacted.redacted_count,
-                    "curated_trust": trust_scores.get(trust_level, 0.5),
-                }
+                "confidence_basis": "multiple_sources_agree" if trust_level == "canonical" else "single_user_statement",
+                "status": row[9],
+                "trust_level": trust_level,
+                "turn_index": None,
+                "chunk_index": None,
+                "message_created_at": row[10],
+                "snippet": redacted.text,
+                "redacted_secret_count": redacted.redacted_count,
+                "curated_trust": trust_scores.get(trust_level, 0.5),
+                "curated_subject_id": row[4],
+                "subject_name": subject_name,
+                "curated_source_kind": row[6],
+                "curated_source_ref": row[7],
+                "source_refs": source_refs,
+                "provenance": provenance,
+            }
         )
     return hits
+
+
+def _curated_token_filter(tokens: list[str]) -> tuple[list[str], list[Any]]:
+    token_clauses: list[str] = []
+    params: list[Any] = []
+    for token in tokens:
+        token_clauses.append("(memory_records.title LIKE ? OR memory_records.body LIKE ?)")
+        params.extend([f"%{token}%", f"%{token}%"])
+    return token_clauses, params
+
+
+def _curated_subject_filter(subject: str) -> tuple[str, list[Any]]:
+    subject_slug = normalize_subject_slug(subject)
+    subject_like = f"%{subject}%"
+    return (
+        """
+        (
+            memory_records.subject_id IN (
+                SELECT id FROM subjects WHERE slug = ? OR name LIKE ?
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_links linked_chunks
+                JOIN chunk_subjects ON chunk_subjects.chunk_id = linked_chunks.to_id
+                JOIN subjects linked_chunk_subjects ON linked_chunk_subjects.id = chunk_subjects.subject_id
+                WHERE linked_chunks.from_kind = 'memory_record'
+                  AND linked_chunks.from_id = memory_records.id
+                  AND linked_chunks.to_kind = 'message_chunk'
+                  AND (linked_chunk_subjects.slug = ? OR linked_chunk_subjects.name LIKE ?)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_links linked_conversations
+                JOIN conversation_subjects ON conversation_subjects.conversation_id = linked_conversations.to_id
+                JOIN subjects linked_conversation_subjects ON linked_conversation_subjects.id = conversation_subjects.subject_id
+                WHERE linked_conversations.from_kind = 'memory_record'
+                  AND linked_conversations.from_id = memory_records.id
+                  AND linked_conversations.to_kind = 'conversation'
+                  AND (linked_conversation_subjects.slug = ? OR linked_conversation_subjects.name LIKE ?)
+            )
+        )
+        """,
+        [subject_slug, subject_like, subject_slug, subject_like, subject_slug, subject_like],
+    )
+
+
+def _curated_keyword_relevance(tokens: list[str], *, title: str, body: str) -> float:
+    searchable = f"{title} {body}".lower()
+    if not tokens:
+        return 0.0
+    matched = sum(1 for token in tokens if token.lower() in searchable)
+    if matched == 0:
+        return 0.15
+    return min(1.0, 0.35 + (matched / len(tokens)) * 0.65)
+
+
+def _curated_source_refs(connection: sqlite3.Connection, record_id: str) -> list[dict[str, Any]]:
+    if not _table_exists(connection, "memory_links"):
+        return []
+    rows = connection.execute(
+        """
+        SELECT to_kind, to_id, link_type, confidence, notes
+        FROM memory_links
+        WHERE from_kind = 'memory_record'
+          AND from_id = ?
+        ORDER BY link_type, to_kind, to_id
+        """,
+        (record_id,),
+    ).fetchall()
+    return [
+        {
+            "source_kind": row[0],
+            "source_id": row[1],
+            "link_type": row[2],
+            "confidence": row[3],
+            "notes": row[4],
+        }
+        for row in rows
+    ]
+
+
+def _curated_subject_name(connection: sqlite3.Connection, subject_id: str | None) -> str | None:
+    if not subject_id or not _table_exists(connection, "subjects"):
+        return None
+    row = connection.execute("SELECT name FROM subjects WHERE id = ?", (subject_id,)).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _safe_json_loads(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _empty_result(*, query: str, ranking_profile: str, filters_applied: list[dict[str, Any]]) -> dict[str, Any]:

@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
-from local_agent_lab.memory.curated import create_memory_record
+from local_agent_lab.memory.curated import create_memory_record, promote_chunk_to_memory_record
 from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec
 from local_agent_lab.memory.observability import MemoryObservationError
 from local_agent_lab.memory.search import search_chatgpt_memory
@@ -197,6 +197,119 @@ def test_search_chatgpt_memory_includes_curated_memory_records(tmp_path) -> None
 
     assert any(item["source_kind"] == "curated_memory" for item in result["results"])
     assert result["candidate_counts"]["curated"] == 1
+
+
+def test_search_chatgpt_memory_retrieves_subject_curated_records_without_lexical_match(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        record = create_memory_record(
+            connection,
+            record_type="preference",
+            title="Starter feeding cadence",
+            body="Keep the mature starter on a predictable refresh timeline and record rise behavior.",
+            subject_id=subject.id,
+            trust_level="canonical",
+            source_kind="manual",
+            source_ref="recipe-note-1",
+            provenance={"source": {"note_id": "recipe-note-1"}},
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="what are the current baking operating rules",
+        subject="Recipes and Baking",
+        depth="full",
+    )
+
+    curated = [item for item in result["results"] if item["source_kind"] == "curated_memory"]
+    assert curated
+    assert curated[0]["memory_record_id"] == record.id
+    assert curated[0]["source_id"] == record.id
+    assert curated[0]["record_type"] == "preference"
+    assert curated[0]["curated_source_ref"] == "recipe-note-1"
+    assert curated[0]["provenance"] == {"source": {"note_id": "recipe-note-1"}}
+    assert curated[0]["score_breakdown"]["components"]["subject_match"]["value"] == 1.0
+    assert result["candidate_counts"]["curated"] == 1
+
+
+def test_search_chatgpt_memory_subject_filter_uses_curated_source_links(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        assign_conversation_subject(connection, conversation_id, "Lab Automation", include_chunks=True)
+        chunk_id = connection.execute(
+            "SELECT id FROM message_chunks WHERE conversation_id = ? ORDER BY chunk_index LIMIT 1",
+            (conversation_id,),
+        ).fetchone()[0]
+        record = promote_chunk_to_memory_record(
+            connection,
+            chunk_id,
+            record_type="decision",
+            title="Scanner workflow rule",
+            body="Use the curated scanner workflow for incoming lab automation samples.",
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="which scanner rule should the agent use",
+        subject="Lab Automation",
+        depth="full",
+    )
+
+    curated = [item for item in result["results"] if item.get("memory_record_id") == record.id]
+    assert curated
+    assert curated[0]["source_refs"] == [
+        {
+            "source_kind": "conversation",
+            "source_id": conversation_id,
+            "link_type": "derived_from",
+            "confidence": 1.0,
+            "notes": "Source conversation for promoted memory.",
+        },
+        {
+            "source_kind": "message_chunk",
+            "source_id": chunk_id,
+            "link_type": "derived_from",
+            "confidence": 1.0,
+            "notes": "Promoted from ChatGPT export chunk.",
+        },
+    ]
+    assert curated[0]["score_breakdown"]["components"]["curated_trust"]["value"] == 1.0
+
+
+def test_search_chatgpt_memory_canonical_curated_records_outrank_weak_raw_chunks(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Lab Automation")
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Barcode parser source of truth",
+            body="The durable rule is to use the curated barcode parser workflow.",
+            subject_id=subject.id,
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="barcode parser",
+        subject="Lab Automation",
+        depth="full",
+    )
+
+    assert result["results"][0]["source_kind"] == "curated_memory"
+    assert result["results"][0]["trust_level"] == "canonical"
+    assert result["results"][0]["score_breakdown"]["components"]["curated_trust"]["value"] == 1.0
 
 
 def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path) -> None:

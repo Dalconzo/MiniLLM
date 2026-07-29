@@ -15,6 +15,7 @@ data/patches/*
 !data/patches/.gitkeep
 data/memory/*
 !data/memory/.gitkeep
+data/local_staging/
 
 # Private imported/exported personal data
 data/chatgpt_exports/

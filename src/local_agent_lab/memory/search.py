@@ -17,6 +17,7 @@ from .domain_scoping import (
     scope_candidate_domains,
     select_lenses_for_query,
 )
+from .embeddings import LOCAL_VECTOR_BACKEND, cosine_similarity, deterministic_fallback_embedding, load_local_vector
 from .observability import MemoryObservationError, memory_db_path
 from .privacy import redact_obvious_secrets
 from .ranking import rank_memory_hits
@@ -190,6 +191,17 @@ def search_chatgpt_memory(
         if fts_strategy != "precise_all_terms":
             filters_applied.append({"field": "fts_strategy", "value": fts_strategy})
         fts_results = [_row_to_hit(index, row) for index, row in enumerate(rows, start=1)]
+        vector_results = _vector_hits(
+            connection,
+            query=query,
+            subject=subject,
+            exclude_source_ids=excluded_ids,
+            exclude_subjects=exclude_subjects,
+            title=title,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+        )
         curated_results = _curated_hits(
             connection,
             query=query,
@@ -202,8 +214,9 @@ def search_chatgpt_memory(
             limit=limit,
         )
 
+        retrieved_results = _merge_retrieval_hits(fts_results, vector_results)
         scoped_results = []
-        for hit in [*fts_results, *curated_results]:
+        for hit in [*retrieved_results, *curated_results]:
             hit_domains = classify_text_domains(
                 hit.get("title"),
                 hit.get("snippet"),
@@ -263,7 +276,7 @@ def search_chatgpt_memory(
             },
             "candidate_counts": {
                 "fts": len(fts_results),
-                "vector": 0,
+                "vector": len(vector_results),
                 "curated": len(curated_results),
                 "after_filters": len(results),
         },
@@ -271,6 +284,210 @@ def search_chatgpt_memory(
         "results": results,
         "count": len(results),
     }
+
+
+def _vector_hits(
+    connection: sqlite3.Connection,
+    *,
+    query: str,
+    subject: str | None,
+    exclude_source_ids: list[str],
+    exclude_subjects: list[str] | None,
+    title: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    required_tables = {"embedding_models", "chunk_embeddings", "local_embedding_vectors"}
+    if not all(_table_exists(connection, table) for table in required_tables):
+        return []
+
+    model = connection.execute(
+        """
+        SELECT id, model, dimension
+        FROM embedding_models
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if model is None:
+        return []
+
+    embedding_model_id = str(model["id"] if isinstance(model, sqlite3.Row) else model[0])
+    dimension = int(model["dimension"] if isinstance(model, sqlite3.Row) else model[2])
+    query_vector = deterministic_fallback_embedding(query, dimension)
+
+    where = [
+        "chunk_embeddings.embedding_model_id = ?",
+        "chunk_embeddings.vector_backend = ?",
+        "chunk_embeddings.is_stale = 0",
+        "chunk_embeddings.text_sha256 = message_chunks.text_sha256",
+        "message_chunks.is_deleted = 0",
+        "messages.is_deleted = 0",
+        "conversations.is_deleted = 0",
+    ]
+    params: list[Any] = [embedding_model_id, LOCAL_VECTOR_BACKEND]
+    if exclude_source_ids:
+        placeholders = ", ".join("?" for _ in exclude_source_ids)
+        where.append(f"message_chunks.id NOT IN ({placeholders})")
+        where.append(f"messages.id NOT IN ({placeholders})")
+        where.append(f"conversations.id NOT IN ({placeholders})")
+        params.extend(exclude_source_ids)
+        params.extend(exclude_source_ids)
+        params.extend(exclude_source_ids)
+    if title:
+        where.append("conversations.title LIKE ?")
+        params.append(f"%{title}%")
+    if date_from:
+        where.append("COALESCE(messages.created_at, conversations.created_at, '') >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("COALESCE(messages.created_at, conversations.created_at, '') <= ?")
+        params.append(date_to)
+    if subject:
+        if not (_table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects")):
+            return []
+        subject_slug = normalize_subject_slug(subject)
+        where.append(
+            """
+            (
+                EXISTS (
+                    SELECT 1
+                    FROM chunk_subjects
+                    JOIN subjects ON subjects.id = chunk_subjects.subject_id
+                    WHERE chunk_subjects.chunk_id = message_chunks.id
+                      AND (subjects.slug = ? OR subjects.name LIKE ?)
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM conversation_subjects
+                    JOIN subjects ON subjects.id = conversation_subjects.subject_id
+                    WHERE conversation_subjects.conversation_id = conversations.id
+                      AND (subjects.slug = ? OR subjects.name LIKE ?)
+                )
+            )
+            """
+        )
+        params.extend([subject_slug, f"%{subject}%", subject_slug, f"%{subject}%"])
+    if exclude_subjects and _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
+        subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
+        placeholders = ", ".join("?" for _ in subject_slugs)
+        where.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM chunk_subjects excluded_chunk_subjects
+                JOIN subjects excluded_subjects
+                  ON excluded_subjects.id = excluded_chunk_subjects.subject_id
+                WHERE excluded_chunk_subjects.chunk_id = message_chunks.id
+                  AND excluded_subjects.slug IN ({placeholders})
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM conversation_subjects excluded_conversation_subjects
+                JOIN subjects excluded_subjects
+                  ON excluded_subjects.id = excluded_conversation_subjects.subject_id
+                WHERE excluded_conversation_subjects.conversation_id = conversations.id
+                  AND excluded_subjects.slug IN ({placeholders})
+            )
+            """
+        )
+        params.extend(subject_slugs)
+        params.extend(subject_slugs)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            conversations.id AS conversation_id,
+            conversations.source_conversation_id,
+            conversations.title,
+            messages.id AS message_id,
+            messages.role,
+            messages.turn_index,
+            messages.created_at AS message_created_at,
+            message_chunks.id AS chunk_id,
+            message_chunks.chunk_index,
+            message_chunks.source_kind,
+            message_chunks.text,
+            chunk_embeddings.vector_ref
+        FROM chunk_embeddings
+        JOIN local_embedding_vectors ON local_embedding_vectors.vector_ref = chunk_embeddings.vector_ref
+        JOIN message_chunks ON message_chunks.id = chunk_embeddings.chunk_id
+        JOIN messages ON messages.id = message_chunks.message_id
+        JOIN conversations ON conversations.id = message_chunks.conversation_id
+        WHERE {' AND '.join(where)}
+        """,
+        params,
+    ).fetchall()
+
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        similarity = cosine_similarity(query_vector, load_local_vector(connection, str(row["vector_ref"])))
+        if similarity <= 0.0:
+            continue
+        scored.append(_row_to_vector_hit(len(scored) + 1, row, similarity=similarity, embedding_model_id=embedding_model_id))
+
+    scored.sort(key=lambda item: (-float(item["semantic_similarity"]), str(item["chunk_id"])))
+    return [{**item, "rank": index} for index, item in enumerate(scored[:limit], start=1)]
+
+
+def _row_to_vector_hit(rank: int, row: sqlite3.Row, *, similarity: float, embedding_model_id: str) -> dict[str, Any]:
+    text = str(row["text"] or "")
+    redacted = redact_obvious_secrets(text[:280])
+    source_role = row["role"]
+    return {
+        "rank": rank,
+        "score": similarity,
+        "score_breakdown": {
+            "fts_bm25": None,
+            "semantic_similarity": round(similarity, 6),
+            "source_trust": None,
+            "personal_feedback": None,
+        },
+        "keyword_relevance": 0.0,
+        "semantic_similarity": max(0.0, min(1.0, similarity)),
+        "source_kind": row["source_kind"],
+        "retrieval_sources": ["vector"],
+        "embedding_model_id": embedding_model_id,
+        "disclosure_tier": "medium",
+        "exposed_fields": ["title", "role", "snippet", "message_created_at", "ids"],
+        "conversation_id": row["conversation_id"],
+        "source_conversation_id": row["source_conversation_id"],
+        "message_id": row["message_id"],
+        "chunk_id": row["chunk_id"],
+        "title": redact_obvious_secrets(row["title"] or "").text,
+        "role": source_role,
+        "source_role": source_role,
+        "epistemic_status": "assistant_suggested" if source_role == "assistant" else "user_reported",
+        "confidence_basis": "assistant_suggestion_only" if source_role == "assistant" else "single_user_statement",
+        "status": None,
+        "trust_level": None,
+        "turn_index": row["turn_index"],
+        "chunk_index": row["chunk_index"],
+        "message_created_at": row["message_created_at"],
+        "snippet": redacted.text,
+        "redacted_secret_count": redacted.redacted_count,
+    }
+
+
+def _merge_retrieval_hits(fts_results: list[dict[str, Any]], vector_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for hit in fts_results:
+        chunk_id = str(hit["chunk_id"])
+        merged[chunk_id] = {**hit, "retrieval_sources": ["fts"]}
+    for hit in vector_results:
+        chunk_id = str(hit["chunk_id"])
+        existing = merged.get(chunk_id)
+        if existing is None:
+            merged[chunk_id] = hit
+            continue
+        sources = sorted(set(existing.get("retrieval_sources", [])) | {"vector"})
+        existing["retrieval_sources"] = sources
+        existing["semantic_similarity"] = hit.get("semantic_similarity")
+        existing["embedding_model_id"] = hit.get("embedding_model_id")
+        if isinstance(existing.get("score_breakdown"), dict):
+            existing["score_breakdown"]["semantic_similarity"] = hit.get("semantic_similarity")
+    return list(merged.values())
 
 
 def _row_to_hit(rank: int, row: sqlite3.Row) -> dict[str, Any]:

@@ -5,6 +5,7 @@ import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
 from local_agent_lab.memory.curated import create_memory_record
+from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec
 from local_agent_lab.memory.observability import MemoryObservationError
 from local_agent_lab.memory.search import search_chatgpt_memory
 from local_agent_lab.memory.subjects import assign_conversation_subject, upsert_subject
@@ -196,6 +197,118 @@ def test_search_chatgpt_memory_includes_curated_memory_records(tmp_path) -> None
 
     assert any(item["source_kind"] == "curated_memory" for item in result["results"])
     assert result["candidate_counts"]["curated"] == 1
+
+
+def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        connection.execute("DELETE FROM chatgpt_chunks_fts")
+        connection.execute("DELETE FROM message_chunks")
+        connection.execute("DELETE FROM messages")
+        connection.execute("DELETE FROM conversations")
+        text = "Track the sourdough starter fermentation rise timeline after feeding."
+        connection.execute(
+            """
+            INSERT INTO conversations (
+                id, import_id, source_conversation_id, title, created_at, updated_at,
+                message_count, first_message_at, last_message_at, summary, content_sha256,
+                is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                "conv_baking",
+                import_id,
+                "conversation-baking",
+                "Starter rise notebook",
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+                1,
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+                None,
+                "hash-conversation-baking",
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO messages (
+                id, conversation_id, import_id, source_message_id, parent_message_id, role,
+                author_name, turn_index, created_at, content_text, content_sha256,
+                token_estimate, attachment_count, is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+            """,
+            (
+                "msg_baking",
+                "conv_baking",
+                import_id,
+                "msg-baking",
+                None,
+                "user",
+                None,
+                0,
+                "2026-07-01T00:00:00Z",
+                text,
+                "hash-message-baking",
+                9,
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO message_chunks (
+                id, message_id, conversation_id, import_id, chunk_index, text,
+                text_sha256, token_estimate, start_char, end_char, source_kind, summary,
+                is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                "chk_baking",
+                "msg_baking",
+                "conv_baking",
+                import_id,
+                0,
+                text,
+                "hash-baking",
+                9,
+                0,
+                len(text),
+                "chatgpt_export",
+                None,
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chatgpt_chunks_fts(title, role, text, import_id, conversation_id, message_id, chunk_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Starter rise notebook",
+                "user",
+                text,
+                import_id,
+                "conv_baking",
+                "msg_baking",
+                "chk_baking",
+            ),
+        )
+        connection.commit()
+        embed_missing_chunks(connection, spec=fallback_model_spec(dimension=32))
+
+    lexical = search_chatgpt_memory(memory_dir=memory_dir, query="leavened loaf proving schedule")
+    assert lexical["candidate_counts"]["fts"] == 0
+    assert lexical["candidate_counts"]["vector"] == 1
+    assert lexical["results"][0]["chunk_id"] == "chk_baking"
+    assert lexical["results"][0]["score_breakdown"]["components"]["semantic_similarity"]["value"] > 0
+    assert lexical["results"][0]["retrieval_sources"] == ["vector"]
 
 
 def test_search_chatgpt_memory_subject_filter_is_explicit_without_subject_tables(tmp_path) -> None:

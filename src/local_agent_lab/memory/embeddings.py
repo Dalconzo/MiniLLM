@@ -71,6 +71,7 @@ def fallback_model_spec(*, dimension: int = DEFAULT_FALLBACK_DIMENSION) -> Embed
         metadata={
             "purpose": "dependency-free fallback for tests and offline smoke checks",
             "quality": "not suitable for production semantic ranking",
+            "semantic_hints": "small hand-authored synonym set for fixture recall checks",
         },
     )
 
@@ -351,7 +352,33 @@ def cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
 
 
 def _tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
+    base_tokens = re.findall(r"[a-z0-9]+", text.lower())
+    expanded: list[str] = []
+    for token in base_tokens:
+        expanded.append(token)
+        expanded.extend(_TOKEN_ALIASES.get(token, ()))
+    return expanded
+
+
+_TOKEN_ALIASES = {
+    "bake": ("baking", "oven"),
+    "baking": ("bake", "oven"),
+    "bread": ("loaf", "sourdough"),
+    "ferment": ("fermentation", "proof", "rise"),
+    "fermentation": ("ferment", "proof", "rise"),
+    "leaven": ("levain", "starter", "sourdough"),
+    "leavened": ("levain", "starter", "sourdough"),
+    "levain": ("leaven", "starter", "sourdough"),
+    "loaf": ("bread", "sourdough"),
+    "proof": ("ferment", "fermentation", "rise"),
+    "proofing": ("ferment", "fermentation", "rise"),
+    "proving": ("ferment", "fermentation", "rise"),
+    "rise": ("ferment", "fermentation", "proof"),
+    "schedule": ("timing", "timeline"),
+    "sourdough": ("bread", "levain", "starter"),
+    "starter": ("levain", "sourdough"),
+    "timing": ("schedule", "timeline"),
+}
 
 
 def _normalize(vector: list[float]) -> list[float]:

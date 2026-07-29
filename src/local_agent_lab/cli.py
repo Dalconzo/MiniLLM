@@ -1359,12 +1359,13 @@ def memory_embed(
             report = embed_missing_chunks(connection, spec=fallback_model_spec(dimension=dimension), limit=limit)
         report["run_id"] = run.run_id
         report["sqlite_path"] = str(db_path)
-        memory_trace.write_json("embedding_report.json", report)
-        memory_trace.finish(status="ok", result=report)
+        output_report = _compact_memory_embed_report(report)
+        memory_trace.write_json("embedding_report.json", output_report)
+        memory_trace.finish(status="ok", result=output_report)
         if json_output:
-            typer.echo(json.dumps(report, indent=2, sort_keys=True))
+            typer.echo(json.dumps(output_report, indent=2, sort_keys=True))
         else:
-            typer.echo(_render_memory_embed(report))
+            typer.echo(_render_memory_embed(output_report))
     except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
         if isinstance(exc, MemoryObservationError):
             error = exc.to_dict()
@@ -2757,6 +2758,20 @@ def _render_memory_embed(payload: dict[str, object]) -> str:
             f"Embeddings written: {payload['embeddings_written']}",
         ]
     )
+
+
+def _compact_memory_embed_report(report: dict[str, object], *, sample_size: int = 20) -> dict[str, object]:
+    compact = dict(report)
+    vector_refs = compact.get("vector_refs")
+    if isinstance(vector_refs, list):
+        compact["vector_ref_count"] = len(vector_refs)
+        if len(vector_refs) > sample_size:
+            compact["vector_refs_sample"] = vector_refs[:sample_size]
+            compact["vector_refs_truncated"] = True
+            compact.pop("vector_refs", None)
+        else:
+            compact["vector_refs_truncated"] = False
+    return compact
 
 
 def _render_memory_subjects(payload: dict[str, object]) -> str:

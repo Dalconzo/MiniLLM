@@ -14,6 +14,7 @@ from local_agent_lab.memory.subjects import (
     list_subjects,
     normalize_subject_slug,
     remove_conversation_subject,
+    resolve_subject,
     upsert_subject,
 )
 
@@ -122,6 +123,16 @@ def test_upsert_subject_supports_subject_project_and_workflow(memory_connection)
     assert project.id == "project_minillm"
     assert workflow.id == "workflow_code-review"
     assert get_subject(memory_connection, "lab automation").description == "Wet-lab automation work"
+
+
+def test_resolve_subject_supports_known_aliases_without_creating_subjects(memory_connection) -> None:
+    upsert_subject(memory_connection, "AI Memory and Local LLMs")
+
+    resolved, alias_target = resolve_subject(memory_connection, "Memory System")
+
+    assert resolved.name == "AI Memory and Local LLMs"
+    assert alias_target == "AI Memory and Local LLMs"
+    assert len(list_subjects(memory_connection)) == 1
 
 
 def test_assign_conversation_subject_lists_counts_and_recency(memory_connection) -> None:

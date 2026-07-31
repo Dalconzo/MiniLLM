@@ -1371,6 +1371,7 @@ class HomeMCPServer:
         depth: str = "medium",
         effort: int = 2,
         allow_cross_domain: bool = False,
+        debug_min_disclosure_tier: str | None = None,
     ) -> dict[str, Any]:
         return search_chatgpt_memory(
             memory_dir=self.config.paths["memory_dir"],
@@ -1385,6 +1386,7 @@ class HomeMCPServer:
             depth=depth,
             effort=effort,
             allow_cross_domain=allow_cross_domain,
+            debug_min_disclosure_tier=debug_min_disclosure_tier,
         )
 
     def memory_context(
@@ -1396,6 +1398,7 @@ class HomeMCPServer:
         subject: str | None = None,
         effort: int = 2,
         allow_cross_domain: bool = False,
+        debug_min_disclosure_tier: str | None = None,
         run_id: str,
     ) -> dict[str, Any]:
         result = search_chatgpt_memory(
@@ -1406,6 +1409,7 @@ class HomeMCPServer:
             depth=depth,
             effort=effort,
             allow_cross_domain=allow_cross_domain,
+            debug_min_disclosure_tier=debug_min_disclosure_tier,
         )
         db_path = memory_db_path(self.config.paths["memory_dir"])
         with sqlite3.connect(db_path) as connection:
@@ -1955,6 +1959,7 @@ class HomeMCPServer:
                         "depth": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
                         "effort": {"type": "integer", "minimum": 1, "maximum": 5},
                         "allow_cross_domain": {"type": "boolean"},
+                        "debug_min_disclosure_tier": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -1972,6 +1977,7 @@ class HomeMCPServer:
                         "subject": {"type": "string"},
                         "effort": {"type": "integer", "minimum": 1, "maximum": 5},
                         "allow_cross_domain": {"type": "boolean"},
+                        "debug_min_disclosure_tier": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
                     },
                     "required": ["query"],
                     "additionalProperties": False,
@@ -2342,6 +2348,9 @@ class HomeMCPServer:
                 depth=str(arguments.get("depth", "medium")),
                 effort=int(arguments.get("effort", 2)),
                 allow_cross_domain=bool(arguments.get("allow_cross_domain", False)),
+                debug_min_disclosure_tier=str(arguments["debug_min_disclosure_tier"])
+                if arguments.get("debug_min_disclosure_tier")
+                else None,
             )
         if name == "memory_context":
             if run_id is None:
@@ -2353,6 +2362,9 @@ class HomeMCPServer:
                 subject=str(arguments["subject"]) if arguments.get("subject") else None,
                 effort=int(arguments.get("effort", 2)),
                 allow_cross_domain=bool(arguments.get("allow_cross_domain", False)),
+                debug_min_disclosure_tier=str(arguments["debug_min_disclosure_tier"])
+                if arguments.get("debug_min_disclosure_tier")
+                else None,
                 run_id=run_id,
             )
         if name == "memory_list":

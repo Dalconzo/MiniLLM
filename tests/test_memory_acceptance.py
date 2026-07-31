@@ -151,6 +151,15 @@ def test_acceptance_status_review_and_lifecycle_surfaces_are_visible(tmp_path, m
     assert loop_payload["count"] >= 1
     assert any("Baking camera open loop" == item["title"] for item in loop_payload["open_loops"])
 
+    records = runner.invoke(app, ["memory-list", "--json"])
+    assert records.exit_code == 0
+    record_payload = json.loads(records.stdout)
+    target_record = next(item for item in record_payload["memory_records"] if item["title"] == "Home MCP memory tools")
+    assigned = runner.invoke(app, ["memory-curated-assign-subject", target_record["id"], "Home MCP", "--json"])
+    assert assigned.exit_code == 0
+    assigned_payload = json.loads(assigned.stdout)
+    assert assigned_payload["memory_record"]["subject_id"] == assigned_payload["subject"]["id"]
+
     eval_run = runner.invoke(app, ["memory-eval", "--json"])
     assert eval_run.exit_code == 0
     eval_payload = json.loads(eval_run.stdout)

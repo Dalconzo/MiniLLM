@@ -12,6 +12,19 @@ from .observability import utc_now
 
 
 SUBJECT_SCHEMA_VERSION = 2
+SUBJECT_ALIASES = {
+    "home-mcp": "Home Projects and Devices",
+    "home-mcp-capabilities": "Home Projects and Devices",
+    "memory-system": "AI Memory and Local LLMs",
+    "ai-memory": "AI Memory and Local LLMs",
+    "local-llm": "AI Memory and Local LLMs",
+    "local-llms": "AI Memory and Local LLMs",
+    "project-catalog": "Home Projects and Devices",
+    "projects": "Home Projects and Devices",
+    "health-supplements": "Health and Supplements",
+    "recipes": "Recipes and Baking",
+    "baking": "Recipes and Baking",
+}
 
 
 @dataclass(frozen=True)
@@ -175,6 +188,44 @@ def get_subject(connection: sqlite3.Connection, slug_or_name: str, *, kind: str 
     if row is None:
         raise KeyError(f"subject not found: {normalized_kind}/{slug}")
     return _subject_from_row(row)
+
+
+def resolve_subject(
+    connection: sqlite3.Connection,
+    slug_or_name: str,
+    *,
+    kind: str = "subject",
+) -> tuple[Subject, str | None]:
+    """Resolve a subject input through exact slug/name and known aliases."""
+    init_subject_schema(connection)
+    normalized_kind = _normalize_kind(kind)
+    requested_slug = normalize_subject_slug(slug_or_name)
+    row = connection.execute(
+        """
+        SELECT id, slug, kind, name, description, created_at, updated_at, metadata_json
+        FROM subjects
+        WHERE kind = ? AND (slug = ? OR lower(name) = lower(?))
+        """,
+        (normalized_kind, requested_slug, slug_or_name.strip()),
+    ).fetchone()
+    if row is not None:
+        return _subject_from_row(row), None
+
+    alias_target = SUBJECT_ALIASES.get(requested_slug)
+    if alias_target is None:
+        raise KeyError(f"subject not found: {normalized_kind}/{requested_slug}")
+    alias_slug = normalize_subject_slug(alias_target)
+    row = connection.execute(
+        """
+        SELECT id, slug, kind, name, description, created_at, updated_at, metadata_json
+        FROM subjects
+        WHERE kind = ? AND slug = ?
+        """,
+        (normalized_kind, alias_slug),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"subject alias target not found: {normalized_kind}/{requested_slug}->{alias_slug}")
+    return _subject_from_row(row), alias_target
 
 
 def assign_conversation_subject(

@@ -485,8 +485,7 @@ def test_search_chatgpt_memory_subject_filter_is_explicit_without_subject_tables
     result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="lab automation")
 
     assert result["count"] == 0
-    assert result["filters_applied"][0]["field"] == "subject"
-    assert result["filters_applied"][0]["warning"] == "subject tables do not exist yet"
+    assert result["filters_applied"] == [{"field": "subject", "value": "lab automation"}]
 
 
 def test_search_chatgpt_memory_supports_conversation_level_subjects(tmp_path) -> None:
@@ -505,6 +504,46 @@ def test_search_chatgpt_memory_supports_conversation_level_subjects(tmp_path) ->
     assert result["filters_applied"] == [{"field": "subject", "value": "Lab Automation"}]
 
 
+def test_search_chatgpt_memory_subject_filter_resolves_known_aliases(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+    db_path = data_dir / "memory" / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        assign_conversation_subject(connection, conversation_id, "AI Memory and Local LLMs", include_chunks=False)
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="Memory System")
+
+    assert result["count"] == 2
+    assert result["filters_applied"] == [
+        {
+            "field": "subject",
+            "value": "AI Memory and Local LLMs",
+            "requested": "Memory System",
+            "alias_target": "AI Memory and Local LLMs",
+        }
+    ]
+
+
+def test_search_chatgpt_memory_debug_min_disclosure_tier_exposes_snippets(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(
+        memory_dir=data_dir / "memory",
+        query="barcode parser",
+        depth="full",
+        debug_min_disclosure_tier="medium",
+    )
+
+    assert result["debug_disclosure"]["min_tier"] == "medium"
+    assert result["results"][0]["disclosure_tier"] in {"medium", "close", "full"}
+    assert result["results"][0]["debug_disclosure_forced"] is True
+    assert "snippet" in result["results"][0]
+
+
 def test_search_chatgpt_memory_normalizes_unicode_subjects(tmp_path) -> None:
     data_dir = tmp_path / "data"
     import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
@@ -518,7 +557,7 @@ def test_search_chatgpt_memory_normalizes_unicode_subjects(tmp_path) -> None:
     result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="Cafe workflow")
 
     assert result["count"] == 2
-    assert result["filters_applied"] == [{"field": "subject", "value": "Cafe workflow"}]
+    assert result["filters_applied"] == [{"field": "subject", "value": "Café workflow"}]
 
 
 def test_search_chatgpt_memory_excludes_curated_records_by_subject(tmp_path) -> None:

@@ -19,3 +19,4 @@ data/local_staging/
 
 # Private imported/exported personal data
 data/chatgpt_exports/
+export.zip

@@ -21,8 +21,8 @@ from .domain_scoping import (
 from .embeddings import LOCAL_VECTOR_BACKEND, cosine_similarity, deterministic_fallback_embedding, load_local_vector
 from .observability import MemoryObservationError, memory_db_path
 from .privacy import redact_obvious_secrets
-from .ranking import rank_memory_hits
-from .subjects import normalize_subject_slug
+from .ranking import DISCLOSURE_TIERS, EXPOSED_FIELDS_BY_TIER, rank_memory_hits
+from .subjects import normalize_subject_slug, resolve_subject
 
 
 def search_chatgpt_memory(
@@ -39,6 +39,7 @@ def search_chatgpt_memory(
     depth: str = "medium",
     effort: int = 2,
     allow_cross_domain: bool = False,
+    debug_min_disclosure_tier: str | None = None,
 ) -> dict[str, Any]:
     sqlite_path = memory_db_path(memory_dir)
     if not sqlite_path.exists():
@@ -63,6 +64,13 @@ def search_chatgpt_memory(
         init_audit_schema(connection)
         filters_applied: list[dict[str, Any]] = []
         query_domains = detect_query_domains(query)
+        resolved_subject = None
+        subject_alias_target = None
+        if subject:
+            try:
+                resolved_subject, subject_alias_target = resolve_subject(connection, subject)
+            except KeyError:
+                resolved_subject = None
         where = [
             "chatgpt_chunks_fts MATCH ?",
             "message_chunks.is_deleted = 0",
@@ -94,6 +102,8 @@ def search_chatgpt_memory(
             filters_applied.append({"field": "date_to", "value": date_to})
         if subject:
             if _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
+                subject_slug = resolved_subject.slug if resolved_subject is not None else normalize_subject_slug(subject)
+                subject_name = resolved_subject.name if resolved_subject is not None else subject
                 where.append(
                     """
                     (
@@ -114,9 +124,12 @@ def search_chatgpt_memory(
                     )
                     """
                 )
-                subject_slug = normalize_subject_slug(subject)
-                params.extend([subject_slug, f"%{subject}%", subject_slug, f"%{subject}%"])
-                filters_applied.append({"field": "subject", "value": subject})
+                params.extend([subject_slug, f"%{subject_name}%", subject_slug, f"%{subject_name}%"])
+                subject_filter: dict[str, Any] = {"field": "subject", "value": subject_name}
+                if subject_alias_target:
+                    subject_filter["requested"] = subject
+                    subject_filter["alias_target"] = subject_alias_target
+                filters_applied.append(subject_filter)
             else:
                 return _empty_result(
                     query=query,
@@ -196,6 +209,7 @@ def search_chatgpt_memory(
             connection,
             query=query,
             subject=subject,
+            resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
             exclude_source_ids=excluded_ids,
             exclude_subjects=exclude_subjects,
             title=title,
@@ -207,6 +221,7 @@ def search_chatgpt_memory(
             connection,
             query=query,
             subject=subject,
+            resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
             exclude_source_ids=excluded_ids,
             exclude_subjects=exclude_subjects,
             title=title,
@@ -255,6 +270,8 @@ def search_chatgpt_memory(
 
         effective_depth = _effort_depth_cap(depth, effort)
         results = rank_memory_hits(scoped_results, depth=effective_depth)[:limit]
+        if debug_min_disclosure_tier:
+            results = [_force_min_disclosure_tier(result, debug_min_disclosure_tier) for result in results]
         results = [_project_hit_for_depth(result) for result in results]
         lenses = select_lenses_for_query(query_domains, effort)
         results = [_attach_effort_checks(result, effort=effort, query=query, query_domains=query_domains) for result in results]
@@ -283,6 +300,10 @@ def search_chatgpt_memory(
                 "after_filters": len(results),
         },
         "filters_applied": filters_applied,
+        "debug_disclosure": {
+            "min_tier": debug_min_disclosure_tier,
+            "policy": "debug_only" if debug_min_disclosure_tier else None,
+        },
         "results": results,
         "count": len(results),
     }
@@ -293,6 +314,7 @@ def _vector_hits(
     *,
     query: str,
     subject: str | None,
+    resolved_subject_name: str | None,
     exclude_source_ids: list[str],
     exclude_subjects: list[str] | None,
     title: str | None,
@@ -349,7 +371,8 @@ def _vector_hits(
     if subject:
         if not (_table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects")):
             return []
-        subject_slug = normalize_subject_slug(subject)
+        subject_slug = normalize_subject_slug(resolved_subject_name or subject)
+        subject_like = f"%{resolved_subject_name or subject}%"
         where.append(
             """
             (
@@ -370,7 +393,7 @@ def _vector_hits(
             )
             """
         )
-        params.extend([subject_slug, f"%{subject}%", subject_slug, f"%{subject}%"])
+        params.extend([subject_slug, subject_like, subject_slug, subject_like])
     if exclude_subjects and _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
         subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
         placeholders = ", ".join("?" for _ in subject_slugs)
@@ -532,6 +555,7 @@ def _curated_hits(
     *,
     query: str,
     subject: str | None,
+    resolved_subject_name: str | None,
     exclude_source_ids: list[str],
     exclude_subjects: list[str] | None,
     title: str | None,
@@ -580,7 +604,7 @@ def _curated_hits(
         )
         params.extend(exclude_source_ids)
     if subject and _table_exists(connection, "subjects"):
-        subject_where, subject_params = _curated_subject_filter(subject)
+        subject_where, subject_params = _curated_subject_filter(resolved_subject_name or subject)
         where.append(subject_where)
         params.extend(subject_params)
     if exclude_subjects and _table_exists(connection, "subjects"):
@@ -795,6 +819,23 @@ def _project_hit_for_depth(hit: dict[str, Any]) -> dict[str, Any]:
         projected.pop("related_curated_memories", None)
     projected["title"] = redact_obvious_secrets(str(projected.get("title") or "")).text
     return projected
+
+
+def _force_min_disclosure_tier(hit: dict[str, Any], min_tier: str) -> dict[str, Any]:
+    if min_tier not in DISCLOSURE_TIERS:
+        raise ValueError(f"debug_min_disclosure_tier must be one of: {', '.join(DISCLOSURE_TIERS)}")
+    current_tier = str(hit.get("disclosure_tier") or "far")
+    if current_tier not in DISCLOSURE_TIERS:
+        current_tier = "far"
+    current_index = DISCLOSURE_TIERS.index(current_tier)
+    min_index = DISCLOSURE_TIERS.index(min_tier)
+    if current_index >= min_index:
+        return hit
+    updated = dict(hit)
+    updated["disclosure_tier"] = min_tier
+    updated["exposed_fields"] = list(EXPOSED_FIELDS_BY_TIER[min_tier])
+    updated["debug_disclosure_forced"] = True
+    return updated
 
 
 def _attach_effort_checks(hit: dict[str, Any], *, effort: int, query: str, query_domains: list[str]) -> dict[str, Any]:

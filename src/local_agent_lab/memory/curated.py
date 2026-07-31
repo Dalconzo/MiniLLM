@@ -423,6 +423,21 @@ def update_memory_record_status(
     return get_memory_record(connection, record_id)
 
 
+def update_memory_record_subject(connection: sqlite3.Connection, record_id: str, subject_id: str | None) -> MemoryRecord:
+    init_curated_memory_schema(connection)
+    get_memory_record(connection, record_id)
+    with connection:
+        connection.execute(
+            """
+            UPDATE memory_records
+            SET subject_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (subject_id, utc_now(), record_id),
+        )
+    return get_memory_record(connection, record_id)
+
+
 def create_memory_link(
     connection: sqlite3.Connection,
     *,

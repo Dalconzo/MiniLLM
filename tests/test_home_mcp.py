@@ -692,6 +692,8 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     schemas = {tool["name"]: tool["inputSchema"]["properties"] for tool in tools}
     assert schemas["memory_context"]["depth"]["enum"] == ["far", "medium", "close", "full"]
     assert schemas["memory_search"]["depth"]["enum"] == ["far", "medium", "close", "full"]
+    assert schemas["memory_context"]["debug_min_disclosure_tier"]["enum"] == ["far", "medium", "close", "full"]
+    assert schemas["memory_search"]["debug_min_disclosure_tier"]["enum"] == ["far", "medium", "close", "full"]
     assert schemas["memory_review_subjects"]["quality_filter"]["enum"] == ["all", "user_only", "high_signal"]
     assert schemas["memory_review_subjects"]["review_status"]["enum"] == ["pending", "approved", "rejected", "merged"]
     assert schemas["memory_review"]["action"]["enum"] == ["list", "show", "approve", "reject", "promote"]

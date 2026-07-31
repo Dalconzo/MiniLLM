@@ -73,7 +73,13 @@ from .memory.candidates import (
     list_candidate_subjects,
     update_candidate_review,
 )
-from .memory.curated import create_memory_record, get_memory_record, list_memory_records, promote_chunk_to_memory_record
+from .memory.curated import (
+    create_memory_record,
+    get_memory_record,
+    list_memory_records,
+    promote_chunk_to_memory_record,
+    update_memory_record_subject,
+)
 from .memory.context_packet import build_context_packet, compact_context_items
 from .memory.embeddings import embed_missing_chunks, fallback_model_spec
 from .memory.feedback import feedback_summary, list_open_loops, record_memory_feedback
@@ -97,7 +103,7 @@ from .memory.observability import (
     validate_memory_state,
 )
 from .memory.search import search_chatgpt_memory
-from .memory.subjects import assign_conversation_subject, init_subject_schema, list_subjects, normalize_subject_slug
+from .memory.subjects import assign_conversation_subject, init_subject_schema, list_subjects, normalize_subject_slug, resolve_subject
 from .home_mcp import HomeMCPError, build_home_mcp_server, serve_home_mcp
 from .services.home_mcp_launchd import (
     HOME_MCP_HOME_LABEL,
@@ -1109,6 +1115,11 @@ def memory_search(
     depth: str = typer.Option("medium", "--depth", help="Disclosure depth: far, medium, close, or full."),
     effort: int = typer.Option(2, "--effort", min=1, max=5, help="Retrieval effort level, 1-5."),
     allow_cross_domain: bool = typer.Option(False, "--allow-cross-domain", help="Allow explicit cross-domain expansion."),
+    debug_min_disclosure_tier: str | None = typer.Option(
+        None,
+        "--debug-min-disclosure-tier",
+        help="Testing only: force returned hits to expose at least this disclosure tier.",
+    ),
     explain: bool = typer.Option(False, "--explain", help="Write score/candidate explanation artifacts."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -1140,6 +1151,7 @@ def memory_search(
                 "depth": depth,
                 "effort": effort,
                 "allow_cross_domain": allow_cross_domain,
+                "debug_min_disclosure_tier": debug_min_disclosure_tier,
             },
         )
         payload = search_chatgpt_memory(
@@ -1155,6 +1167,7 @@ def memory_search(
             depth=depth,
             effort=effort,
             allow_cross_domain=allow_cross_domain,
+            debug_min_disclosure_tier=debug_min_disclosure_tier,
         )
         payload["run_id"] = run.run_id
         with sqlite3.connect(memory_db_path(config.paths["memory_dir"])) as connection:
@@ -1221,6 +1234,11 @@ def memory_context(
     subject: str | None = typer.Option(None, "--subject", help="Optional subject filter."),
     effort: int = typer.Option(2, "--effort", min=1, max=5, help="Retrieval effort level, 1-5."),
     allow_cross_domain: bool = typer.Option(False, "--allow-cross-domain", help="Allow explicit cross-domain expansion."),
+    debug_min_disclosure_tier: str | None = typer.Option(
+        None,
+        "--debug-min-disclosure-tier",
+        help="Testing only: force returned context items to expose at least this disclosure tier.",
+    ),
     explain: bool = typer.Option(False, "--explain", help="Write context/ranking explanation artifacts."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
@@ -1236,6 +1254,7 @@ def memory_context(
             "subject": subject,
             "effort": effort,
             "allow_cross_domain": allow_cross_domain,
+            "debug_min_disclosure_tier": debug_min_disclosure_tier,
             "explain": explain,
         },
     )
@@ -1257,6 +1276,7 @@ def memory_context(
             depth=depth,
             effort=effort,
             allow_cross_domain=allow_cross_domain,
+            debug_min_disclosure_tier=debug_min_disclosure_tier,
         )
         context_items = compact_context_items(result["results"])
         with sqlite3.connect(db_path) as connection:
@@ -1746,6 +1766,70 @@ def memory_list(
         memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
         memory_trace.finish(status="error", result={"error": error}, error=error)
         typer.echo(json.dumps({"run_id": run.run_id, "error": error}, indent=2, sort_keys=True), err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("memory-curated-assign-subject")
+def memory_curated_assign_subject(
+    memory_id: str = typer.Argument(..., help="Curated memory record ID."),
+    subject: str = typer.Argument(..., help="Subject name, slug, or supported alias."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Attach an existing curated memory record to an existing subject."""
+    config, _client, logger = _client_and_logger()
+    db_path = memory_db_path(config.paths["memory_dir"])
+    run = logger.start("memory-curated-assign-subject", {"memory_id": memory_id, "subject": subject})
+    memory_trace = MemoryTraceWriter(
+        logger=logger,
+        run=run,
+        command="memory-curated-assign-subject",
+        argv=sys.argv[1:],
+        config_path=config.path,
+        sqlite_path=db_path,
+    )
+    try:
+        if not db_path.exists():
+            raise MemoryObservationError(
+                f"ChatGPT memory database does not exist: {db_path}",
+                stage="write_sqlite",
+                error_code="memory_database_not_found",
+                source_ref=str(db_path),
+            )
+        with sqlite3.connect(db_path) as connection:
+            resolved_subject, alias_target = resolve_subject(connection, subject)
+            record = update_memory_record_subject(connection, memory_id, resolved_subject.id)
+        payload = {
+            "status": "ok",
+            "run_id": run.run_id,
+            "requested_subject": subject,
+            "alias_target": alias_target,
+            "subject": resolved_subject.to_dict(),
+            "memory_record": record.to_dict(),
+        }
+        memory_trace.write_json("memory_record_subject.json", payload)
+        memory_trace.finish(status="ok", result=payload)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            typer.echo(f"Assigned {record.id} to {resolved_subject.name} ({resolved_subject.id})\nrun_id: {run.run_id}")
+    except (MemoryObservationError, sqlite3.Error, KeyError, ValueError) as exc:
+        if isinstance(exc, MemoryObservationError):
+            error = exc.to_dict()
+            stage = exc.stage
+            source_ref = exc.source_ref
+        else:
+            error = {
+                "message": str(exc),
+                "stage": "write_sqlite",
+                "error_code": "curated_subject_assignment_failed",
+                "source_ref": memory_id,
+            }
+            stage = "write_sqlite"
+            source_ref = memory_id
+        memory_trace.trace(stage, str(exc), level="error", source_ref=source_ref, details={"error": error})
+        payload = {"status": "error", "run_id": run.run_id, "error": error}
+        memory_trace.finish(status="error", result=payload, error=error)
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True), err=True)
         raise typer.Exit(code=1)
 
 

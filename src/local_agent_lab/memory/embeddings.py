@@ -76,6 +76,21 @@ def fallback_model_spec(*, dimension: int = DEFAULT_FALLBACK_DIMENSION) -> Embed
     )
 
 
+def ollama_model_spec(*, model: str, dimension: int, host: str) -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        provider="ollama",
+        model=model,
+        dimension=dimension,
+        normalize=True,
+        metadata={
+            "purpose": "local semantic retrieval for ChatGPT memory chunks",
+            "quality": "production local semantic embedding backend",
+            "host": host,
+            "privacy": "local Ollama HTTP endpoint",
+        },
+    )
+
+
 def init_embedding_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """

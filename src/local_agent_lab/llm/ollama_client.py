@@ -57,3 +57,18 @@ class OllamaClient:
                 "options": {"temperature": temperature},
             },
         )
+
+    def embed(self, *, model: str, text: str) -> list[float]:
+        try:
+            payload = self._post("/api/embed", {"model": model, "input": text})
+            embeddings = payload.get("embeddings")
+            if isinstance(embeddings, list) and embeddings:
+                return [float(value) for value in embeddings[0]]
+        except OllamaError:
+            payload = self._post("/api/embeddings", {"model": model, "prompt": text})
+            embedding = payload.get("embedding")
+            if isinstance(embedding, list):
+                return [float(value) for value in embedding]
+            raise
+
+        raise OllamaError(f"Ollama returned no embedding for model {model}")

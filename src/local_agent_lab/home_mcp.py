@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import yaml
 
 from .config import AppConfig
+from .llm.ollama_client import OllamaClient
 from .logging.run_logger import RunContext, RunLogger
 from .memory.analysis import analyze_memory_corpus
 from .memory.audit import init_audit_schema, record_retrieval_event
@@ -88,6 +89,22 @@ def _default_curated_record_type(memory_type: str) -> str:
         "financial_note": "research_note",
     }
     return mapping.get(memory_type, "research_note")
+
+
+def _ollama_embedding_function(config: AppConfig):
+    try:
+        profile = config.get_profile("embeddings")
+    except KeyError:
+        return None
+    client = OllamaClient(host=config.ollama.host, timeout_seconds=config.ollama.request_timeout_seconds)
+
+    def embed(text: str, dimension: int) -> list[float]:
+        vector = client.embed(model=profile.model, text=text)
+        if len(vector) != dimension:
+            raise ValueError(f"Ollama embedding dimension {len(vector)} does not match expected dimension {dimension}")
+        return vector
+
+    return embed
 
 
 def _candidate_title(candidate: CandidateMemory) -> str:
@@ -1389,6 +1406,7 @@ class HomeMCPServer:
             effort=effort,
             allow_cross_domain=allow_cross_domain,
             debug_min_disclosure_tier=debug_min_disclosure_tier,
+            query_embedder=_ollama_embedding_function(self.config),
         )
 
     def memory_context(
@@ -1412,6 +1430,7 @@ class HomeMCPServer:
             effort=effort,
             allow_cross_domain=allow_cross_domain,
             debug_min_disclosure_tier=debug_min_disclosure_tier,
+            query_embedder=_ollama_embedding_function(self.config),
         )
         db_path = memory_db_path(self.config.paths["memory_dir"])
         with sqlite3.connect(db_path) as connection:

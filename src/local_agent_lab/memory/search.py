@@ -18,7 +18,7 @@ from .domain_scoping import (
     scope_candidate_domains,
     select_lenses_for_query,
 )
-from .embeddings import LOCAL_VECTOR_BACKEND, cosine_similarity, deterministic_fallback_embedding, load_local_vector
+from .embeddings import LOCAL_VECTOR_BACKEND, EmbeddingFunction, cosine_similarity, deterministic_fallback_embedding, load_local_vector
 from .observability import MemoryObservationError, memory_db_path
 from .privacy import redact_obvious_secrets
 from .ranking import DISCLOSURE_TIERS, EXPOSED_FIELDS_BY_TIER, rank_memory_hits
@@ -40,6 +40,7 @@ def search_chatgpt_memory(
     effort: int = 2,
     allow_cross_domain: bool = False,
     debug_min_disclosure_tier: str | None = None,
+    query_embedder: EmbeddingFunction | None = None,
 ) -> dict[str, Any]:
     sqlite_path = memory_db_path(memory_dir)
     if not sqlite_path.exists():
@@ -208,6 +209,7 @@ def search_chatgpt_memory(
         vector_results = _vector_hits(
             connection,
             query=query,
+            query_embedder=query_embedder,
             subject=subject,
             resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
             exclude_source_ids=excluded_ids,
@@ -313,6 +315,7 @@ def _vector_hits(
     connection: sqlite3.Connection,
     *,
     query: str,
+    query_embedder: EmbeddingFunction | None,
     subject: str | None,
     resolved_subject_name: str | None,
     exclude_source_ids: list[str],
@@ -328,7 +331,7 @@ def _vector_hits(
 
     model = connection.execute(
         """
-        SELECT id, model, dimension
+        SELECT id, provider, model, dimension
         FROM embedding_models
         ORDER BY created_at DESC, id DESC
         LIMIT 1
@@ -338,8 +341,21 @@ def _vector_hits(
         return []
 
     embedding_model_id = str(model["id"] if isinstance(model, sqlite3.Row) else model[0])
-    dimension = int(model["dimension"] if isinstance(model, sqlite3.Row) else model[2])
-    query_vector = deterministic_fallback_embedding(query, dimension)
+    provider = str(model["provider"] if isinstance(model, sqlite3.Row) else model[1])
+    dimension = int(model["dimension"] if isinstance(model, sqlite3.Row) else model[3])
+    if provider == "local":
+        query_vector = deterministic_fallback_embedding(query, dimension)
+    elif query_embedder is not None:
+        query_vector = query_embedder(query, dimension)
+        if len(query_vector) != dimension:
+            raise MemoryObservationError(
+                f"query embedding dimension {len(query_vector)} does not match active model dimension {dimension}",
+                stage="retrieve_vectors",
+                error_code="embedding_dimension_mismatch",
+                source_ref=embedding_model_id,
+            )
+    else:
+        return []
 
     where = [
         "chunk_embeddings.embedding_model_id = ?",

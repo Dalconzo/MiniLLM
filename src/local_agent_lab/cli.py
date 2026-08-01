@@ -81,7 +81,7 @@ from .memory.curated import (
     update_memory_record_subject,
 )
 from .memory.context_packet import build_context_packet, compact_context_items
-from .memory.embeddings import embed_missing_chunks, fallback_model_spec
+from .memory.embeddings import embed_missing_chunks, fallback_model_spec, ollama_model_spec
 from .memory.feedback import feedback_summary, list_open_loops, record_memory_feedback
 from .memory.eval_checks import run_memory_eval
 from .memory.frontdoor import (
@@ -133,6 +133,26 @@ def _client_and_logger():
     )
     logger = RunLogger(config.logs_dir)
     return config, client, logger
+
+
+def _embedding_profile(config):
+    return config.get_profile("embeddings")
+
+
+def _ollama_embedding_function(config):
+    try:
+        profile = _embedding_profile(config)
+    except KeyError:
+        return None
+    client = OllamaClient(host=config.ollama.host, timeout_seconds=config.ollama.request_timeout_seconds)
+
+    def embed(text: str, dimension: int) -> list[float]:
+        vector = client.embed(model=profile.model, text=text)
+        if len(vector) != dimension:
+            raise ValueError(f"Ollama embedding dimension {len(vector)} does not match expected dimension {dimension}")
+        return vector
+
+    return embed
 
 
 @app.command()
@@ -1168,6 +1188,7 @@ def memory_search(
             effort=effort,
             allow_cross_domain=allow_cross_domain,
             debug_min_disclosure_tier=debug_min_disclosure_tier,
+            query_embedder=_ollama_embedding_function(config),
         )
         payload["run_id"] = run.run_id
         with sqlite3.connect(memory_db_path(config.paths["memory_dir"])) as connection:
@@ -1277,6 +1298,7 @@ def memory_context(
             effort=effort,
             allow_cross_domain=allow_cross_domain,
             debug_min_disclosure_tier=debug_min_disclosure_tier,
+            query_embedder=_ollama_embedding_function(config),
         )
         context_items = compact_context_items(result["results"])
         with sqlite3.connect(db_path) as connection:
@@ -1361,12 +1383,13 @@ def memory_trace_command(
 def memory_embed(
     limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum chunks to embed."),
     dimension: int = typer.Option(64, "--dimension", min=1, max=4096, help="Fallback embedding dimension."),
+    backend: str = typer.Option("ollama", "--backend", help="Embedding backend: ollama or deterministic."),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
-    """Build deterministic local embeddings for imported ChatGPT chunks."""
+    """Build resumable local embeddings for imported ChatGPT chunks."""
     config, _client, logger = _client_and_logger()
     db_path = memory_db_path(config.paths["memory_dir"])
-    run = logger.start("memory-embed", {"limit": limit, "dimension": dimension, "db_path": str(db_path)})
+    run = logger.start("memory-embed", {"limit": limit, "dimension": dimension, "backend": backend, "db_path": str(db_path)})
     memory_trace = MemoryTraceWriter(
         logger=logger,
         run=run,
@@ -1384,9 +1407,35 @@ def memory_embed(
                 source_ref=str(db_path),
             )
         memory_trace.trace("load_config", "Loaded local agent configuration.", details={"config": str(config.path)})
-        memory_trace.trace("embed_chunks", "Embedding chunks that are missing or stale.", details={"limit": limit})
+        if backend == "deterministic":
+            spec = fallback_model_spec(dimension=dimension)
+            embedder = None
+        elif backend == "ollama":
+            profile = _embedding_profile(config)
+            client = OllamaClient(host=config.ollama.host, timeout_seconds=config.ollama.request_timeout_seconds)
+            probe_vector = client.embed(model=profile.model, text="embedding dimension probe")
+            spec = ollama_model_spec(model=profile.model, dimension=len(probe_vector), host=config.ollama.host)
+
+            def embedder(text: str, expected_dimension: int) -> list[float]:
+                vector = client.embed(model=profile.model, text=text)
+                if len(vector) != expected_dimension:
+                    raise ValueError(
+                        f"Ollama embedding dimension {len(vector)} does not match expected dimension {expected_dimension}"
+                    )
+                return vector
+        else:
+            raise ValueError("backend must be 'ollama' or 'deterministic'")
+
+        memory_trace.trace(
+            "embed_chunks",
+            "Embedding chunks that are missing or stale.",
+            details={"limit": limit, "backend": backend, "model": spec.model, "dimension": spec.dimension},
+        )
         with sqlite3.connect(db_path) as connection:
-            report = embed_missing_chunks(connection, spec=fallback_model_spec(dimension=dimension), limit=limit)
+            if embedder is None:
+                report = embed_missing_chunks(connection, spec=spec, limit=limit)
+            else:
+                report = embed_missing_chunks(connection, spec=spec, embedder=embedder, limit=limit)
         report["run_id"] = run.run_id
         report["sqlite_path"] = str(db_path)
         output_report = _compact_memory_embed_report(report)
@@ -1396,7 +1445,7 @@ def memory_embed(
             typer.echo(json.dumps(output_report, indent=2, sort_keys=True))
         else:
             typer.echo(_render_memory_embed(output_report))
-    except (MemoryObservationError, sqlite3.Error, ValueError) as exc:
+    except (MemoryObservationError, OllamaError, sqlite3.Error, ValueError) as exc:
         if isinstance(exc, MemoryObservationError):
             error = exc.to_dict()
             stage = exc.stage
@@ -3334,6 +3383,7 @@ def _execute_memory_assist_plan(
                 depth=str(arguments.get("depth", "medium")),
                 effort=int(arguments.get("effort", 2)),
                 allow_cross_domain=bool(arguments.get("allow_cross_domain", False)),
+                query_embedder=_ollama_embedding_function(config),
             )
             return {"command": action, "status": result["status"], "result": result}
         if action == "memory-candidates":

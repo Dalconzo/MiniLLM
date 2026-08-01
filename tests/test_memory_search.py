@@ -6,7 +6,7 @@ import pytest
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
 from local_agent_lab.memory.context_packet import build_context_packet, compact_context_items
 from local_agent_lab.memory.curated import create_memory_record, promote_chunk_to_memory_record
-from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec
+from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec, ollama_model_spec
 from local_agent_lab.memory.observability import MemoryObservationError
 from local_agent_lab.memory.search import search_chatgpt_memory
 from local_agent_lab.memory.subjects import assign_conversation_subject, upsert_subject
@@ -478,6 +478,39 @@ def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path)
     assert lexical["results"][0]["chunk_id"] == "chk_baking"
     assert lexical["results"][0]["score_breakdown"]["components"]["semantic_similarity"]["value"] > 0
     assert lexical["results"][0]["retrieval_sources"] == ["vector"]
+
+
+def test_search_chatgpt_memory_uses_query_embedder_for_ollama_vectors(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        spec = ollama_model_spec(model="nomic-embed-text", dimension=3, host="http://127.0.0.1:11434")
+
+        def chunk_embedder(text: str, _dimension: int) -> list[float]:
+            if "barcode parser" in text.lower():
+                return [1.0, 0.0, 0.0]
+            return [0.0, 1.0, 0.0]
+
+        embed_missing_chunks(connection, spec=spec, embedder=chunk_embedder)
+
+    without_query_embedder = search_chatgpt_memory(memory_dir=memory_dir, query="vector recall unrelated lexical terms")
+    assert without_query_embedder["candidate_counts"]["vector"] == 0
+
+    with_query_embedder = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="vector recall unrelated lexical terms",
+        allow_cross_domain=True,
+        query_embedder=lambda _text, _dimension: [1.0, 0.0, 0.0],
+    )
+
+    assert with_query_embedder["candidate_counts"]["fts"] == 0
+    assert with_query_embedder["candidate_counts"]["vector"] >= 1
+    assert with_query_embedder["results"][0]["embedding_model_id"] == spec.id
+    assert with_query_embedder["results"][0]["semantic_similarity"] == 1.0
 
 
 def test_search_chatgpt_memory_subject_filter_is_explicit_without_subject_tables(tmp_path) -> None:

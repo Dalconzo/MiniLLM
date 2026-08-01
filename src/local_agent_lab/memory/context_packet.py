@@ -25,6 +25,7 @@ def build_context_packet(
     retrieval_event_id: str,
     search_result: dict[str, Any],
     context_items: list[dict[str, Any]],
+    requested_depth: str | None = None,
 ) -> dict[str, Any]:
     """Compile retrieved memory evidence into the AI Memory Contract packet shape."""
     packet_id = _packet_id(query=query, retrieval_event_id=retrieval_event_id, context_items=context_items)
@@ -34,7 +35,7 @@ def build_context_packet(
         "task": {
             "query": query,
             "subject": _filter_value(search_result.get("filters_applied", []), "subject"),
-            "depth": _first_non_empty(item.get("disclosure_tier") for item in context_items),
+            "depth": requested_depth or search_result.get("depth") or _first_non_empty(item.get("disclosure_tier") for item in context_items),
             "ranking_profile": search_result.get("ranking_profile"),
         },
         "critical_constraints": [],

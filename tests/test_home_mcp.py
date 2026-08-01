@@ -741,6 +741,7 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert structured["retrieval_event_id"].startswith("ret_")
     assert structured["context_packet_id"].startswith("ctx_")
     assert structured["context_packet"]["schema_version"] == 2
+    assert structured["context_packet"]["task"]["depth"] == "medium"
     assert structured["context_packet"]["provenance"]["retrieval_event_id"] == structured["retrieval_event_id"]
     assert structured["context_packet"]["relevant_preferences"] or structured["context_packet"]["current_state"]
     assert structured["context_items"]
@@ -930,6 +931,8 @@ def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) ->
     filtered = server.memory_review_subjects(subject="Cooking and Baking", candidate_limit=10)
     assert filtered["filters"]["quality_filter"] == "high_signal"
     assert filtered["filters"]["effective_quality_filter"] == "high_signal"
+    assert filtered["subject_count"] == filtered["count"]
+    assert filtered["candidate_count"] == len(filtered["candidate_memories"])
     assert [item["id"] for item in filtered["candidate_memories"]] == [seed["candidate_id"]]
 
     full = server.memory_review_subjects(subject="Cooking and Baking", quality_filter="all", candidate_limit=10)

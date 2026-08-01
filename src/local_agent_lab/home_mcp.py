@@ -1219,6 +1219,8 @@ class HomeMCPServer:
         return {
             "status": "ok",
             "count": len(subject_summaries),
+            "subject_count": len(subject_summaries),
+            "candidate_count": len(candidate_memories),
             "subject_summaries": subject_summaries,
             "selected_subject": selected_subject,
             "candidate_memories": candidate_memories,
@@ -1429,6 +1431,7 @@ class HomeMCPServer:
             retrieval_event_id=audit["retrieval_event_id"],
             search_result=result,
             context_items=context_items,
+            requested_depth=depth,
         )
         return {
             "status": "ok",

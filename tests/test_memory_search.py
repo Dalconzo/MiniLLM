@@ -114,11 +114,13 @@ def test_context_packet_v2_separates_evidence_belief_and_provenance(tmp_path) ->
         retrieval_event_id="ret_test",
         search_result=result,
         context_items=context_items,
+        requested_depth="full",
     )
 
     assert packet["schema_version"] == 2
     assert packet["context_packet_id"].startswith("ctx_")
     assert packet["task"]["query"] == result["query"]
+    assert packet["task"]["depth"] == "full"
     assert packet["relevant_preferences"]
     assert packet["provenance"]["retrieval_event_id"] == "ret_test"
     assert packet["provenance"]["source_ids"]

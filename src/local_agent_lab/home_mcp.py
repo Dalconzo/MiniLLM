@@ -985,8 +985,6 @@ class HomeMCPServer:
         tag_filters = {str(item).strip().lower() for item in (tags or []) if str(item).strip()}
         hits: list[dict[str, Any]] = []
         for path in _iter_text_files(root.path, file_types=[".md"], limit=MAX_SEARCH_FILES):
-            if len(hits) >= limit:
-                break
             try:
                 raw_text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:

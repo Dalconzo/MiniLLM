@@ -389,25 +389,27 @@ def test_home_mcp_recipe_search_boosts_exact_title_phrase_over_weak_cooccurrence
     config = load_config(config_path)
     server = build_home_mcp_server(config)
 
-    exact = server.create_recipe_card(
-        title="Miso Butter Roast Bowl",
-        ingredients=["miso", "butter", "rice"],
-        steps=["Roast vegetables.", "Serve with miso butter."],
-        tags=["bowl"],
-    )
     weak = server.create_recipe_card(
         title="Peach Crumble Cobbler",
         ingredients=["peaches", "butter", "miso caramel"],
         steps=["Bake until bubbling."],
         tags=["dessert"],
     )
+    exact = server.create_recipe_card(
+        title="Miso Butter Roast Bowl",
+        ingredients=["miso", "butter", "rice"],
+        steps=["Roast vegetables.", "Serve with miso butter."],
+        tags=["bowl"],
+    )
 
-    result = server.search_recipes(query="miso butter", limit=10)
+    result = server.search_recipes(query="miso butter", limit=1)
 
     assert result["results"][0]["file_id"] == exact["file_id"]
     assert result["results"][0]["match_reason"] == "title_phrase"
-    weak_result = next(item for item in result["results"] if item["file_id"] == weak["file_id"])
-    assert result["results"][0]["score"] > weak_result["score"]
+    comparison = server.search_recipes(query="miso butter", limit=10)
+    weak_result = next(item for item in comparison["results"] if item["file_id"] == weak["file_id"])
+    exact_result = next(item for item in comparison["results"] if item["file_id"] == exact["file_id"])
+    assert exact_result["score"] > weak_result["score"]
 
 
 def test_home_mcp_note_discovery_recipe_lookup_and_attempt_comparison(tmp_path) -> None:

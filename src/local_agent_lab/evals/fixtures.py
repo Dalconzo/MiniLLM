@@ -371,6 +371,7 @@ def memory_usage_prompt_cases() -> tuple[UsagePromptCase, ...]:
             expected_source_kinds=("curated_memory",),
             expected_primary_domain="cooking_baking",
             expected_domain_relations=("transfer",),
+            allow_cross_domain=True,
         ),
         UsagePromptCase(
             id="blocked_source_suppression",

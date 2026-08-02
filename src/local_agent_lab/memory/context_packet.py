@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import re
+from dataclasses import dataclass
 from typing import Any
+
+from .ranking import DISCLOSURE_TIERS
 
 
 CONTEXT_PACKET_SCHEMA_VERSION = 2
+RETRIEVAL_DEPTHS = ("close", "broad")
+PACKET_DETAILS = ("summary", "standard", "complete")
 CONTEXT_PACKET_SECTIONS = (
     "critical_constraints",
     "current_state",
@@ -19,6 +25,62 @@ CONTEXT_PACKET_SECTIONS = (
 )
 
 
+@dataclass(frozen=True)
+class ContextControls:
+    retrieval_depth: str
+    packet_detail: str
+    disclosure_tier: str
+    requested_depth: str | None
+    legacy_depth_alias: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "retrieval_depth": self.retrieval_depth,
+            "packet_detail": self.packet_detail,
+            "disclosure_tier": self.disclosure_tier,
+            "requested_depth": self.requested_depth,
+            "legacy_depth_alias": self.legacy_depth_alias,
+        }
+
+
+def normalize_context_controls(
+    *,
+    depth: str | None = None,
+    retrieval_depth: str | None = None,
+    packet_detail: str | None = None,
+    disclosure_tier: str | None = None,
+    effort: int = 2,
+) -> ContextControls:
+    """Separate the legacy depth knob into retrieval, packet, and disclosure controls."""
+    requested_depth = depth
+    legacy_depth_alias = retrieval_depth is None and packet_detail is None and disclosure_tier is None
+    if legacy_depth_alias:
+        disclosure_tier = depth or "medium"
+        if disclosure_tier not in DISCLOSURE_TIERS:
+            raise ValueError(f"depth must be one of: {', '.join(DISCLOSURE_TIERS)}")
+        retrieval_depth = "broad" if disclosure_tier == "full" or effort >= 4 else "close"
+        packet_detail = "complete" if disclosure_tier == "full" else "summary" if disclosure_tier == "far" else "standard"
+    else:
+        retrieval_depth = retrieval_depth or ("broad" if effort >= 4 else "close")
+        packet_detail = packet_detail or "standard"
+        disclosure_tier = disclosure_tier or depth or "medium"
+
+    if retrieval_depth not in RETRIEVAL_DEPTHS:
+        raise ValueError(f"retrieval_depth must be one of: {', '.join(RETRIEVAL_DEPTHS)}")
+    if packet_detail not in PACKET_DETAILS:
+        raise ValueError(f"packet_detail must be one of: {', '.join(PACKET_DETAILS)}")
+    if disclosure_tier not in DISCLOSURE_TIERS:
+        raise ValueError(f"disclosure_tier must be one of: {', '.join(DISCLOSURE_TIERS)}")
+
+    return ContextControls(
+        retrieval_depth=retrieval_depth,
+        packet_detail=packet_detail,
+        disclosure_tier=disclosure_tier,
+        requested_depth=requested_depth,
+        legacy_depth_alias=legacy_depth_alias,
+    )
+
+
 def build_context_packet(
     *,
     query: str,
@@ -26,8 +88,17 @@ def build_context_packet(
     search_result: dict[str, Any],
     context_items: list[dict[str, Any]],
     requested_depth: str | None = None,
+    retrieval_depth: str | None = None,
+    packet_detail: str | None = None,
+    disclosure_tier: str | None = None,
 ) -> dict[str, Any]:
     """Compile retrieved memory evidence into the AI Memory Contract packet shape."""
+    controls = normalize_context_controls(
+        depth=requested_depth,
+        retrieval_depth=retrieval_depth,
+        packet_detail=packet_detail,
+        disclosure_tier=disclosure_tier,
+    )
     packet_id = _packet_id(query=query, retrieval_event_id=retrieval_event_id, context_items=context_items)
     packet: dict[str, Any] = {
         "schema_version": CONTEXT_PACKET_SCHEMA_VERSION,
@@ -35,7 +106,11 @@ def build_context_packet(
         "task": {
             "query": query,
             "subject": _filter_value(search_result.get("filters_applied", []), "subject"),
-            "depth": requested_depth or search_result.get("depth") or _first_non_empty(item.get("disclosure_tier") for item in context_items),
+            "depth": controls.disclosure_tier,
+            "retrieval_depth": controls.retrieval_depth,
+            "packet_detail": controls.packet_detail,
+            "disclosure_tier": controls.disclosure_tier,
+            "legacy_depth_alias": controls.legacy_depth_alias,
             "ranking_profile": search_result.get("ranking_profile"),
         },
         "critical_constraints": [],
@@ -62,8 +137,9 @@ def build_context_packet(
     for item in context_items:
         entry = _packet_entry(item)
         section = _section_for_item(item, entry)
+        entry["packet_slot"] = section
         packet[section].append(entry)
-        if _is_uncertain(item, entry):
+        if section != "uncertainty" and _is_uncertain(item, entry):
             packet["uncertainty"].append(_uncertainty_entry(item, entry))
 
     if search_result.get("governance", {}).get("high_risk"):
@@ -80,6 +156,7 @@ def build_context_packet(
 
     _add_inferred_pattern(packet, context_items)
     _add_omission_note(packet, search_result, context_items)
+    _add_empty_slot_notes(packet)
     return packet
 
 
@@ -132,16 +209,20 @@ def _packet_entry(item: dict[str, Any]) -> dict[str, Any]:
 def _section_for_item(item: dict[str, Any], entry: dict[str, Any]) -> str:
     record_type = str(item.get("record_type") or "").lower()
     text = str(entry.get("claim") or "").lower()
+    title = str(item.get("title") or "").lower()
+    combined = f"{title} {text}"
     if record_type in {"constraint", "risk"} or any(token in text for token in ("must not", "do not", "blocked", "boundary", "require")):
         return "critical_constraints"
     if record_type in {"preference", "contact_note"} or "prefer" in text:
         entry["strength"] = "strong" if item.get("trust_level") in {"canonical", "high"} else "contextual"
         return "relevant_preferences"
-    if record_type in {"lesson"} or any(token in text for token in ("failed", "failure", "wrong", "avoid", "lesson")):
+    if record_type in {"lesson"} or _contains_context_token(
+        combined, ("failed", "failure", "wrong", "avoid", "lesson", "underproof", "overproof")
+    ):
         return "failures_and_lessons"
     if record_type in {"decision", "workflow", "project", "open_loop"}:
         return "current_state"
-    if any(token in text for token in ("outcome", "worked", "completed", "attempted", "successful", "mixed")):
+    if _contains_context_token(combined, ("outcome", "worked", "completed", "attempted", "successful", "mixed", "rose", "fell", "peaked")):
         return "relevant_outcomes"
     checks = item.get("validation_checks", {})
     contradiction = checks.get("contradiction", {}) if isinstance(checks, dict) else {}
@@ -150,6 +231,13 @@ def _section_for_item(item: dict[str, Any], entry: dict[str, Any]) -> str:
     if item.get("source_role") == "assistant":
         return "uncertainty"
     return "current_state"
+
+
+def _contains_context_token(text: str, tokens: tuple[str, ...]) -> bool:
+    for token in tokens:
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])", text):
+            return True
+    return False
 
 
 def _uncertainty_entry(item: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
@@ -206,6 +294,27 @@ def _add_omission_note(packet: dict[str, Any], search_result: dict[str, Any], co
         )
 
 
+def _add_empty_slot_notes(packet: dict[str, Any]) -> None:
+    evidence_sections = (
+        "critical_constraints",
+        "current_state",
+        "relevant_preferences",
+        "relevant_outcomes",
+        "failures_and_lessons",
+        "contradictions_and_qualifications",
+        "uncertainty",
+    )
+    empty_sections = [section for section in evidence_sections if not packet.get(section)]
+    if empty_sections:
+        packet["omitted_but_available"].append(
+            {
+                "category": "empty_context_slots",
+                "sections": empty_sections,
+                "reason": "no retrieved item classified into these packet slots",
+            }
+        )
+
+
 def _claim_text(item: dict[str, Any]) -> str:
     snippet = str(item.get("snippet") or "").strip()
     title = str(item.get("title") or "").strip()
@@ -258,4 +367,5 @@ def _first_non_empty(values: Any) -> Any:
     for value in values:
         if value:
             return value
+    return None
     return None

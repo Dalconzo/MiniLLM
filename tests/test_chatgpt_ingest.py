@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export, parse_chatgpt_export
 
@@ -47,6 +48,32 @@ def _write_export(root):
     ]
     (export_dir / "conversations.json").write_text(json.dumps(export), encoding="utf-8")
     return root / "raw"
+
+
+def _write_export_with_message(root, *, export_name: str, conversation_id: str, message_text: str, created_at: int):
+    export_dir = root / "raw" / export_name
+    export_dir.mkdir(parents=True)
+    export = [
+        {
+            "id": conversation_id,
+            "title": "Incremental import",
+            "create_time": created_at,
+            "update_time": created_at,
+            "mapping": {
+                "msg-user": {
+                    "id": "msg-user",
+                    "message": {
+                        "id": "msg-user",
+                        "author": {"role": "user"},
+                        "create_time": created_at,
+                        "content": {"content_type": "text", "parts": [message_text]},
+                    },
+                },
+            },
+        }
+    ]
+    (export_dir / "conversations.json").write_text(json.dumps(export), encoding="utf-8")
+    return export_dir / "conversations.json"
 
 
 def test_parse_chatgpt_export_normalizes_conversations_messages_and_chunks(tmp_path) -> None:
@@ -113,3 +140,39 @@ def test_import_chatgpt_export_is_idempotent_for_same_export(tmp_path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM chatgpt_chunks_fts").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM candidate_memories").fetchone()[0] == 2
+
+
+def test_import_chatgpt_export_replaces_overlapping_conversation_from_newer_export(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    first_path = _write_export_with_message(
+        tmp_path / "first",
+        export_name="export-1",
+        conversation_id="conversation-incremental",
+        message_text="Old starter note.",
+        created_at=1_700_000_000,
+    )
+    second_path = _write_export_with_message(
+        tmp_path / "second",
+        export_name="export-2",
+        conversation_id="conversation-incremental",
+        message_text="New starter note with 100 percent rise.",
+        created_at=1_700_086_400,
+    )
+
+    first = import_chatgpt_export(input_path=first_path, data_dir=data_dir, memory_dir=memory_dir)
+    second = import_chatgpt_export(input_path=second_path, data_dir=data_dir, memory_dir=memory_dir)
+    repeat = import_chatgpt_export(input_path=second_path, data_dir=data_dir, memory_dir=memory_dir)
+
+    assert first["import_id"] != second["import_id"]
+    assert second["import_id"] == repeat["import_id"]
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM imports").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM message_chunks").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM chatgpt_chunks_fts").fetchone()[0] == 1
+        content = connection.execute("SELECT content_text FROM messages").fetchone()[0]
+        assert content == "New starter note with 100 percent rise."
+        latest_created_at = connection.execute("SELECT created_at FROM messages").fetchone()[0]
+        assert latest_created_at == datetime.fromtimestamp(1_700_086_400, tz=timezone.utc).isoformat()

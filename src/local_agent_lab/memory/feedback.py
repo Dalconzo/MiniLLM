@@ -29,6 +29,13 @@ VALID_AGENT_FEEDBACK_CATEGORIES = (
     "other",
 )
 VALID_AGENT_FEEDBACK_SEVERITIES = ("low", "medium", "high", "critical")
+VALID_FEEDBACK_REVIEW_STATUSES = ("submitted", "reviewed", "applied", "superseded", "rejected")
+VALID_FEEDBACK_CONTROL_TYPES = (
+    "query_source_penalty",
+    "wrong_subject_penalty",
+    "global_source_penalty",
+    "eval_example",
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +108,42 @@ class AgentFeedback:
         }
 
 
+@dataclass(frozen=True)
+class FeedbackRankingControl:
+    id: str
+    feedback_id: str
+    control_type: str
+    status: str
+    query_pattern: str | None
+    source_id: str | None
+    subject: str | None
+    weight: float
+    rationale: str
+    rollback_note: str | None
+    created_by: str
+    created_at: str
+    applied_at: str | None
+    superseded_by: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "feedback_id": self.feedback_id,
+            "control_type": self.control_type,
+            "status": self.status,
+            "query_pattern": self.query_pattern,
+            "source_id": self.source_id,
+            "subject": self.subject,
+            "weight": self.weight,
+            "rationale": self.rationale,
+            "rollback_note": self.rollback_note,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "applied_at": self.applied_at,
+            "superseded_by": self.superseded_by,
+        }
+
+
 def init_feedback_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -160,6 +203,41 @@ def init_feedback_schema(connection: sqlite3.Connection) -> None:
             ON agent_feedback(category);
         CREATE INDEX IF NOT EXISTS idx_agent_feedback_created
             ON agent_feedback(created_at);
+
+        CREATE TABLE IF NOT EXISTS agent_feedback_reviews (
+            feedback_id TEXT PRIMARY KEY REFERENCES agent_feedback(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('submitted', 'reviewed', 'applied', 'superseded', 'rejected')),
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            review_notes TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS feedback_ranking_controls (
+            id TEXT PRIMARY KEY,
+            feedback_id TEXT NOT NULL REFERENCES agent_feedback(id) ON DELETE CASCADE,
+            control_type TEXT NOT NULL CHECK (
+                control_type IN ('query_source_penalty', 'wrong_subject_penalty', 'global_source_penalty', 'eval_example')
+            ),
+            status TEXT NOT NULL CHECK (status IN ('submitted', 'reviewed', 'applied', 'superseded', 'rejected')),
+            query_pattern TEXT,
+            source_id TEXT,
+            subject TEXT,
+            weight REAL NOT NULL,
+            rationale TEXT NOT NULL,
+            rollback_note TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            applied_at TEXT,
+            superseded_by TEXT REFERENCES feedback_ranking_controls(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_feedback_controls_feedback
+            ON feedback_ranking_controls(feedback_id);
+        CREATE INDEX IF NOT EXISTS idx_feedback_controls_status
+            ON feedback_ranking_controls(status);
+        CREATE INDEX IF NOT EXISTS idx_feedback_controls_source
+            ON feedback_ranking_controls(source_id);
         """
     )
     connection.commit()
@@ -317,7 +395,134 @@ def record_agent_feedback(
                 feedback.created_at,
             ),
         )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO agent_feedback_reviews (feedback_id, status, reviewed_by, reviewed_at, review_notes, updated_at)
+            VALUES (?, 'submitted', NULL, NULL, NULL, ?)
+            """,
+            (feedback.id, feedback.created_at),
+        )
     return feedback
+
+
+def create_feedback_ranking_control(
+    connection: sqlite3.Connection,
+    *,
+    feedback_id: str,
+    control_type: str,
+    query_pattern: str | None = None,
+    source_id: str | None = None,
+    subject: str | None = None,
+    weight: float = 0.0,
+    rationale: str,
+    rollback_note: str | None = None,
+    created_by: str = "local",
+    status: str = "reviewed",
+) -> FeedbackRankingControl:
+    init_feedback_schema(connection)
+    normalized_type = _validate_feedback_control_type(control_type)
+    normalized_status = _validate_feedback_review_status(status)
+    now = utc_now()
+    control_id = "frc_" + _short_hash(
+        json.dumps(
+            {
+                "feedback_id": feedback_id,
+                "control_type": normalized_type,
+                "query_pattern": query_pattern,
+                "source_id": source_id,
+                "subject": subject,
+                "weight": weight,
+                "rationale": rationale,
+                "created_at": now,
+            },
+            sort_keys=True,
+        )
+    )
+    control = FeedbackRankingControl(
+        id=control_id,
+        feedback_id=_require_nonempty(feedback_id, "feedback_id"),
+        control_type=normalized_type,
+        status=normalized_status,
+        query_pattern=query_pattern.strip() if query_pattern else None,
+        source_id=source_id.strip() if source_id else None,
+        subject=subject.strip() if subject else None,
+        weight=float(weight),
+        rationale=_require_nonempty(rationale, "rationale"),
+        rollback_note=rollback_note,
+        created_by=_require_nonempty(created_by, "created_by"),
+        created_at=now,
+        applied_at=now if normalized_status == "applied" else None,
+        superseded_by=None,
+    )
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO feedback_ranking_controls (
+                id, feedback_id, control_type, status, query_pattern, source_id, subject, weight,
+                rationale, rollback_note, created_by, created_at, applied_at, superseded_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                control.id,
+                control.feedback_id,
+                control.control_type,
+                control.status,
+                control.query_pattern,
+                control.source_id,
+                control.subject,
+                control.weight,
+                control.rationale,
+                control.rollback_note,
+                control.created_by,
+                control.created_at,
+                control.applied_at,
+                control.superseded_by,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_feedback_reviews (feedback_id, status, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(feedback_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (control.feedback_id, control.status, now),
+        )
+    return control
+
+
+def list_feedback_ranking_controls(
+    connection: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    limit: int | None = None,
+) -> list[FeedbackRankingControl]:
+    init_feedback_schema(connection)
+    where = ""
+    params: list[Any] = []
+    if status is not None:
+        where = "WHERE status = ?"
+        params.append(_validate_feedback_review_status(status))
+    limit_clause = ""
+    if limit is not None:
+        if limit < 1:
+            return []
+        limit_clause = "LIMIT ?"
+        params.append(limit)
+    rows = connection.execute(
+        f"""
+        SELECT id, feedback_id, control_type, status, query_pattern, source_id, subject, weight,
+               rationale, rollback_note, created_by, created_at, applied_at, superseded_by
+        FROM feedback_ranking_controls
+        {where}
+        ORDER BY created_at DESC, id DESC
+        {limit_clause}
+        """,
+        params,
+    ).fetchall()
+    return [_feedback_ranking_control_from_row(row) for row in rows]
 
 
 def list_open_loops(connection: sqlite3.Connection, *, limit: int | None = None) -> list[dict[str, Any]]:
@@ -394,6 +599,20 @@ def _validate_agent_feedback_severity(severity: str) -> str:
     return normalized
 
 
+def _validate_feedback_review_status(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized not in VALID_FEEDBACK_REVIEW_STATUSES:
+        raise ValueError(f"invalid feedback review status: {status}")
+    return normalized
+
+
+def _validate_feedback_control_type(control_type: str) -> str:
+    normalized = control_type.strip().lower()
+    if normalized not in VALID_FEEDBACK_CONTROL_TYPES:
+        raise ValueError(f"invalid feedback control type: {control_type}")
+    return normalized
+
+
 def _validate_confidence(confidence: float) -> float:
     value = float(confidence)
     if value < 0.0 or value > 1.0:
@@ -412,3 +631,22 @@ def _short_hash(value: str) -> str:
     import hashlib
 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _feedback_ranking_control_from_row(row: sqlite3.Row | tuple[Any, ...]) -> FeedbackRankingControl:
+    return FeedbackRankingControl(
+        id=row[0],
+        feedback_id=row[1],
+        control_type=row[2],
+        status=row[3],
+        query_pattern=row[4],
+        source_id=row[5],
+        subject=row[6],
+        weight=float(row[7]),
+        rationale=row[8],
+        rollback_note=row[9],
+        created_by=row[10],
+        created_at=row[11],
+        applied_at=row[12],
+        superseded_by=row[13],
+    )

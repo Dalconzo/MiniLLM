@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -26,6 +27,7 @@ from local_agent_lab.memory.observability import (
     memory_db_path,
     read_memory_trace,
     render_memory_trace,
+    summarize_memory_status,
     validate_memory_state,
 )
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
@@ -320,8 +322,54 @@ def test_memory_status_reports_counts_and_recent_runs(tmp_path, monkeypatch) -> 
     assert result.exit_code == 0
     assert "Status:" in result.stdout
     assert "Counts:" in result.stdout
+    assert "Corpus Freshness:" in result.stdout
     assert "Latest Import:" in result.stdout
     assert "Recent Runs:" in result.stdout
+
+
+def test_memory_status_reports_corpus_freshness_separately_from_embedding_health(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_path = tmp_path / "raw"
+    export_dir = import_path / "export-1"
+    export_dir.mkdir(parents=True)
+    recent_time = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())
+    (export_dir / "conversations.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "conversation-freshness",
+                    "title": "Fresh starter note",
+                    "create_time": recent_time,
+                    "update_time": recent_time,
+                    "mapping": {
+                        "u": {
+                            "id": "u",
+                            "message": {
+                                "id": "u",
+                                "author": {"role": "user"},
+                                "create_time": recent_time,
+                                "content": {"parts": ["The starter doubled after feeding yesterday."]},
+                            },
+                        }
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    import_chatgpt_export(input_path=import_path, data_dir=data_dir, memory_dir=memory_dir)
+
+    status = summarize_memory_status(data_dir=data_dir, memory_dir=memory_dir, logs_dir=data_dir / "logs")
+
+    sqlite_status = status["sqlite"]
+    assert sqlite_status["embedding_health"]["status"] in {"missing_schema", "empty", "no_model", "partial", "ok"}
+    assert sqlite_status["corpus_freshness"]["status"] == "current"
+    assert sqlite_status["corpus_freshness"]["latest_source_message"]["conversation_title"] == "Fresh starter note"
+    assert sqlite_status["corpus_freshness"]["latest_imported_at"] == sqlite_status["latest_import"]["imported_at"]
+    assert sqlite_status["corpus_freshness"]["latest_import_id"] == sqlite_status["latest_import"]["id"]
+    assert sqlite_status["corpus_freshness"]["import_lag_days"] is not None
+    assert sqlite_status["corpus_freshness"]["import_lag_days"] < 2
 
 
 def test_memory_runs_lists_recent_commands(tmp_path, monkeypatch) -> None:

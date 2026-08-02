@@ -412,6 +412,88 @@ def test_home_mcp_recipe_search_boosts_exact_title_phrase_over_weak_cooccurrence
     assert exact_result["score"] > weak_result["score"]
 
 
+def test_home_mcp_flags_heading_only_recipe_methods_as_non_actionable(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    created = server.create_recipe_card(
+        title="Miso-Butter Roast Bowl with Jammy Eggs",
+        body=(
+            "## Ingredients\n"
+            "- 1 cup jasmine rice\n"
+            "- 1 1/4 cups water\n"
+            "- 2 tbsp butter\n"
+            "- 2 tbsp white or yellow miso\n\n"
+            "## Method\n"
+            "1. Start the rice\n"
+            "2. Heat the oven and prep the first roast\n"
+            "3. Cook the jammy eggs\n"
+            "4. Make the miso-butter sauce\n"
+        ),
+        tags=["bowl"],
+    )
+
+    assert created["validation"]["actionable"] is False
+    assert "non_executable_method" in created["validation_warnings"]
+    assert "heading_only_method_steps" in created["validation_warnings"]
+    assert created["validation"]["steps_count"] == 4
+    assert created["validation"]["executable_steps_count"] == 0
+
+    fetched = server.get_recipe(recipe_id=created["file_id"])
+    assert fetched["structure"]["steps"] == [
+        "Start the rice",
+        "Heat the oven and prep the first roast",
+        "Cook the jammy eggs",
+        "Make the miso-butter sauce",
+    ]
+    assert fetched["validation"]["actionable"] is False
+    assert fetched["validation"]["heading_only_steps_count"] == 4
+
+    search = server.search_recipes(query="miso butter", limit=1)
+    result = search["results"][0]
+    assert result["file_id"] == created["file_id"]
+    assert result["actionable"] is False
+    assert "heading_only_method_steps" in result["validation_warnings"]
+
+
+def test_home_mcp_recipe_validation_accepts_detailed_steps_and_optional_ingredients(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    created = server.create_recipe_card(
+        title="Detailed Roast Bowl",
+        ingredients=[
+            "1 cup jasmine rice",
+            "1 1/4 cups water",
+            "2 tbsp butter",
+            "2 tbsp white miso",
+            "Optional: sesame seeds",
+            "Optional: sliced scallions",
+        ],
+        steps=[
+            "Rinse 1 cup jasmine rice, then cook it with 1 1/4 cups water until tender.",
+            "Roast vegetables at 425F for 25 minutes until browned at the edges.",
+            "Whisk 2 tbsp butter with 2 tbsp miso in a bowl until smooth.",
+        ],
+        tags=["bowl"],
+    )
+
+    assert created["validation"]["actionable"] is True
+    assert created["validation"]["severity"] == "ok"
+    assert created["validation_warnings"] == []
+
+    fetched = server.get_recipe(recipe_id=created["file_id"])
+    assert fetched["validation"]["actionable"] is True
+    assert fetched["validation"]["ingredients_count"] == 6
+    assert fetched["validation"]["executable_steps_count"] == 3
+
+    search = server.search_recipes(query="roast bowl", limit=1)
+    assert search["results"][0]["actionable"] is True
+    assert search["results"][0]["validation_warnings"] == []
+
+
 def test_home_mcp_note_discovery_recipe_lookup_and_attempt_comparison(tmp_path) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)
@@ -719,6 +801,9 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     } <= tool_names
     schemas = {tool["name"]: tool["inputSchema"]["properties"] for tool in tools}
     assert schemas["memory_context"]["depth"]["enum"] == ["far", "medium", "close", "full"]
+    assert schemas["memory_context"]["retrieval_depth"]["enum"] == ["close", "broad"]
+    assert schemas["memory_context"]["packet_detail"]["enum"] == ["summary", "standard", "complete"]
+    assert schemas["memory_context"]["disclosure_tier"]["enum"] == ["far", "medium", "close", "full"]
     assert schemas["memory_search"]["depth"]["enum"] == ["far", "medium", "close", "full"]
     assert schemas["memory_context"]["debug_min_disclosure_tier"]["enum"] == ["far", "medium", "close", "full"]
     assert schemas["memory_search"]["debug_min_disclosure_tier"]["enum"] == ["far", "medium", "close", "full"]
@@ -770,6 +855,9 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert structured["context_packet_id"].startswith("ctx_")
     assert structured["context_packet"]["schema_version"] == 2
     assert structured["context_packet"]["task"]["depth"] == "medium"
+    assert structured["context_controls"]["retrieval_depth"] == "close"
+    assert structured["context_controls"]["packet_detail"] == "standard"
+    assert structured["context_controls"]["disclosure_tier"] == "medium"
     assert structured["context_packet"]["provenance"]["retrieval_event_id"] == structured["retrieval_event_id"]
     assert structured["context_packet"]["relevant_preferences"] or structured["context_packet"]["current_state"]
     assert structured["context_items"]

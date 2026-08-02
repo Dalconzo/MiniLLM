@@ -32,7 +32,7 @@ from .memory.candidates import (
     init_candidate_memory_schema,
 )
 from .memory.chatgpt_ingest import init_chatgpt_memory_schema
-from .memory.context_packet import build_context_packet, compact_context_items
+from .memory.context_packet import build_context_packet, compact_context_items, normalize_context_controls
 from .memory.curated import MemoryRecord, create_memory_record, init_curated_memory_schema, list_memory_records
 from .memory.feedback import (
     VALID_AGENT_FEEDBACK_CATEGORIES,
@@ -143,11 +143,25 @@ def _recipe_standard() -> dict[str, Any]:
             "One title and one short summary paragraph.",
             "At a glance section with yield and timing if known.",
             "One ingredient per bullet; no nested ingredient subheadings.",
-            "One method step per numbered item; no nested step headings.",
+            "One executable method step per numbered item; do not use headings as method steps.",
+            "Method steps should include concrete actions plus enough detail to act: quantities, temperatures, durations, equipment, sequencing, or doneness cues where known.",
             "Notes stay brief and only capture exceptions or substitutions.",
             "Source is explicit so the recipe can be traced later.",
             "Use the same structure every time before creating a new recipe card.",
         ],
+        "validation": {
+            "actionable_method_required": True,
+            "minimum_executable_steps": 1,
+            "heading_only_steps_warn": True,
+            "required_method_detail_examples": [
+                "temperature",
+                "duration",
+                "doneness cue",
+                "quantity",
+                "equipment",
+                "sequencing",
+            ],
+        },
         "sections": [
             "Title",
             "At a glance",
@@ -698,6 +712,10 @@ class HomeMCPServer:
             metadata={"kind": "recipe", **(metadata or {})},
         )
         result["recipe_id"] = result["file_id"]
+        parsed = _extract_recipe_structure(body, title=title)
+        validation = _validate_recipe_card(parsed)
+        result["validation"] = validation
+        result["validation_warnings"] = validation["warning_codes"]
         return result
 
     def get_recipe(self, *, recipe_id: str) -> dict[str, Any]:
@@ -712,6 +730,7 @@ class HomeMCPServer:
         metadata, body = _parse_markdown_document(str(read["content"]))
         title = str(metadata.get("title") or Path(str(read["relative_path"])).stem).strip()
         parsed = _extract_recipe_structure(body, title=title)
+        validation = _validate_recipe_card(parsed)
         nested_metadata = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
         return {
             "status": "ok",
@@ -722,6 +741,8 @@ class HomeMCPServer:
             "metadata": metadata,
             "recipe_card": nested_metadata.get("recipe_card") if isinstance(nested_metadata.get("recipe_card"), dict) else metadata.get("recipe_card"),
             "structure": parsed,
+            "validation": validation,
+            "validation_warnings": validation["warning_codes"],
             "content": body.strip(),
             "standard": _recipe_standard(),
         }
@@ -752,6 +773,7 @@ class HomeMCPServer:
             title = title or str(Path(read["relative_path"]).stem).replace("-", " ").replace("_", " ").strip().title()
         source_text = source_text or ""
         parsed = _extract_recipe_structure(source_text, title=title, query=query)
+        validation = _validate_recipe_card(parsed)
         draft_title = parsed["title"]
         body = _render_recipe_card_body(
             draft_title,
@@ -788,6 +810,8 @@ class HomeMCPServer:
                 "summary": parsed["summary"],
                 "confidence": parsed["confidence"],
                 "tags": parsed["tags"],
+                "validation": validation,
+                "validation_warnings": validation["warning_codes"],
                 "standard": _recipe_standard(),
             },
         }
@@ -919,6 +943,10 @@ class HomeMCPServer:
             metadata=recipe_metadata,
         )
         result["recipe_id"] = result["file_id"]
+        parsed = _extract_recipe_structure(recipe_body, title=title)
+        validation = _validate_recipe_card(parsed)
+        result["validation"] = validation
+        result["validation_warnings"] = validation["warning_codes"]
         return result
 
     def recipe_standard(self) -> dict[str, Any]:
@@ -1000,6 +1028,7 @@ class HomeMCPServer:
             title = str(metadata.get("title") or path.stem).strip()
             body_text = redact_text(body)
             recipe_structure = _extract_recipe_structure(body_text, title=title)
+            validation = _validate_recipe_card(recipe_structure)
             card_summary = str(
                 metadata.get("summary")
                 or (metadata.get("recipe_card", {}) if isinstance(metadata.get("recipe_card"), dict) else {}).get("summary", "")
@@ -1063,6 +1092,9 @@ class HomeMCPServer:
                     "cook_time": recipe_structure["cook_time"],
                     "total_time": recipe_structure["total_time"],
                     "recipe_summary": recipe_structure["summary"],
+                    "validation": validation,
+                    "validation_warnings": validation["warning_codes"],
+                    "actionable": validation["actionable"],
                     "schema_version": schema_version,
                     "score": round(score, 3),
                     "match_reason": "title_phrase" if phrase_in_title else "title_terms" if normalized_query and all(term in title_lower for term in query_terms) else "path_phrase" if phrase_in_path else "tag_phrase" if phrase_in_tags else "content" if normalized_query else "recent",
@@ -1434,6 +1466,9 @@ class HomeMCPServer:
         *,
         query: str,
         depth: str = "medium",
+        retrieval_depth: str | None = None,
+        packet_detail: str | None = None,
+        disclosure_tier: str | None = None,
         limit: int = 6,
         subject: str | None = None,
         effort: int = 2,
@@ -1441,12 +1476,20 @@ class HomeMCPServer:
         debug_min_disclosure_tier: str | None = None,
         run_id: str,
     ) -> dict[str, Any]:
+        controls = normalize_context_controls(
+            depth=depth,
+            retrieval_depth=retrieval_depth,
+            packet_detail=packet_detail,
+            disclosure_tier=disclosure_tier,
+            effort=effort,
+        )
+        search_limit = min(20, limit * 2) if controls.retrieval_depth == "broad" else limit
         result = search_chatgpt_memory(
             memory_dir=self.config.paths["memory_dir"],
             query=query,
-            limit=limit,
+            limit=search_limit,
             subject=subject,
-            depth=depth,
+            depth=controls.disclosure_tier,
             effort=effort,
             allow_cross_domain=allow_cross_domain,
             debug_min_disclosure_tier=debug_min_disclosure_tier,
@@ -1461,16 +1504,19 @@ class HomeMCPServer:
                 command="home-mcp:memory_context",
                 filters=result["filters_applied"],
                 ranking_profile=result["ranking_profile"],
-                disclosure_depth=depth,
+                disclosure_depth=controls.disclosure_tier,
                 results=result["results"],
             )
-        context_items = compact_context_items(result["results"])
+        context_items = compact_context_items(result["results"][:limit])
         context_packet = build_context_packet(
             query=query,
             retrieval_event_id=audit["retrieval_event_id"],
             search_result=result,
             context_items=context_items,
             requested_depth=depth,
+            retrieval_depth=controls.retrieval_depth,
+            packet_detail=controls.packet_detail,
+            disclosure_tier=controls.disclosure_tier,
         )
         return {
             "status": "ok",
@@ -1478,6 +1524,7 @@ class HomeMCPServer:
             "context_packet_id": context_packet["context_packet_id"],
             "query": query,
             "depth": depth,
+            "context_controls": controls.to_dict(),
             "ranking_profile": result["ranking_profile"],
             "domain_detection": result["domain_detection"],
             "filters_applied": result["filters_applied"],
@@ -2016,6 +2063,9 @@ class HomeMCPServer:
                     "properties": {
                         "query": {"type": "string"},
                         "depth": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
+                        "retrieval_depth": {"type": "string", "enum": ["close", "broad"]},
+                        "packet_detail": {"type": "string", "enum": ["summary", "standard", "complete"]},
+                        "disclosure_tier": {"type": "string", "enum": list(DISCLOSURE_TIERS)},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                         "subject": {"type": "string"},
                         "effort": {"type": "integer", "minimum": 1, "maximum": 5},
@@ -2402,6 +2452,9 @@ class HomeMCPServer:
             return self.memory_context(
                 query=str(arguments["query"]),
                 depth=str(arguments.get("depth", "medium")),
+                retrieval_depth=str(arguments["retrieval_depth"]) if arguments.get("retrieval_depth") else None,
+                packet_detail=str(arguments["packet_detail"]) if arguments.get("packet_detail") else None,
+                disclosure_tier=str(arguments["disclosure_tier"]) if arguments.get("disclosure_tier") else None,
                 limit=int(arguments.get("limit", 6)),
                 subject=str(arguments["subject"]) if arguments.get("subject") else None,
                 effort=int(arguments.get("effort", 2)),
@@ -2475,6 +2528,7 @@ class HomeMCPServer:
                 details={
                     "context_packet_id": result.get("context_packet_id"),
                     "requested_depth": result.get("depth"),
+                    "context_controls": result.get("context_controls"),
                     "packet_depth": (result.get("context_packet") or {}).get("task", {}).get("depth")
                     if isinstance(result.get("context_packet"), dict)
                     else None,
@@ -2912,6 +2966,178 @@ def _extract_recipe_structure(text: str, *, title: str | None = None, query: str
         "summary": summary,
         "confidence": round(min(confidence, 0.98), 2),
         "tags": tags,
+    }
+
+
+_RECIPE_ACTION_VERBS = {
+    "add",
+    "arrange",
+    "bake",
+    "beat",
+    "blend",
+    "boil",
+    "bring",
+    "brush",
+    "chill",
+    "chop",
+    "coat",
+    "combine",
+    "cook",
+    "cool",
+    "cover",
+    "cut",
+    "divide",
+    "drain",
+    "drizzle",
+    "fold",
+    "heat",
+    "knead",
+    "line",
+    "make",
+    "mix",
+    "place",
+    "pour",
+    "preheat",
+    "prep",
+    "reduce",
+    "remove",
+    "rest",
+    "rinse",
+    "roast",
+    "roll",
+    "saute",
+    "sauté",
+    "season",
+    "serve",
+    "set",
+    "shape",
+    "simmer",
+    "slice",
+    "spread",
+    "sprinkle",
+    "start",
+    "stir",
+    "strain",
+    "toast",
+    "top",
+    "transfer",
+    "whisk",
+}
+
+
+def _validate_recipe_card(structure: dict[str, Any]) -> dict[str, Any]:
+    ingredients = [str(item).strip() for item in structure.get("ingredients", []) if str(item).strip()]
+    steps = [str(item).strip() for item in structure.get("steps", []) if str(item).strip()]
+    step_assessments = [_assess_recipe_step(step, index=index + 1) for index, step in enumerate(steps)]
+    executable_count = sum(1 for item in step_assessments if item["executable"])
+    heading_only_count = sum(1 for item in step_assessments if item["heading_only"])
+    detail_poor_count = sum(1 for item in step_assessments if item["detail_level"] == "low")
+    warnings: list[dict[str, Any]] = []
+
+    if not ingredients:
+        warnings.append(
+            {
+                "code": "missing_ingredients",
+                "severity": "error",
+                "message": "Recipe card has no parsed ingredients.",
+            }
+        )
+    if not steps:
+        warnings.append(
+            {
+                "code": "missing_method_steps",
+                "severity": "error",
+                "message": "Recipe card has no parsed method steps.",
+            }
+        )
+    minimum_executable_steps = max(1, (len(steps) + 1) // 2) if steps else 0
+    if steps and executable_count < minimum_executable_steps:
+        warnings.append(
+            {
+                "code": "non_executable_method" if executable_count == 0 else "insufficient_executable_method_steps",
+                "severity": "error",
+                "message": "Parsed method steps do not contain enough executable instructions.",
+            }
+        )
+    if heading_only_count:
+        warnings.append(
+            {
+                "code": "heading_only_method_steps",
+                "severity": "warning" if executable_count else "error",
+                "message": f"{heading_only_count} method step(s) look like headings rather than executable instructions.",
+                "step_indexes": [item["index"] for item in step_assessments if item["heading_only"]],
+            }
+        )
+    if steps and detail_poor_count == len(steps):
+        warnings.append(
+            {
+                "code": "method_lacks_operational_detail",
+                "severity": "warning" if executable_count else "error",
+                "message": "Method steps do not include enough operational detail such as duration, temperature, quantity, equipment, sequencing, or doneness cues.",
+            }
+        )
+
+    actionable = bool(ingredients and steps and executable_count > 0 and not any(item["severity"] == "error" for item in warnings))
+    return {
+        "schema_version": RECIPE_CARD_SCHEMA_VERSION,
+        "actionable": actionable,
+        "severity": "ok" if actionable and not warnings else "warning" if actionable else "fail",
+        "ingredients_count": len(ingredients),
+        "steps_count": len(steps),
+        "executable_steps_count": executable_count,
+        "minimum_executable_steps": minimum_executable_steps,
+        "heading_only_steps_count": heading_only_count,
+        "detail_poor_steps_count": detail_poor_count,
+        "warnings": warnings,
+        "warning_codes": [str(item["code"]) for item in warnings],
+        "step_assessments": step_assessments,
+    }
+
+
+def _assess_recipe_step(step: str, *, index: int) -> dict[str, Any]:
+    normalized = re.sub(r"\s+", " ", step.strip())
+    lower = normalized.lower()
+    words = re.findall(r"[a-zA-ZÀ-ÿ0-9']+", lower)
+    first_word = words[0] if words else ""
+    has_action = first_word in _RECIPE_ACTION_VERBS or bool(re.match(r"^(let|allow|leave|return|continue)\b", lower))
+    has_temperature = bool(re.search(r"\b\d{2,3}\s*(?:°|degrees?|f|c|fahrenheit|celsius)\b", lower))
+    has_duration = bool(re.search(r"\b\d+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b", lower))
+    has_quantity = bool(re.search(r"\b\d+(?:[\/.]\d+)?\s*(?:cups?|tbsp|tsp|g|kg|oz|ounces?|lb|pounds?|ml|l|pinch|cloves?)\b", lower))
+    has_doneness = bool(
+        re.search(
+            r"\b(until|golden|browned|bubbling|set|tender|translucent|fragrant|thickened|doubled|puffed|crisp|smooth|combined)\b",
+            lower,
+        )
+    )
+    has_equipment = bool(re.search(r"\b(oven|pan|pot|skillet|bowl|sheet|tray|rack|thermometer|mixer|blender|processor)\b", lower))
+    has_sequence = bool(
+        re.search(r"\b(before|after|then|while|meanwhile|once|when|until|for|at|into|onto|with)\b", lower)
+        or "as soon as" in lower
+    )
+    has_strong_detail = any([has_temperature, has_duration, has_quantity, has_doneness])
+    has_detail = any([has_strong_detail, has_equipment, has_sequence])
+    has_terminal_punctuation = normalized.endswith((".", "!", "?"))
+    title_like = len(words) <= 8 and not has_terminal_punctuation and not has_strong_detail
+    generic_heading = first_word in {"start", "heat", "cook", "make", "prep"} and len(words) <= 8 and not has_strong_detail
+    if generic_heading and not any([has_quantity, has_duration, has_temperature, has_doneness]):
+        title_like = True
+    heading_only = title_like
+    executable = has_action and (has_strong_detail or (has_terminal_punctuation and len(words) > 2)) and not heading_only
+    return {
+        "index": index,
+        "step": normalized,
+        "executable": executable,
+        "heading_only": heading_only,
+        "detail_level": "high" if executable and sum([has_temperature, has_duration, has_quantity, has_doneness, has_equipment, has_sequence]) >= 2 else "medium" if has_detail else "low",
+        "signals": {
+            "action_verb": has_action,
+            "temperature": has_temperature,
+            "duration": has_duration,
+            "quantity": has_quantity,
+            "doneness_cue": has_doneness,
+            "equipment": has_equipment,
+            "sequencing": has_sequence,
+        },
     }
 
 

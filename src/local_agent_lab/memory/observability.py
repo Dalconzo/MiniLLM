@@ -156,16 +156,35 @@ def validate_memory_state(*, data_dir: Path, memory_dir: Path) -> dict[str, Any]
 def summarize_memory_status(*, data_dir: Path, memory_dir: Path, logs_dir: Path, recent_limit: int = 5) -> dict[str, Any]:
     report = validate_memory_state(data_dir=data_dir, memory_dir=memory_dir)
     sqlite_path = memory_db_path(memory_dir)
+    checked_at = utc_now()
 
     sqlite_summary: dict[str, Any] = {
         "exists": sqlite_path.exists(),
         "counts": {},
         "latest_import": None,
+        "embedding_health": {
+            "status": "missing_database" if not sqlite_path.exists() else "unknown",
+            "coverage_ratio": 0.0,
+            "embedded_chunks": 0,
+            "missing_chunks": 0,
+            "stale_chunks": 0,
+            "active_model": None,
+        },
+        "corpus_freshness": {
+            "status": "missing_database" if not sqlite_path.exists() else "unknown",
+            "checked_at": checked_at,
+            "latest_source_message": None,
+            "latest_imported_at": None,
+            "latest_import_id": None,
+            "import_lag_days": None,
+            "threshold_days": {"current": 14, "stale": 45},
+        },
     }
     if sqlite_path.exists():
         with sqlite3.connect(sqlite_path) as connection:
             sqlite_summary["counts"] = _sqlite_counts(connection)
             sqlite_summary["embedding_coverage"] = _embedding_coverage_summary(connection)
+            sqlite_summary["embedding_health"] = _embedding_health_summary(sqlite_summary["embedding_coverage"])
             latest_import = connection.execute(
                 """
                 SELECT id, source_root, raw_manifest_path, imported_at, status, parser_version,
@@ -192,6 +211,11 @@ def summarize_memory_status(*, data_dir: Path, memory_dir: Path, logs_dir: Path,
                     "notes": latest_import[12],
                     "candidate_memory_count": _count_candidates_for_import(connection, latest_import[0]),
                 }
+            sqlite_summary["corpus_freshness"] = _corpus_freshness_summary(
+                connection,
+                checked_at=checked_at,
+                latest_import=sqlite_summary["latest_import"],
+            )
 
     recent_runs = list_recent_runs(logs_dir, limit=recent_limit)
     return {
@@ -494,6 +518,96 @@ def _embedding_coverage_summary(connection: sqlite3.Connection) -> dict[str, Any
     }
 
 
+def _embedding_health_summary(embedding_coverage: dict[str, Any]) -> dict[str, Any]:
+    active_model = embedding_coverage.get("active_model")
+    return {
+        "status": embedding_coverage.get("status"),
+        "coverage_ratio": embedding_coverage.get("coverage_ratio", 0.0),
+        "total_chunks": embedding_coverage.get("total_chunks", 0),
+        "embedded_chunks": embedding_coverage.get("embedded_chunks", 0),
+        "missing_chunks": embedding_coverage.get("missing_chunks", 0),
+        "stale_chunks": embedding_coverage.get("stale_chunks", 0),
+        "active_model": active_model,
+    }
+
+
+def _corpus_freshness_summary(
+    connection: sqlite3.Connection,
+    *,
+    checked_at: str,
+    latest_import: dict[str, Any] | None,
+) -> dict[str, Any]:
+    latest_message = connection.execute(
+        """
+        SELECT messages.id, messages.created_at, messages.role, conversations.id, conversations.title
+        FROM messages
+        JOIN conversations ON conversations.id = messages.conversation_id
+        WHERE messages.created_at IS NOT NULL
+          AND messages.created_at != ''
+          AND messages.is_deleted = 0
+        ORDER BY messages.created_at DESC, messages.id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    latest_source_message = None
+    if latest_message:
+        latest_source_message = {
+            "message_id": latest_message[0],
+            "created_at": latest_message[1],
+            "role": latest_message[2],
+            "conversation_id": latest_message[3],
+            "conversation_title": latest_message[4],
+        }
+
+    latest_message_dt = _parse_datetime(latest_source_message["created_at"]) if latest_source_message else None
+    checked_dt = _parse_datetime(checked_at)
+    import_lag_days = None
+    status = "empty"
+    if latest_source_message is None:
+        status = "empty"
+    elif latest_message_dt is None or checked_dt is None:
+        status = "unknown"
+    else:
+        import_lag_days = max((checked_dt - latest_message_dt).total_seconds() / 86400, 0.0)
+        if import_lag_days <= 14:
+            status = "current"
+        elif import_lag_days <= 45:
+            status = "aging"
+        else:
+            status = "stale"
+
+    return {
+        "status": status,
+        "checked_at": checked_at,
+        "latest_source_message": latest_source_message,
+        "latest_imported_at": latest_import.get("imported_at") if latest_import else None,
+        "latest_import_id": latest_import.get("id") if latest_import else None,
+        "import_lag_days": round(import_lag_days, 3) if import_lag_days is not None else None,
+        "threshold_days": {"current": 14, "stale": 45},
+    }
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _sqlite_tables(connection: sqlite3.Connection) -> set[str]:
     return {
         row[0]
@@ -597,6 +711,8 @@ def _validate_sqlite(sqlite_path: Path) -> list[dict[str, Any]]:
                     "details": {"missing_tables": missing, "tables": sorted(tables)},
                 }
             )
+            if not missing and {"subjects", "chunk_subjects", "conversation_subjects"}.issubset(tables):
+                checks.extend(_validate_subject_provenance(connection, path=sqlite_path))
     except sqlite3.Error as exc:
         checks.append(
             {
@@ -604,6 +720,90 @@ def _validate_sqlite(sqlite_path: Path) -> list[dict[str, Any]]:
                 "status": "error",
                 "message": str(exc),
                 "path": str(sqlite_path),
+            }
+        )
+    return checks
+
+
+def _validate_subject_provenance(connection: sqlite3.Connection, *, path: Path) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    chunk_without_conversation_rows = connection.execute(
+        """
+        SELECT s.name, COUNT(DISTINCT chs.chunk_id) AS chunk_count
+        FROM subjects s
+        JOIN chunk_subjects chs ON chs.subject_id = s.id
+        JOIN message_chunks mc ON mc.id = chs.chunk_id AND mc.is_deleted = 0
+        LEFT JOIN conversations c ON c.id = mc.conversation_id AND c.is_deleted = 0
+        WHERE c.id IS NULL
+        GROUP BY s.id
+        HAVING chunk_count > 0
+        ORDER BY chunk_count DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    if chunk_without_conversation_rows:
+        checks.append(
+            {
+                "name": "subject_chunk_conversation_provenance",
+                "status": "warn",
+                "message": "Some subject chunk assignments do not resolve to live conversations.",
+                "path": str(path),
+                "details": {
+                    "subjects": [
+                        {"name": row[0], "chunk_count": int(row[1] or 0)} for row in chunk_without_conversation_rows
+                    ]
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "subject_chunk_conversation_provenance",
+                "status": "ok",
+                "message": "Subject chunk assignments resolve to live conversations.",
+                "path": str(path),
+            }
+        )
+
+    concentrated_rows = connection.execute(
+        """
+        SELECT s.name, COUNT(DISTINCT mc.conversation_id) AS conversation_count, COUNT(DISTINCT chs.chunk_id) AS chunk_count
+        FROM subjects s
+        JOIN chunk_subjects chs ON chs.subject_id = s.id
+        JOIN message_chunks mc ON mc.id = chs.chunk_id AND mc.is_deleted = 0
+        JOIN conversations c ON c.id = mc.conversation_id AND c.is_deleted = 0
+        GROUP BY s.id
+        HAVING conversation_count = 1 AND chunk_count >= 500
+        ORDER BY chunk_count DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    if concentrated_rows:
+        checks.append(
+            {
+                "name": "subject_conversation_concentration",
+                "status": "warn",
+                "message": "Some subjects have many chunks from one conversation; inspect for over-broad assignment.",
+                "path": str(path),
+                "details": {
+                    "subjects": [
+                        {
+                            "name": row[0],
+                            "conversation_count": int(row[1] or 0),
+                            "chunk_count": int(row[2] or 0),
+                        }
+                        for row in concentrated_rows
+                    ]
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "subject_conversation_concentration",
+                "status": "ok",
+                "message": "No pathological subject concentration detected.",
+                "path": str(path),
             }
         )
     return checks

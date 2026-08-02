@@ -25,6 +25,11 @@ from .ranking import DISCLOSURE_TIERS, EXPOSED_FIELDS_BY_TIER, rank_memory_hits
 from .subjects import normalize_subject_slug, resolve_subject
 
 
+MIN_LEXICAL_RELEVANCE = 0.30
+MIN_CURATED_LEXICAL_RELEVANCE = 0.20
+MIN_SEMANTIC_SIMILARITY = 0.58
+
+
 def search_chatgpt_memory(
     *,
     memory_dir: Path,
@@ -41,6 +46,9 @@ def search_chatgpt_memory(
     allow_cross_domain: bool = False,
     debug_min_disclosure_tier: str | None = None,
     query_embedder: EmbeddingFunction | None = None,
+    max_chunks_per_message: int | None = 2,
+    max_chunks_per_conversation: int | None = 4,
+    document_mode: bool = False,
 ) -> dict[str, Any]:
     sqlite_path = memory_db_path(memory_dir)
     if not sqlite_path.exists():
@@ -51,6 +59,7 @@ def search_chatgpt_memory(
             source_ref=str(sqlite_path),
         )
 
+    query_tokens = _search_tokens(query)
     fts_queries = _fts_queries(query)
     if not fts_queries:
         raise MemoryObservationError(
@@ -194,18 +203,30 @@ def search_chatgpt_memory(
             ORDER BY bm25_score ASC
             LIMIT ?
         """
+        candidate_limit = max(limit * 4, 20)
         rows = []
         fts_strategy = fts_queries[0][0]
         for strategy, candidate_fts_query in fts_queries:
             candidate_params = list(params)
             candidate_params[0] = candidate_fts_query
-            rows = connection.execute(sql, [*candidate_params, limit]).fetchall()
+            rows = connection.execute(sql, [*candidate_params, candidate_limit]).fetchall()
             fts_strategy = strategy
             if rows:
                 break
         if fts_strategy != "precise_all_terms":
             filters_applied.append({"field": "fts_strategy", "value": fts_strategy})
-        fts_results = [_row_to_hit(index, row) for index, row in enumerate(rows, start=1)]
+        fts_results = [
+            {
+                **_row_to_hit(index, row),
+                "keyword_relevance": _lexical_relevance(
+                    query_tokens,
+                    str(row["title"] or ""),
+                    str(row["snippet"] or ""),
+                    str(row["role"] or ""),
+                ),
+            }
+            for index, row in enumerate(rows, start=1)
+        ]
         vector_results = _vector_hits(
             connection,
             query=query,
@@ -217,7 +238,7 @@ def search_chatgpt_memory(
             title=title,
             date_from=date_from,
             date_to=date_to,
-            limit=limit,
+            limit=candidate_limit,
         )
         curated_results = _curated_hits(
             connection,
@@ -229,13 +250,17 @@ def search_chatgpt_memory(
             title=title,
             date_from=date_from,
             date_to=date_to,
-            limit=limit,
+            limit=candidate_limit,
         )
 
         retrieved_results = _merge_retrieval_hits(fts_results, vector_results)
         scoped_results = []
         domain_filtered_count = 0
         governance_filtered_count = 0
+        boundary_domains = _strict_boundary_domains(
+            query_domains,
+            resolved_subject.name if resolved_subject is not None else subject,
+        )
         for hit in [*retrieved_results, *curated_results]:
             hit_domains = classify_text_domains(
                 hit.get("title"),
@@ -250,6 +275,9 @@ def search_chatgpt_memory(
                 allow_cross_domain=allow_cross_domain,
             )
             if not allowed:
+                domain_filtered_count += 1
+                continue
+            if not allow_cross_domain and boundary_domains and not _passes_strict_domain_boundary(hit_domains, boundary_domains):
                 domain_filtered_count += 1
                 continue
             governance_allowed, governance_reason, governance_labels = apply_governance_policy(
@@ -276,7 +304,18 @@ def search_chatgpt_memory(
 
         effective_depth = _effort_depth_cap(depth, effort)
         ranked_results = rank_memory_hits(scoped_results, depth=effective_depth)
-        results = ranked_results[:limit]
+        relevant_results = [item for item in ranked_results if _passes_relevance_floor(item)]
+        relevance_filtered_count = len(ranked_results) - len(relevant_results)
+        if document_mode:
+            diverse_results = relevant_results
+            diversity_filtered_count = 0
+        else:
+            diverse_results, diversity_filtered_count = _apply_diversity_caps(
+                relevant_results,
+                max_chunks_per_message=max_chunks_per_message,
+                max_chunks_per_conversation=max_chunks_per_conversation,
+            )
+        results = _renumber_results(diverse_results[:limit])
         if debug_min_disclosure_tier:
             results = [_force_min_disclosure_tier(result, debug_min_disclosure_tier) for result in results]
         results = [_project_hit_for_depth(result) for result in results]
@@ -292,6 +331,10 @@ def search_chatgpt_memory(
             "governance_filtered": governance_filtered_count,
             "scoped": len(scoped_results),
             "ranked": len(ranked_results),
+            "relevance_filtered": relevance_filtered_count,
+            "after_relevance": len(relevant_results),
+            "diversity_filtered": diversity_filtered_count,
+            "after_diversity": len(diverse_results),
             "after_filters": len(results),
         }
         trace_diagnostics = _search_trace_diagnostics(
@@ -333,6 +376,20 @@ def search_chatgpt_memory(
             "debug_disclosure": {
                 "min_tier": debug_min_disclosure_tier,
                 "policy": "debug_only" if debug_min_disclosure_tier else None,
+            },
+            "result_quality": _result_quality(results=results, ranked_count=len(ranked_results)),
+            "retrieval_controls": {
+                "minimum_relevance": {
+                    "policy": "lexical_or_semantic_floor_v1",
+                    "lexical_relevance": MIN_LEXICAL_RELEVANCE,
+                    "semantic_similarity": MIN_SEMANTIC_SIMILARITY,
+                    "curated_lexical_relevance": MIN_CURATED_LEXICAL_RELEVANCE,
+                },
+                "diversity": {
+                    "document_mode": document_mode,
+                    "max_chunks_per_message": None if document_mode else max_chunks_per_message,
+                    "max_chunks_per_conversation": None if document_mode else max_chunks_per_conversation,
+                },
             },
             "trace_diagnostics": trace_diagnostics,
             "results": results,
@@ -781,9 +838,9 @@ def _curated_subject_filter(subject: str) -> tuple[str, list[Any]]:
 
 
 def _curated_keyword_relevance(tokens: list[str], *, title: str, body: str) -> float:
-    searchable = f"{title} {body}".lower()
     if not tokens:
         return 0.0
+    searchable = f"{title} {body}".lower()
     matched = sum(1 for token in tokens if token.lower() in searchable)
     if matched == 0:
         return 0.0
@@ -797,6 +854,110 @@ def _curated_keyword_relevance(tokens: list[str], *, title: str, body: str) -> f
 def _is_low_value_curated_record(*, title: str, body: str, source_ref: str) -> bool:
     text = f"{title} {body} {source_ref}".lower()
     return any(marker in text for marker in ("smoke-test", "smoke test", "browser-smoke", "test focaccia"))
+
+
+def _strict_boundary_domains(query_domains: list[str], subject_name: str | None) -> list[str]:
+    query_specific = [domain for domain in query_domains if domain != "misc"]
+    if query_specific:
+        return query_specific
+    if not subject_name:
+        return []
+    return [domain for domain in classify_text_domains(subject_name) if domain != "misc"]
+
+
+def _passes_strict_domain_boundary(candidate_domains: list[str], boundary_domains: list[str]) -> bool:
+    candidate_specific = [domain for domain in candidate_domains if domain != "misc"]
+    if not candidate_specific:
+        return False
+    return bool(set(candidate_specific) & set(boundary_domains))
+
+
+def _passes_relevance_floor(hit: dict[str, Any]) -> bool:
+    keyword = _float_value(hit.get("score_breakdown"), "keyword_relevance", fallback=hit.get("keyword_relevance"))
+    semantic = _float_value(hit.get("score_breakdown"), "semantic_similarity", fallback=hit.get("semantic_similarity"))
+    source_kind = str(hit.get("source_kind") or "")
+    if source_kind == "curated_memory":
+        return keyword >= MIN_CURATED_LEXICAL_RELEVANCE or semantic >= MIN_SEMANTIC_SIMILARITY
+    return keyword >= MIN_LEXICAL_RELEVANCE or semantic >= MIN_SEMANTIC_SIMILARITY
+
+
+def _float_value(score_breakdown: Any, component: str, *, fallback: Any = None) -> float:
+    if isinstance(score_breakdown, dict):
+        components = score_breakdown.get("components")
+        if isinstance(components, dict):
+            entry = components.get(component)
+            if isinstance(entry, dict):
+                try:
+                    return float(entry.get("value") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+    try:
+        return float(fallback or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_diversity_caps(
+    results: list[dict[str, Any]],
+    *,
+    max_chunks_per_message: int | None,
+    max_chunks_per_conversation: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if max_chunks_per_message is None and max_chunks_per_conversation is None:
+        return results, 0
+
+    kept: list[dict[str, Any]] = []
+    message_counts: dict[str, int] = {}
+    conversation_counts: dict[str, int] = {}
+    filtered = 0
+    for item in results:
+        message_id = str(item.get("message_id") or "")
+        conversation_id = str(item.get("conversation_id") or "")
+        if max_chunks_per_message is not None and message_id:
+            if message_counts.get(message_id, 0) >= max_chunks_per_message:
+                filtered += 1
+                continue
+        if max_chunks_per_conversation is not None and conversation_id:
+            if conversation_counts.get(conversation_id, 0) >= max_chunks_per_conversation:
+                filtered += 1
+                continue
+        kept.append(item)
+        if message_id:
+            message_counts[message_id] = message_counts.get(message_id, 0) + 1
+        if conversation_id:
+            conversation_counts[conversation_id] = conversation_counts.get(conversation_id, 0) + 1
+    return kept, filtered
+
+
+def _renumber_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    renumbered: list[dict[str, Any]] = []
+    for rank, item in enumerate(results, start=1):
+        updated = dict(item)
+        updated["rank"] = rank
+        renumbered.append(updated)
+    return renumbered
+
+
+def _result_quality(*, results: list[dict[str, Any]], ranked_count: int) -> str:
+    if results:
+        return "reliable_results"
+    if ranked_count:
+        return "no_reliable_results"
+    return "no_results"
+
+
+def _lexical_relevance(tokens: list[str], *parts: str) -> float:
+    if not tokens:
+        return 0.0
+    searchable = " ".join(parts).lower()
+    if not searchable.strip():
+        return 0.0
+    matched = sum(1 for token in tokens if token.lower() in searchable)
+    if matched == 0:
+        return 0.0
+    joined = " ".join(token.lower() for token in tokens)
+    phrase_bonus = 0.15 if joined and joined in searchable else 0.0
+    return min(1.0, (matched / len(tokens)) + phrase_bonus)
 
 
 def _curated_source_refs(connection: sqlite3.Connection, record_id: str) -> list[dict[str, Any]]:
@@ -852,6 +1013,10 @@ def _empty_result(*, query: str, ranking_profile: str, filters_applied: list[dic
         "governance_filtered": 0,
         "scoped": 0,
         "ranked": 0,
+        "relevance_filtered": 0,
+        "after_relevance": 0,
+        "diversity_filtered": 0,
+        "after_diversity": 0,
         "after_filters": 0,
     }
     return {
@@ -860,6 +1025,7 @@ def _empty_result(*, query: str, ranking_profile: str, filters_applied: list[dic
         "ranking_profile": ranking_profile,
         "candidate_counts": candidate_counts,
         "filters_applied": filters_applied,
+        "result_quality": "no_reliable_results",
         "trace_diagnostics": _search_trace_diagnostics(
             query=query,
             requested_subject=None,
@@ -957,6 +1123,10 @@ def _search_trace_diagnostics(
                 "before_domain_governance": candidate_counts.get("before_domain_governance", 0),
                 "domain_filtered": candidate_counts.get("domain_filtered", 0),
                 "governance_filtered": candidate_counts.get("governance_filtered", 0),
+                "relevance_filtered": candidate_counts.get("relevance_filtered", 0),
+                "after_relevance": candidate_counts.get("after_relevance", 0),
+                "diversity_filtered": candidate_counts.get("diversity_filtered", 0),
+                "after_diversity": candidate_counts.get("after_diversity", 0),
                 "scoped": candidate_counts.get("scoped", 0),
             },
         },

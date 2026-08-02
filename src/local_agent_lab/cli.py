@@ -80,7 +80,7 @@ from .memory.curated import (
     promote_chunk_to_memory_record,
     update_memory_record_subject,
 )
-from .memory.context_packet import build_context_packet, compact_context_items
+from .memory.context_packet import build_context_packet, compact_context_items, normalize_context_controls
 from .memory.embeddings import embed_missing_chunks, fallback_model_spec, ollama_model_spec
 from .memory.feedback import feedback_summary, list_open_loops, record_memory_feedback
 from .memory.eval_checks import run_memory_eval
@@ -1251,6 +1251,9 @@ def memory_search(
 def memory_context(
     query: str = typer.Argument(..., help="Task or question to build a memory context pack for."),
     depth: str = typer.Option("medium", "--depth", help="Disclosure depth: far, medium, close, or full."),
+    retrieval_depth: str | None = typer.Option(None, "--retrieval-depth", help="Retrieval breadth: close or broad."),
+    packet_detail: str | None = typer.Option(None, "--packet-detail", help="Packet detail: summary, standard, or complete."),
+    disclosure_tier: str | None = typer.Option(None, "--disclosure-tier", help="Disclosure tier: far, medium, close, or full."),
     limit: int = typer.Option(6, "--limit", min=1, max=20, help="Maximum context items."),
     subject: str | None = typer.Option(None, "--subject", help="Optional subject filter."),
     effort: int = typer.Option(2, "--effort", min=1, max=5, help="Retrieval effort level, 1-5."),
@@ -1271,6 +1274,9 @@ def memory_context(
         {
             "query": query,
             "depth": depth,
+            "retrieval_depth": retrieval_depth,
+            "packet_detail": packet_detail,
+            "disclosure_tier": disclosure_tier,
             "limit": limit,
             "subject": subject,
             "effort": effort,
@@ -1288,19 +1294,26 @@ def memory_context(
         sqlite_path=db_path,
     )
     try:
+        controls = normalize_context_controls(
+            depth=depth,
+            retrieval_depth=retrieval_depth,
+            packet_detail=packet_detail,
+            disclosure_tier=disclosure_tier,
+            effort=effort,
+        )
+        search_limit = min(20, limit * 2) if controls.retrieval_depth == "broad" else limit
         memory_trace.trace("retrieve_candidates", "Retrieving memory context candidates.", details={"query": query})
         result = search_chatgpt_memory(
             memory_dir=config.paths["memory_dir"],
             query=query,
-            limit=limit,
+            limit=search_limit,
             subject=subject,
-            depth=depth,
+            depth=controls.disclosure_tier,
             effort=effort,
             allow_cross_domain=allow_cross_domain,
             debug_min_disclosure_tier=debug_min_disclosure_tier,
             query_embedder=_ollama_embedding_function(config),
         )
-        context_items = compact_context_items(result["results"])
         with sqlite3.connect(db_path) as connection:
             audit = record_retrieval_event(
                 connection,
@@ -1309,15 +1322,19 @@ def memory_context(
                 command="memory-context",
                 filters=result["filters_applied"],
                 ranking_profile=result["ranking_profile"],
-                disclosure_depth=depth,
+                disclosure_depth=controls.disclosure_tier,
                 results=result["results"],
             )
+        context_items = compact_context_items(result["results"][:limit])
         context_packet = build_context_packet(
             query=query,
             retrieval_event_id=audit["retrieval_event_id"],
             search_result=result,
             context_items=context_items,
             requested_depth=depth,
+            retrieval_depth=controls.retrieval_depth,
+            packet_detail=controls.packet_detail,
+            disclosure_tier=controls.disclosure_tier,
         )
         payload = {
             "status": "ok",
@@ -1326,6 +1343,7 @@ def memory_context(
             "context_packet_id": context_packet["context_packet_id"],
             "query": query,
             "depth": depth,
+            "context_controls": controls.to_dict(),
             "ranking_profile": result["ranking_profile"],
             "domain_detection": result["domain_detection"],
             "filters_applied": result["filters_applied"],
@@ -2789,6 +2807,22 @@ def _render_memory_status(payload: dict[str, object]) -> str:
                 "Semantic Embeddings:",
                 f"- status={embedding_coverage.get('status')} coverage={float(embedding_coverage.get('coverage_ratio', 0.0)):.1%} embedded={embedding_coverage.get('embedded_chunks', 0)}/{embedding_coverage.get('total_chunks', 0)} missing={embedding_coverage.get('missing_chunks', 0)} stale={embedding_coverage.get('stale_chunks', 0)}",
                 f"- active_model={model_label}",
+            ]
+        )
+    corpus_freshness = sqlite_info.get("corpus_freshness")
+    if isinstance(corpus_freshness, dict):
+        latest_source_message = corpus_freshness.get("latest_source_message")
+        latest_source_at = None
+        latest_source_title = None
+        if isinstance(latest_source_message, dict):
+            latest_source_at = latest_source_message.get("created_at")
+            latest_source_title = latest_source_message.get("conversation_title")
+        lines.extend(
+            [
+                "Corpus Freshness:",
+                f"- status={corpus_freshness.get('status')} import_lag_days={corpus_freshness.get('import_lag_days')}",
+                f"- latest_source_message={latest_source_at or 'none'} title={latest_source_title or 'none'}",
+                f"- latest_imported_at={corpus_freshness.get('latest_imported_at') or 'none'} latest_import_id={corpus_freshness.get('latest_import_id') or 'none'}",
             ]
         )
     if latest_import:

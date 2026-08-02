@@ -329,9 +329,20 @@ def init_chatgpt_memory_schema(connection: sqlite3.Connection) -> None:
 
 def replace_import(connection: sqlite3.Connection, parsed: ParsedExport) -> None:
     import_id = parsed.import_record["id"]
+    conversation_ids = [str(conversation["id"]) for conversation in parsed.conversations]
     with connection:
         connection.execute("DELETE FROM chatgpt_chunks_fts WHERE import_id = ?", (import_id,))
         connection.execute("DELETE FROM imports WHERE id = ?", (import_id,))
+        if conversation_ids:
+            placeholders = ",".join("?" for _ in conversation_ids)
+            connection.execute(
+                f"DELETE FROM chatgpt_chunks_fts WHERE conversation_id IN ({placeholders})",
+                conversation_ids,
+            )
+            connection.execute(
+                f"DELETE FROM conversations WHERE id IN ({placeholders})",
+                conversation_ids,
+            )
         connection.execute(
             """
             INSERT INTO imports (

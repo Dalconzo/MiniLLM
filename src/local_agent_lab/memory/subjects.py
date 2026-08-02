@@ -55,15 +55,23 @@ class Subject:
 class SubjectSummary:
     subject: Subject
     conversation_count: int
+    explicit_conversation_count: int
+    chunk_conversation_count: int
+    message_count: int
     chunk_count: int
     latest_activity_at: str | None
+    provenance_warnings: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             **self.subject.to_dict(),
             "conversation_count": self.conversation_count,
+            "explicit_conversation_count": self.explicit_conversation_count,
+            "chunk_conversation_count": self.chunk_conversation_count,
+            "message_count": self.message_count,
             "chunk_count": self.chunk_count,
             "latest_activity_at": self.latest_activity_at,
+            "provenance_warnings": self.provenance_warnings,
         }
 
 
@@ -350,20 +358,64 @@ def list_subjects(
             s.created_at,
             s.updated_at,
             s.metadata_json,
-            COUNT(DISTINCT cs.conversation_id) AS conversation_count,
-            COUNT(DISTINCT chs.chunk_id) AS chunk_count,
-            MAX(
-                COALESCE(c.updated_at, c.last_message_at, c.created_at),
-                COALESCE(mc_conv.updated_at, mc_conv.last_message_at, mc_conv.created_at)
+            (
+                SELECT COUNT(DISTINCT conversation_id)
+                FROM (
+                    SELECT cs2.conversation_id AS conversation_id
+                    FROM conversation_subjects cs2
+                    JOIN conversations c2 ON c2.id = cs2.conversation_id AND c2.is_deleted = 0
+                    WHERE cs2.subject_id = s.id
+                    UNION
+                    SELECT mc2.conversation_id AS conversation_id
+                    FROM chunk_subjects chs2
+                    JOIN message_chunks mc2 ON mc2.id = chs2.chunk_id AND mc2.is_deleted = 0
+                    JOIN conversations c3 ON c3.id = mc2.conversation_id AND c3.is_deleted = 0
+                    WHERE chs2.subject_id = s.id
+                )
+            ) AS conversation_count,
+            (
+                SELECT COUNT(DISTINCT cs3.conversation_id)
+                FROM conversation_subjects cs3
+                JOIN conversations c4 ON c4.id = cs3.conversation_id AND c4.is_deleted = 0
+                WHERE cs3.subject_id = s.id
+            ) AS explicit_conversation_count,
+            (
+                SELECT COUNT(DISTINCT mc3.conversation_id)
+                FROM chunk_subjects chs3
+                JOIN message_chunks mc3 ON mc3.id = chs3.chunk_id AND mc3.is_deleted = 0
+                JOIN conversations c5 ON c5.id = mc3.conversation_id AND c5.is_deleted = 0
+                WHERE chs3.subject_id = s.id
+            ) AS chunk_conversation_count,
+            (
+                SELECT COUNT(DISTINCT mc4.message_id)
+                FROM chunk_subjects chs4
+                JOIN message_chunks mc4 ON mc4.id = chs4.chunk_id AND mc4.is_deleted = 0
+                JOIN messages m4 ON m4.id = mc4.message_id AND m4.is_deleted = 0
+                WHERE chs4.subject_id = s.id
+            ) AS message_count,
+            (
+                SELECT COUNT(DISTINCT chs5.chunk_id)
+                FROM chunk_subjects chs5
+                JOIN message_chunks mc5 ON mc5.id = chs5.chunk_id AND mc5.is_deleted = 0
+                WHERE chs5.subject_id = s.id
+            ) AS chunk_count,
+            (
+                SELECT MAX(activity_at)
+                FROM (
+                    SELECT COALESCE(c6.updated_at, c6.last_message_at, c6.created_at) AS activity_at
+                    FROM conversation_subjects cs6
+                    JOIN conversations c6 ON c6.id = cs6.conversation_id AND c6.is_deleted = 0
+                    WHERE cs6.subject_id = s.id
+                    UNION ALL
+                    SELECT COALESCE(c7.updated_at, c7.last_message_at, c7.created_at) AS activity_at
+                    FROM chunk_subjects chs7
+                    JOIN message_chunks mc7 ON mc7.id = chs7.chunk_id AND mc7.is_deleted = 0
+                    JOIN conversations c7 ON c7.id = mc7.conversation_id AND c7.is_deleted = 0
+                    WHERE chs7.subject_id = s.id
+                )
             ) AS latest_activity_at
         FROM subjects s
-        LEFT JOIN conversation_subjects cs ON cs.subject_id = s.id
-        LEFT JOIN conversations c ON c.id = cs.conversation_id AND c.is_deleted = 0
-        LEFT JOIN chunk_subjects chs ON chs.subject_id = s.id
-        LEFT JOIN message_chunks mc ON mc.id = chs.chunk_id AND mc.is_deleted = 0
-        LEFT JOIN conversations mc_conv ON mc_conv.id = mc.conversation_id AND mc_conv.is_deleted = 0
         {where}
-        GROUP BY s.id
         ORDER BY latest_activity_at DESC NULLS LAST, s.kind ASC, s.name COLLATE NOCASE ASC
         {limit_clause}
         """,
@@ -482,12 +534,67 @@ def _subject_from_row(row: sqlite3.Row | tuple[Any, ...]) -> Subject:
 
 
 def _summary_from_row(row: sqlite3.Row | tuple[Any, ...]) -> SubjectSummary:
+    conversation_count = int(row[8] or 0)
+    explicit_conversation_count = int(row[9] or 0)
+    chunk_conversation_count = int(row[10] or 0)
+    message_count = int(row[11] or 0)
+    chunk_count = int(row[12] or 0)
     return SubjectSummary(
         subject=_subject_from_row(row[:8]),
-        conversation_count=int(row[8] or 0),
-        chunk_count=int(row[9] or 0),
-        latest_activity_at=row[10],
+        conversation_count=conversation_count,
+        explicit_conversation_count=explicit_conversation_count,
+        chunk_conversation_count=chunk_conversation_count,
+        message_count=message_count,
+        chunk_count=chunk_count,
+        latest_activity_at=row[13],
+        provenance_warnings=_subject_provenance_warnings(
+            conversation_count=conversation_count,
+            explicit_conversation_count=explicit_conversation_count,
+            chunk_conversation_count=chunk_conversation_count,
+            message_count=message_count,
+            chunk_count=chunk_count,
+        ),
     )
+
+
+def _subject_provenance_warnings(
+    *,
+    conversation_count: int,
+    explicit_conversation_count: int,
+    chunk_conversation_count: int,
+    message_count: int,
+    chunk_count: int,
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if chunk_count > 0 and conversation_count == 0:
+        warnings.append(
+            {
+                "code": "chunk_subject_without_conversation_provenance",
+                "message": "Subject has chunk assignments but no live source conversations.",
+            }
+        )
+    if chunk_count > 0 and explicit_conversation_count == 0:
+        warnings.append(
+            {
+                "code": "chunk_only_subject_assignment",
+                "message": "Subject count comes from chunk-level assignments, not explicit conversation labels.",
+            }
+        )
+    if conversation_count == 1 and chunk_count >= 500:
+        warnings.append(
+            {
+                "code": "single_conversation_concentration",
+                "message": "Subject has many chunks from one conversation; inspect for over-broad assignment.",
+            }
+        )
+    if chunk_count > 0 and message_count == 0:
+        warnings.append(
+            {
+                "code": "chunk_subject_without_message_provenance",
+                "message": "Subject has chunk assignments that do not resolve to live messages.",
+            }
+        )
+    return warnings
 
 
 def _assignment_from_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:

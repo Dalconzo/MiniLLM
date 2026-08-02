@@ -1,13 +1,47 @@
 from __future__ import annotations
 
+import re
+
 from .ontology import validate_domain
 
 
 DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "cooking_baking": ("recipe", "bake", "baking", "cook", "oven", "cake", "dough", "dessert", "sourdough"),
+    "cooking_baking": (
+        "recipe",
+        "bake",
+        "baking",
+        "bread",
+        "cook",
+        "oven",
+        "cake",
+        "dough",
+        "dessert",
+        "feed",
+        "feeding",
+        "ferment",
+        "fermentation",
+        "levain",
+        "proof",
+        "starter",
+        "sourdough",
+    ),
     "lab_automation": ("plate reader", "parser", "csv", "workflow", "pipette", "assay", "robot", "automation", "lab"),
     "career_work": ("job", "interview", "resume", "manager", "career", "work", "promotion", "workflow"),
-    "ai_memory_systems": ("memory", "rag", "embedding", "retrieval", "llm", "ollama", "vector", "subject"),
+    "ai_memory_systems": (
+        "memory",
+        "rag",
+        "embedding",
+        "retrieval",
+        "llm",
+        "ollama",
+        "vector",
+        "subject",
+        "mcp",
+        "json-rpc",
+        "trace",
+        "run id",
+        "run ids",
+    ),
     "finance_investing": ("portfolio", "stock", "market", "invest", "trade", "401k", "ira", "rebalancing", "funds"),
     "health_supplements": ("supplement", "vitamin", "health", "sleep", "dose", "wellness"),
     "relationships_life": ("partner", "friend", "family", "relationship", "dating"),
@@ -81,7 +115,7 @@ def scope_candidate_domains(
         return True, "primary"
 
     if allow_cross_domain:
-        return True, "analogy"
+        return True, "transfer" if _is_adjacent(normalized_query, normalized_candidate) else "analogy"
 
     if effort >= 3:
         if _is_adjacent(normalized_query, normalized_candidate):
@@ -164,9 +198,18 @@ def _detect_domains(text: str) -> list[str]:
     lowered = text.lower()
     detected: list[str] = []
     for domain, keywords in DOMAIN_KEYWORDS.items():
-        if any(keyword in lowered for keyword in keywords):
+        if any(_contains_keyword(lowered, keyword) for keyword in keywords):
             detected.append(validate_domain(domain))
     return detected
+
+
+def _contains_keyword(text: str, keyword: str) -> bool:
+    normalized_keyword = keyword.lower().strip()
+    if not normalized_keyword:
+        return False
+    if " " in normalized_keyword:
+        return normalized_keyword in text
+    return re.search(rf"(?<![a-z0-9_]){re.escape(normalized_keyword)}(?![a-z0-9_])", text) is not None
 
 
 def _is_adjacent(query_domains: list[str], candidate_domains: list[str]) -> bool:

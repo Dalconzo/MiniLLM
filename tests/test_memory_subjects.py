@@ -194,8 +194,12 @@ def test_assign_chunk_subject_counts_chunk_without_conversation_assignment(memor
 
     summaries = list_subjects(memory_connection, kind="project")
     assert summaries[0].subject.slug == "parser-implementation"
-    assert summaries[0].conversation_count == 0
+    assert summaries[0].conversation_count == 1
+    assert summaries[0].explicit_conversation_count == 0
+    assert summaries[0].chunk_conversation_count == 1
+    assert summaries[0].message_count == 1
     assert summaries[0].chunk_count == 1
+    assert [warning["code"] for warning in summaries[0].provenance_warnings] == ["chunk_only_subject_assignment"]
 
 
 def test_remove_conversation_subject_can_remove_chunk_assignments(memory_connection) -> None:

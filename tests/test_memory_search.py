@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
-from local_agent_lab.memory.context_packet import build_context_packet, compact_context_items
+from local_agent_lab.memory.context_packet import build_context_packet, compact_context_items, normalize_context_controls
 from local_agent_lab.memory.curated import create_memory_record, promote_chunk_to_memory_record
 from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec, ollama_model_spec
 from local_agent_lab.memory.observability import MemoryObservationError
@@ -138,6 +138,58 @@ def test_context_packet_v2_separates_evidence_belief_and_provenance(tmp_path) ->
         "provenance",
     }
     assert all("source_ids" in item and "epistemic_status" in item for item in packet["relevant_preferences"])
+
+
+def test_context_controls_separate_retrieval_packet_and_disclosure_depth() -> None:
+    controls = normalize_context_controls(
+        depth="medium",
+        retrieval_depth="broad",
+        packet_detail="complete",
+        disclosure_tier="far",
+        effort=2,
+    )
+
+    assert controls.retrieval_depth == "broad"
+    assert controls.packet_detail == "complete"
+    assert controls.disclosure_tier == "far"
+    assert controls.legacy_depth_alias is False
+
+
+def test_context_packet_classifies_slots_and_does_not_duplicate_uncertainty() -> None:
+    packet = build_context_packet(
+        query="starter tracking",
+        retrieval_event_id="ret_slots",
+        search_result={"ranking_profile": "test", "candidate_counts": {}, "filters_applied": []},
+        context_items=[
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_user_outcome",
+                "title": "Starter log",
+                "snippet": "Starter rose 75 percent, then fell after peak.",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_assistant",
+                "title": "Starter advice",
+                "snippet": "Assistant suggested waiting until the starter doubled.",
+                "source_role": "assistant",
+                "epistemic_status": "assistant_suggested",
+            },
+        ],
+        requested_depth="medium",
+        retrieval_depth="broad",
+        packet_detail="complete",
+        disclosure_tier="medium",
+    )
+
+    assert packet["task"]["retrieval_depth"] == "broad"
+    assert packet["task"]["packet_detail"] == "complete"
+    assert packet["task"]["disclosure_tier"] == "medium"
+    assert packet["relevant_outcomes"][0]["source_ids"] == ["src_user_outcome"]
+    assert [item["source_ids"] for item in packet["uncertainty"]] == [["src_assistant"]]
+    assert any(note["category"] == "empty_context_slots" for note in packet["omitted_but_available"])
 
 
 def test_search_chatgpt_memory_falls_back_for_natural_language_queries(tmp_path) -> None:
@@ -403,9 +455,9 @@ def test_search_chatgpt_memory_demotes_irrelevant_smoke_test_curated_records(tmp
     )
 
     ids = [item.get("memory_record_id") for item in result["results"] if item["source_kind"] == "curated_memory"]
-    assert ids.index(relevant.id) < ids.index(smoke.id)
-    smoke_result = next(item for item in result["results"] if item.get("memory_record_id") == smoke.id)
-    assert smoke_result["score_breakdown"]["components"]["spam_penalty"]["value"] == 1.0
+    assert relevant.id in ids
+    assert smoke.id not in ids
+    assert result["candidate_counts"]["relevance_filtered"] >= 1
 
 
 def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path) -> None:
@@ -510,13 +562,21 @@ def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path)
             ),
         )
         connection.commit()
-        embed_missing_chunks(connection, spec=fallback_model_spec(dimension=32))
+        embed_missing_chunks(
+            connection,
+            spec=ollama_model_spec(model="test-semantic", dimension=32, host="http://127.0.0.1:11434"),
+            embedder=lambda _text, _dimension: [1.0] + [0.0] * 31,
+        )
 
-    lexical = search_chatgpt_memory(memory_dir=memory_dir, query="leavened loaf proving schedule")
+    lexical = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="leavened loaf proving schedule",
+        query_embedder=lambda _text, _dimension: [1.0] + [0.0] * 31,
+    )
     assert lexical["candidate_counts"]["fts"] == 0
     assert lexical["candidate_counts"]["vector"] == 1
     assert lexical["results"][0]["chunk_id"] == "chk_baking"
-    assert lexical["results"][0]["score_breakdown"]["components"]["semantic_similarity"]["value"] > 0
+    assert lexical["results"][0]["score_breakdown"]["components"]["semantic_similarity"]["value"] >= 0.58
     assert lexical["results"][0]["retrieval_sources"] == ["vector"]
 
 
@@ -591,7 +651,8 @@ def test_search_chatgpt_memory_subject_filter_resolves_known_aliases(tmp_path) -
 
     result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="Memory System")
 
-    assert result["count"] == 2
+    assert result["count"] == 0
+    assert result["candidate_counts"]["domain_filtered"] == 2
     assert result["filters_applied"] == [
         {
             "field": "subject",
@@ -600,6 +661,124 @@ def test_search_chatgpt_memory_subject_filter_resolves_known_aliases(tmp_path) -
             "alias_target": "AI Memory and Local LLMs",
         }
     ]
+
+
+def test_search_chatgpt_memory_returns_no_reliable_results_for_weak_curated_subject_match(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Recipe card standard",
+            body="Keep recipe notes compact and separate confirmed facts from drafts.",
+            subject_id=subject.id,
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="qzvorn 9472 xenolith checksum gasket",
+        subject="Recipes and Baking",
+    )
+
+    assert result["status"] == "ok"
+    assert result["result_quality"] == "no_reliable_results"
+    assert result["count"] == 0
+    assert result["candidate_counts"]["curated"] == 1
+    assert result["candidate_counts"]["relevance_filtered"] == 1
+
+
+def test_search_chatgpt_memory_blocks_wrong_domain_subject_leak_when_cross_domain_disabled(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_bad_domain",
+            message_id="msg_bad_domain",
+            chunk_id="chk_bad_domain",
+            title="AI Automation Micro-Business",
+            role="assistant",
+            text="Project preferences, available time, and desired difficulty for a lab automation workflow.",
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_good_domain",
+            message_id="msg_good_domain",
+            chunk_id="chk_good_domain",
+            title="Baking Project Planning",
+            role="user",
+            text="For baking project preferences, I want ambitious cake and bread work scaled to available time.",
+        )
+        assign_conversation_subject(connection, "conv_bad_domain", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(connection, "conv_good_domain", "Recipes and Baking", include_chunks=True)
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="baking project preferences available time desired difficulty",
+        subject="Recipes and Baking",
+        allow_cross_domain=False,
+        depth="full",
+    )
+
+    assert [item["chunk_id"] for item in result["results"]] == ["chk_good_domain"]
+    assert result["candidate_counts"]["domain_filtered"] >= 1
+    assert result["results"][0]["domain_primary"] == "cooking_baking"
+
+
+def test_search_chatgpt_memory_applies_default_message_and_conversation_diversity_caps(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        for index in range(5):
+            _insert_chunk(
+                connection,
+                import_id=import_id,
+                conversation_id="conv_long_doc",
+                message_id="msg_long_doc",
+                chunk_id=f"chk_long_doc_{index}",
+                title="Top Tier Sourdough Recipe",
+                role="assistant",
+                text=f"Sourdough starter feeding rise fermentation timing note {index}.",
+                chunk_index=index,
+            )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_second_doc",
+            message_id="msg_second_doc",
+            chunk_id="chk_second_doc",
+            title="Starter Tracking Note",
+            role="user",
+            text="My sourdough starter feeding rise timing should be tracked separately.",
+        )
+
+    default = search_chatgpt_memory(memory_dir=memory_dir, query="sourdough starter feeding rise timing", limit=6)
+    default_long_doc = [item for item in default["results"] if item["message_id"] == "msg_long_doc"]
+    assert len(default_long_doc) == 2
+    assert any(item["chunk_id"] == "chk_second_doc" for item in default["results"])
+    assert default["candidate_counts"]["diversity_filtered"] >= 3
+
+    document = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="sourdough starter feeding rise timing",
+        limit=6,
+        title="Top Tier Sourdough Recipe",
+        document_mode=True,
+    )
+    assert [item["chunk_id"] for item in document["results"]] == [f"chk_long_doc_{index}" for index in range(5)]
+    assert document["candidate_counts"]["diversity_filtered"] == 0
 
 
 def test_search_chatgpt_memory_debug_min_disclosure_tier_exposes_snippets(tmp_path) -> None:
@@ -700,3 +879,98 @@ def test_search_chatgpt_memory_errors_when_database_missing(tmp_path) -> None:
 
     assert exc_info.value.stage == "retrieve_candidates"
     assert exc_info.value.error_code == "memory_database_not_found"
+
+
+def _insert_chunk(
+    connection: sqlite3.Connection,
+    *,
+    import_id: str,
+    conversation_id: str,
+    message_id: str,
+    chunk_id: str,
+    title: str,
+    role: str,
+    text: str,
+    chunk_index: int = 0,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO conversations (
+            id, import_id, source_conversation_id, title, created_at, updated_at,
+            message_count, first_message_at, last_message_at, summary, content_sha256,
+            is_deleted, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            conversation_id,
+            import_id,
+            conversation_id,
+            title,
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            1,
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            None,
+            f"hash-{conversation_id}",
+            "{}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO messages (
+            id, conversation_id, import_id, source_message_id, parent_message_id, role,
+            author_name, turn_index, created_at, content_text, content_sha256,
+            token_estimate, attachment_count, is_deleted, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+        """,
+        (
+            message_id,
+            conversation_id,
+            import_id,
+            message_id,
+            None,
+            role,
+            None,
+            0,
+            "2026-07-01T00:00:00Z",
+            text,
+            f"hash-{message_id}",
+            len(text.split()),
+            "{}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO message_chunks (
+            id, message_id, conversation_id, import_id, chunk_index, text,
+            text_sha256, token_estimate, start_char, end_char, source_kind, summary,
+            is_deleted, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            chunk_id,
+            message_id,
+            conversation_id,
+            import_id,
+            chunk_index,
+            text,
+            f"hash-{chunk_id}",
+            len(text.split()),
+            0,
+            len(text),
+            "chatgpt_export",
+            None,
+            "{}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO chatgpt_chunks_fts(title, role, text, import_id, conversation_id, message_id, chunk_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (title, role, text, import_id, conversation_id, message_id, chunk_id),
+    )

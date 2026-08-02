@@ -1021,10 +1021,10 @@ class HomeMCPServer:
             tags_lower = " ".join(card_tags).lower()
             path_lower = str(path.relative_to(root.path)).lower()
             body_lower = body_text.lower()
-            phrase_in_title = bool(normalized_query and normalized_query in title_lower)
-            phrase_in_path = bool(normalized_query and normalized_query in path_lower)
-            phrase_in_tags = bool(normalized_query and normalized_query in tags_lower)
-            phrase_in_body = bool(normalized_query and normalized_query in body_lower)
+            phrase_in_title = bool(normalized_query and _loose_phrase_contains(title_lower, normalized_query))
+            phrase_in_path = bool(normalized_query and _loose_phrase_contains(path_lower, normalized_query))
+            phrase_in_tags = bool(normalized_query and _loose_phrase_contains(tags_lower, normalized_query))
+            phrase_in_body = bool(normalized_query and _loose_phrase_contains(body_lower, normalized_query))
             if normalized_query:
                 term_coverage = (len(matched_terms) / len(query_terms)) if query_terms else 0.0
                 score += term_coverage * 2.0
@@ -3004,6 +3004,14 @@ def _make_snippet(text: str, term: str, width: int = 220) -> str:
     if end < len(text):
         snippet = snippet + "..."
     return snippet
+
+
+def _loose_phrase_contains(text: str, phrase: str) -> bool:
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    normalized_phrase = re.sub(r"[^a-z0-9]+", " ", phrase.lower()).strip()
+    if not normalized_phrase:
+        return False
+    return f" {normalized_phrase} " in f" {normalized_text} "
 
 
 def _extract_recipe_attempts(body: str) -> list[dict[str, Any]]:

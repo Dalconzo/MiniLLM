@@ -396,7 +396,7 @@ def test_home_mcp_recipe_search_boosts_exact_title_phrase_over_weak_cooccurrence
         tags=["dessert"],
     )
     exact = server.create_recipe_card(
-        title="Miso Butter Roast Bowl",
+        title="Miso-Butter Roast Bowl",
         ingredients=["miso", "butter", "rice"],
         steps=["Roast vegetables.", "Serve with miso butter."],
         tags=["bowl"],

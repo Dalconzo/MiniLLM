@@ -831,6 +831,10 @@ def _reject_high_signal_review_candidate(candidate: CandidateMemory, *, subject_
     word_count = len(_dedupe_tokens(content))
     if _is_context_dependent_fragment(lowered, word_count=word_count):
         return True
+    if _is_image_dependent_fragment(lowered):
+        return True
+    if _is_transient_procedural_question(candidate, lowered, word_count=word_count):
+        return True
     if candidate.memory_type == "procedure" and "?" in content and word_count <= 24:
         return True
     if _is_subject_incidental_match(candidate, subject_name=subject_name):
@@ -865,6 +869,38 @@ def _is_context_dependent_fragment(lowered_content: str, *, word_count: int) -> 
     if word_count <= 20 and _matches(stripped, r"\b(enough|too much|too little|right amount|like this|this okay)\??$"):
         return True
     return False
+
+
+def _is_image_dependent_fragment(lowered_content: str) -> bool:
+    return any(
+        marker in lowered_content
+        for marker in (
+            "like this?",
+            "look like this",
+            "does this look",
+            "from the picture",
+            "in the image",
+            "in this photo",
+            "see the attached",
+            "attached image",
+        )
+    )
+
+
+def _is_transient_procedural_question(candidate: CandidateMemory, lowered_content: str, *, word_count: int) -> bool:
+    if "?" not in lowered_content:
+        return False
+    if candidate.memory_type not in {"procedure", "episodic"}:
+        return False
+    durable_terms = ("always", "usually", "prefer", "avoid", "next time", "worked", "failed", "repeat")
+    if any(term in lowered_content for term in durable_terms):
+        return False
+    if word_count <= 32:
+        return True
+    return _matches(
+        lowered_content,
+        r"\b(cut|slice|chop|fill|mix|bake|cook|roast|proof|prove|knead|fold)\b.*\?",
+    )
 
 
 def _is_subject_incidental_match(candidate: CandidateMemory, *, subject_name: str | None) -> bool:

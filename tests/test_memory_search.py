@@ -368,6 +368,46 @@ def test_search_chatgpt_memory_canonical_curated_records_outrank_weak_raw_chunks
     assert result["results"][0]["score_breakdown"]["components"]["curated_trust"]["value"] == 1.0
 
 
+def test_search_chatgpt_memory_demotes_irrelevant_smoke_test_curated_records(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        relevant = create_memory_record(
+            connection,
+            record_type="preference",
+            title="Starter feeding cadence",
+            body="Track starter rise timing after feeding and use that record to plan sourdough bakes.",
+            subject_id=subject.id,
+            trust_level="canonical",
+            source_kind="manual",
+            source_ref="starter-note",
+        )
+        smoke = create_memory_record(
+            connection,
+            record_type="research_note",
+            title="Smoke Test Focaccia",
+            body="Disposable browser smoke-test recipe record.",
+            subject_id=subject.id,
+            trust_level="canonical",
+            source_kind="manual",
+            source_ref="browser-smoke-test",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise timing after feeding",
+        subject="Recipes and Baking",
+        depth="full",
+    )
+
+    ids = [item.get("memory_record_id") for item in result["results"] if item["source_kind"] == "curated_memory"]
+    assert ids.index(relevant.id) < ids.index(smoke.id)
+    smoke_result = next(item for item in result["results"] if item.get("memory_record_id") == smoke.id)
+    assert smoke_result["score_breakdown"]["components"]["spam_penalty"]["value"] == 1.0
+
+
 def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path) -> None:
     data_dir = tmp_path / "data"
     memory_dir = data_dir / "memory"

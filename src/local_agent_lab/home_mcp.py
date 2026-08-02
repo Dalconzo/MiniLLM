@@ -1013,21 +1013,35 @@ class HomeMCPServer:
             elif isinstance(nested_metadata.get("recipe_card"), dict):
                 schema_version = nested_metadata["recipe_card"].get("schema_version")
             combined_text = " ".join([title, " ".join(card_tags), body_text, str(metadata.get("kind", "")), card_summary]).lower()
-            matched_terms = [term for term in re.split(r"\s+", normalized_query) if term] if normalized_query else []
+            query_terms = [term for term in re.split(r"\s+", normalized_query) if term] if normalized_query else []
+            matched_terms = list(dict.fromkeys(term for term in query_terms if term in combined_text))
             matched_terms = [term for term in matched_terms if term in combined_text]
             if normalized_query and not matched_terms and normalized_query not in combined_text:
                 continue
             score = 0.0
+            title_lower = title.lower()
+            tags_lower = " ".join(card_tags).lower()
+            path_lower = str(path.relative_to(root.path)).lower()
+            body_lower = body_text.lower()
+            phrase_in_title = bool(normalized_query and normalized_query in title_lower)
+            phrase_in_path = bool(normalized_query and normalized_query in path_lower)
+            phrase_in_tags = bool(normalized_query and normalized_query in tags_lower)
+            phrase_in_body = bool(normalized_query and normalized_query in body_lower)
             if normalized_query:
-                score += len(matched_terms)
-                if normalized_query in title.lower():
+                term_coverage = (len(matched_terms) / len(query_terms)) if query_terms else 0.0
+                score += term_coverage * 2.0
+                if phrase_in_title:
+                    score += 12
+                elif all(term in title_lower for term in query_terms):
+                    score += 5
+                if phrase_in_path:
                     score += 4
-                if normalized_query in " ".join(card_tags).lower():
-                    score += 2
-                if normalized_query in body_text.lower():
-                    score += 1
-                if normalized_query in str(path.relative_to(root.path)).lower():
-                    score += 1
+                if phrase_in_tags:
+                    score += 3
+                if phrase_in_body:
+                    score += 1.5
+                elif all(term in body_lower for term in query_terms):
+                    score += 0.75
             else:
                 try:
                     score += path.stat().st_mtime / 1_000_000_000
@@ -1053,8 +1067,16 @@ class HomeMCPServer:
                     "recipe_summary": recipe_structure["summary"],
                     "schema_version": schema_version,
                     "score": round(score, 3),
-                    "match_reason": "title" if normalized_query and normalized_query in title.lower() else "content" if normalized_query else "recent",
+                    "match_reason": "title_phrase" if phrase_in_title else "title_terms" if normalized_query and all(term in title_lower for term in query_terms) else "path_phrase" if phrase_in_path else "tag_phrase" if phrase_in_tags else "content" if normalized_query else "recent",
                     "matched_terms": matched_terms,
+                    "score_breakdown": {
+                        "query_terms": query_terms,
+                        "term_coverage": round((len(matched_terms) / len(query_terms)) if query_terms else 0.0, 3),
+                        "phrase_in_title": phrase_in_title,
+                        "phrase_in_path": phrase_in_path,
+                        "phrase_in_tags": phrase_in_tags,
+                        "phrase_in_body": phrase_in_body,
+                    },
                     "snippet": _make_snippet(snippet_source, snippet_term),
                 }
             )
@@ -1464,6 +1486,7 @@ class HomeMCPServer:
             "governance": result["governance"],
             "lenses": result["lenses"],
             "candidate_counts": result["candidate_counts"],
+            "trace_diagnostics": result.get("trace_diagnostics", []),
             "context_items": context_items,
             "context_packet": context_packet,
         }
@@ -2134,6 +2157,7 @@ class HomeMCPServer:
                     raise HomeMCPError("tool name is required", stage="tools/call", error_code="missing_tool_name")
                 trace.trace("call_tool", "Dispatching tool call.", details={"tool": tool_name})
                 result = self.call_tool(str(tool_name), dict(arguments), run_id=run.run_id)
+                self._trace_tool_diagnostics(trace, tool_name=str(tool_name), result=result)
                 result.setdefault("run_id", run.run_id)
                 result.setdefault("trace_id", run.run_id)
                 result.setdefault("trace_artifact_dir", str(run.run_dir))
@@ -2425,6 +2449,39 @@ class HomeMCPServer:
                 subject_kind=str(arguments["subject_kind"]) if arguments.get("subject_kind") else "subject",
             )
         raise HomeMCPError(f"unsupported tool: {name}", stage="tools/call", error_code="unsupported_tool", source_ref=name)
+
+    def _trace_tool_diagnostics(self, trace: HomeMCPTraceWriter, *, tool_name: str, result: dict[str, Any]) -> None:
+        if tool_name not in {"memory_search", "memory_context"}:
+            return
+        diagnostics = result.get("trace_diagnostics")
+        if isinstance(diagnostics, list):
+            for event in diagnostics:
+                if not isinstance(event, dict):
+                    continue
+                stage = str(event.get("stage") or "memory_diagnostic")
+                message = str(event.get("message") or "Memory diagnostic stage.")
+                details = event.get("details") if isinstance(event.get("details"), dict) else {}
+                trace.trace(stage, message, details=details)
+        if tool_name == "memory_context":
+            trace.trace(
+                "record_retrieval_event",
+                "Recorded retrieval audit event.",
+                details={
+                    "retrieval_event_id": result.get("retrieval_event_id"),
+                    "result_count": len(result.get("context_items", [])) if isinstance(result.get("context_items"), list) else 0,
+                },
+            )
+            trace.trace(
+                "compile_context_packet",
+                "Compiled versioned context packet.",
+                details={
+                    "context_packet_id": result.get("context_packet_id"),
+                    "requested_depth": result.get("depth"),
+                    "packet_depth": (result.get("context_packet") or {}).get("task", {}).get("depth")
+                    if isinstance(result.get("context_packet"), dict)
+                    else None,
+                },
+            )
 
     def _resolve_file_reference(
         self,

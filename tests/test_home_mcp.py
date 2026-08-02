@@ -384,6 +384,32 @@ def test_home_mcp_searches_recipe_cards_and_exposes_aliases(tmp_path) -> None:
     assert rpc_call["result"]["structuredContent"]["count"] == 1
 
 
+def test_home_mcp_recipe_search_boosts_exact_title_phrase_over_weak_cooccurrence(tmp_path) -> None:
+    config_path = _write_config(tmp_path)
+    config = load_config(config_path)
+    server = build_home_mcp_server(config)
+
+    exact = server.create_recipe_card(
+        title="Miso Butter Roast Bowl",
+        ingredients=["miso", "butter", "rice"],
+        steps=["Roast vegetables.", "Serve with miso butter."],
+        tags=["bowl"],
+    )
+    weak = server.create_recipe_card(
+        title="Peach Crumble Cobbler",
+        ingredients=["peaches", "butter", "miso caramel"],
+        steps=["Bake until bubbling."],
+        tags=["dessert"],
+    )
+
+    result = server.search_recipes(query="miso butter", limit=10)
+
+    assert result["results"][0]["file_id"] == exact["file_id"]
+    assert result["results"][0]["match_reason"] == "title_phrase"
+    weak_result = next(item for item in result["results"] if item["file_id"] == weak["file_id"])
+    assert result["results"][0]["score"] > weak_result["score"]
+
+
 def test_home_mcp_note_discovery_recipe_lookup_and_attempt_comparison(tmp_path) -> None:
     config_path = _write_config(tmp_path)
     config = load_config(config_path)
@@ -757,6 +783,21 @@ def test_home_mcp_exposes_memory_tools_and_recipe_bridge(tmp_path) -> None:
     assert trace_content["status"] == "ok"
     assert trace_content["run_id"] == structured["run_id"]
     assert trace_content["tool_name"] == "memory_trace"
+    trace_stages = {event["stage"] for event in trace_content["trace_events"]}
+    assert {
+        "subject_resolution",
+        "domain_detection",
+        "retrieval_sources",
+        "apply_filters",
+        "rank_results",
+        "apply_disclosure",
+        "record_retrieval_event",
+        "compile_context_packet",
+    } <= trace_stages
+    ranking_event = next(event for event in trace_content["trace_events"] if event["stage"] == "rank_results")
+    assert ranking_event["details"]["ranking_profile"] == "hybrid_memory_v1"
+    assert ranking_event["details"]["returned"] >= 1
+    assert "snippet" not in json.dumps(ranking_event["details"]).lower()
 
     feedback_response = server.dispatch_jsonrpc(
         {
@@ -850,6 +891,8 @@ def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) ->
         for candidate_id, source_role, memory_type, confidence, assistant_suggestion, domain, domains, content in [
             ("cand_contextless", "user", "procedure", 0.9, 0, "cooking_baking", ["cooking_baking"], "do it"),
             ("cand_question", "user", "procedure", 0.91, 0, "cooking_baking", ["cooking_baking"], "Is this enough filling for the cake?"),
+            ("cand_image", "user", "procedure", 0.91, 0, "cooking_baking", ["cooking_baking"], "Does this look proofed enough in the image?"),
+            ("cand_pepper", "user", "procedure", 0.91, 0, "cooking_baking", ["cooking_baking"], "Should I cut the peppers into strips or dice?"),
             (
                 "cand_duplicate",
                 "user",
@@ -941,6 +984,8 @@ def test_home_mcp_subject_review_defaults_to_high_signal_candidates(tmp_path) ->
         seed["candidate_id"],
         "cand_contextless",
         "cand_question",
+        "cand_image",
+        "cand_pepper",
         "cand_duplicate",
         "cand_incidental",
         "cand_assistant",

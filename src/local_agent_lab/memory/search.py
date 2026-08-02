@@ -234,6 +234,8 @@ def search_chatgpt_memory(
 
         retrieved_results = _merge_retrieval_hits(fts_results, vector_results)
         scoped_results = []
+        domain_filtered_count = 0
+        governance_filtered_count = 0
         for hit in [*retrieved_results, *curated_results]:
             hit_domains = classify_text_domains(
                 hit.get("title"),
@@ -248,6 +250,7 @@ def search_chatgpt_memory(
                 allow_cross_domain=allow_cross_domain,
             )
             if not allowed:
+                domain_filtered_count += 1
                 continue
             governance_allowed, governance_reason, governance_labels = apply_governance_policy(
                 query_domains,
@@ -260,6 +263,7 @@ def search_chatgpt_memory(
                 domain_relation=relation,
             )
             if not governance_allowed:
+                governance_filtered_count += 1
                 continue
             scoped_hit = dict(hit)
             scoped_hit["domains"] = hit_domains
@@ -271,12 +275,41 @@ def search_chatgpt_memory(
             scoped_results.append(scoped_hit)
 
         effective_depth = _effort_depth_cap(depth, effort)
-        results = rank_memory_hits(scoped_results, depth=effective_depth)[:limit]
+        ranked_results = rank_memory_hits(scoped_results, depth=effective_depth)
+        results = ranked_results[:limit]
         if debug_min_disclosure_tier:
             results = [_force_min_disclosure_tier(result, debug_min_disclosure_tier) for result in results]
         results = [_project_hit_for_depth(result) for result in results]
         lenses = select_lenses_for_query(query_domains, effort)
         results = [_attach_effort_checks(result, effort=effort, query=query, query_domains=query_domains) for result in results]
+        candidate_counts = {
+            "fts": len(fts_results),
+            "vector": len(vector_results),
+            "curated": len(curated_results),
+            "merged": len(retrieved_results),
+            "before_domain_governance": len(retrieved_results) + len(curated_results),
+            "domain_filtered": domain_filtered_count,
+            "governance_filtered": governance_filtered_count,
+            "scoped": len(scoped_results),
+            "ranked": len(ranked_results),
+            "after_filters": len(results),
+        }
+        trace_diagnostics = _search_trace_diagnostics(
+            query=query,
+            requested_subject=subject,
+            resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
+            subject_alias_target=subject_alias_target,
+            query_domains=query_domains,
+            fts_strategy=fts_strategy,
+            requested_depth=depth,
+            effective_depth=effective_depth,
+            effort=effort,
+            allow_cross_domain=allow_cross_domain,
+            filters_applied=filters_applied,
+            candidate_counts=candidate_counts,
+            debug_min_disclosure_tier=debug_min_disclosure_tier,
+            results=results,
+        )
         return {
             "status": "ok",
             "query": query,
@@ -295,20 +328,16 @@ def search_chatgpt_memory(
                 "labels": high_risk_lenses(query_domains),
                 "policy": "conservative_high_risk_v1" if high_risk_domains(query_domains) else "standard_v1",
             },
-            "candidate_counts": {
-                "fts": len(fts_results),
-                "vector": len(vector_results),
-                "curated": len(curated_results),
-                "after_filters": len(results),
-        },
-        "filters_applied": filters_applied,
-        "debug_disclosure": {
-            "min_tier": debug_min_disclosure_tier,
-            "policy": "debug_only" if debug_min_disclosure_tier else None,
-        },
-        "results": results,
-        "count": len(results),
-    }
+            "candidate_counts": candidate_counts,
+            "filters_applied": filters_applied,
+            "debug_disclosure": {
+                "min_tier": debug_min_disclosure_tier,
+                "policy": "debug_only" if debug_min_disclosure_tier else None,
+            },
+            "trace_diagnostics": trace_diagnostics,
+            "results": results,
+            "count": len(results),
+        }
 
 
 def _vector_hits(
@@ -658,6 +687,7 @@ def _curated_hits(
         source_refs = _curated_source_refs(connection, str(row[0]))
         provenance = _safe_json_loads(str(row[8] or "{}"))
         subject_name = _curated_subject_name(connection, str(row[4]) if row[4] else None)
+        spam_penalty = 1.0 if _is_low_value_curated_record(title=str(row[2] or ""), body=str(row[3] or ""), source_ref=str(row[7] or "")) else 0.0
         hits.append(
             {
                 "rank": index,
@@ -694,6 +724,7 @@ def _curated_hits(
                 "snippet": redacted.text,
                 "redacted_secret_count": redacted.redacted_count,
                 "curated_trust": trust_scores.get(trust_level, 0.5),
+                "spam_penalty": spam_penalty,
                 "curated_subject_id": row[4],
                 "subject_name": subject_name,
                 "curated_source_kind": row[6],
@@ -755,8 +786,17 @@ def _curated_keyword_relevance(tokens: list[str], *, title: str, body: str) -> f
         return 0.0
     matched = sum(1 for token in tokens if token.lower() in searchable)
     if matched == 0:
-        return 0.15
-    return min(1.0, 0.35 + (matched / len(tokens)) * 0.65)
+        return 0.0
+    joined = " ".join(token.lower() for token in tokens)
+    title_lower = title.lower()
+    phrase_boost = 0.2 if joined and joined in title_lower else 0.1 if joined and joined in searchable else 0.0
+    title_boost = 0.15 if any(token.lower() in title_lower for token in tokens) else 0.0
+    return min(1.0, 0.25 + (matched / len(tokens)) * 0.55 + phrase_boost + title_boost)
+
+
+def _is_low_value_curated_record(*, title: str, body: str, source_ref: str) -> bool:
+    text = f"{title} {body} {source_ref}".lower()
+    return any(marker in text for marker in ("smoke-test", "smoke test", "browser-smoke", "test focaccia"))
 
 
 def _curated_source_refs(connection: sqlite3.Connection, record_id: str) -> list[dict[str, Any]]:
@@ -802,20 +842,153 @@ def _safe_json_loads(value: str) -> dict[str, Any]:
 
 
 def _empty_result(*, query: str, ranking_profile: str, filters_applied: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_counts = {
+        "fts": 0,
+        "vector": 0,
+        "curated": 0,
+        "merged": 0,
+        "before_domain_governance": 0,
+        "domain_filtered": 0,
+        "governance_filtered": 0,
+        "scoped": 0,
+        "ranked": 0,
+        "after_filters": 0,
+    }
     return {
         "status": "ok",
         "query": query,
         "ranking_profile": ranking_profile,
-        "candidate_counts": {
-            "fts": 0,
-            "vector": 0,
-            "curated": 0,
-            "after_filters": 0,
-        },
+        "candidate_counts": candidate_counts,
         "filters_applied": filters_applied,
+        "trace_diagnostics": _search_trace_diagnostics(
+            query=query,
+            requested_subject=None,
+            resolved_subject_name=None,
+            subject_alias_target=None,
+            query_domains=detect_query_domains(query),
+            fts_strategy="not_run",
+            requested_depth="medium",
+            effective_depth="medium",
+            effort=2,
+            allow_cross_domain=False,
+            filters_applied=filters_applied,
+            candidate_counts=candidate_counts,
+            debug_min_disclosure_tier=None,
+            results=[],
+        ),
         "results": [],
         "count": 0,
     }
+
+
+def _search_trace_diagnostics(
+    *,
+    query: str,
+    requested_subject: str | None,
+    resolved_subject_name: str | None,
+    subject_alias_target: str | None,
+    query_domains: list[str],
+    fts_strategy: str,
+    requested_depth: str,
+    effective_depth: str,
+    effort: int,
+    allow_cross_domain: bool,
+    filters_applied: list[dict[str, Any]],
+    candidate_counts: dict[str, int],
+    debug_min_disclosure_tier: str | None,
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    top_results = []
+    for item in results[:5]:
+        score_breakdown = item.get("score_breakdown") if isinstance(item.get("score_breakdown"), dict) else {}
+        top_results.append(
+            {
+                "rank": item.get("rank"),
+                "source_kind": item.get("source_kind"),
+                "source_id": item.get("source_id") or item.get("memory_record_id") or item.get("chunk_id"),
+                "title": item.get("title"),
+                "score": item.get("score"),
+                "retrieval_sources": item.get("retrieval_sources", []),
+                "domain_primary": item.get("domain_primary"),
+                "domain_relation": item.get("domain_relation"),
+                "disclosure_tier": item.get("disclosure_tier"),
+                "score_components": score_breakdown.get("components", {}),
+            }
+        )
+    return [
+        {
+            "stage": "subject_resolution",
+            "message": "Resolved requested memory subject.",
+            "details": {
+                "requested_subject": requested_subject,
+                "resolved_subject": resolved_subject_name,
+                "alias_target": subject_alias_target,
+                "subject_filter_active": bool(requested_subject),
+            },
+        },
+        {
+            "stage": "domain_detection",
+            "message": "Detected query domains and governance scope.",
+            "details": {
+                "primary_domain": dominant_domain(query_domains),
+                "domains": query_domains,
+                "effort": effort,
+                "allow_cross_domain": allow_cross_domain,
+            },
+        },
+        {
+            "stage": "retrieval_sources",
+            "message": "Collected raw retrieval candidates.",
+            "details": {
+                "fts_strategy": fts_strategy,
+                "counts": {
+                    "fts": candidate_counts.get("fts", 0),
+                    "vector": candidate_counts.get("vector", 0),
+                    "curated": candidate_counts.get("curated", 0),
+                    "merged": candidate_counts.get("merged", 0),
+                },
+            },
+        },
+        {
+            "stage": "apply_filters",
+            "message": "Applied explicit filters, domain scope, and governance policy.",
+            "details": {
+                "filters_applied": filters_applied,
+                "before_domain_governance": candidate_counts.get("before_domain_governance", 0),
+                "domain_filtered": candidate_counts.get("domain_filtered", 0),
+                "governance_filtered": candidate_counts.get("governance_filtered", 0),
+                "scoped": candidate_counts.get("scoped", 0),
+            },
+        },
+        {
+            "stage": "rank_results",
+            "message": "Ranked memory results with inspectable score components.",
+            "details": {
+                "ranking_profile": "hybrid_memory_v1",
+                "ranked": candidate_counts.get("ranked", 0),
+                "returned": candidate_counts.get("after_filters", 0),
+                "top_results": top_results,
+            },
+        },
+        {
+            "stage": "apply_disclosure",
+            "message": "Projected results to the allowed disclosure tier.",
+            "details": {
+                "requested_depth": requested_depth,
+                "effective_depth": effective_depth,
+                "debug_min_disclosure_tier": debug_min_disclosure_tier,
+                "tiers": _tier_counts(results),
+            },
+        },
+    ]
+
+
+def _tier_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in results:
+        tier = str(item.get("disclosure_tier") or "unknown")
+        counts[tier] = counts.get(tier, 0) + 1
+    return counts
 
 
 def _project_hit_for_depth(hit: dict[str, Any]) -> dict[str, Any]:

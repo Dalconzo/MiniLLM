@@ -1,0 +1,1546 @@
+import json
+import sqlite3
+
+import pytest
+
+from local_agent_lab.memory.chatgpt_ingest import import_chatgpt_export
+from local_agent_lab.memory.context_packet import build_context_packet, compact_context_items, normalize_context_controls
+from local_agent_lab.memory.curated import create_memory_record, promote_chunk_to_memory_record
+from local_agent_lab.memory.embeddings import embed_missing_chunks, fallback_model_spec, ollama_model_spec
+from local_agent_lab.memory.feedback import create_feedback_ranking_control, record_agent_feedback
+from local_agent_lab.memory.observability import MemoryObservationError
+from local_agent_lab.memory.search import search_chatgpt_memory
+from local_agent_lab.memory.subjects import assign_conversation_subject, init_subject_schema, upsert_subject
+
+
+def _write_export(root):
+    export_dir = root / "raw" / "export-1"
+    export_dir.mkdir(parents=True)
+    export = [
+        {
+            "id": "conversation-search",
+            "title": "Barcode parser debugging",
+            "mapping": {
+                "u": {
+                    "id": "u",
+                    "parent": None,
+                    "children": ["a"],
+                    "message": {
+                        "id": "u",
+                        "author": {"role": "user"},
+                        "create_time": 1_700_000_000,
+                        "content": {"parts": ["Where is the barcode parser configured?"]},
+                    },
+                },
+                "a": {
+                    "id": "a",
+                    "parent": "u",
+                    "children": [],
+                    "message": {
+                        "id": "a",
+                        "author": {"role": "assistant"},
+                        "create_time": 1_700_000_001,
+                        "content": {"parts": ["The barcode parser lives in lab automation config."]},
+                    },
+                },
+            },
+        },
+        {
+            "id": "conversation-other",
+            "title": "Finance notes",
+            "mapping": {
+                "u": {
+                    "id": "u2",
+                    "message": {
+                        "id": "u2",
+                        "author": {"role": "user"},
+                        "content": {"parts": ["What is the savings plan?"]},
+                    },
+                }
+            },
+        },
+    ]
+    (export_dir / "conversations.json").write_text(json.dumps(export), encoding="utf-8")
+    return root / "raw"
+
+
+def test_search_chatgpt_memory_returns_citations_and_score_breakdown(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode parser")
+
+    assert result["status"] == "ok"
+    assert result["count"] == 2
+    assert result["candidate_counts"]["fts"] == 2
+    assert result["results"][0]["conversation_id"].startswith("conv_")
+    assert result["results"][0]["message_id"].startswith("msg_")
+    assert result["results"][0]["chunk_id"].startswith("chk_")
+    assert result["results"][0]["score_breakdown"]["profile"] == "hybrid_memory_v1"
+    assert "keyword_relevance" in result["results"][0]["score_breakdown"]["components"]
+    assert result["results"][0]["disclosure_tier"] in {"far", "medium", "close", "full"}
+    assert result["domain_detection"]["primary_domain"] == "lab_automation"
+    assert "lab_automation" in result["domain_detection"]["domains"]
+    assert all("domains" in item and "domain_primary" in item for item in result["results"])
+    assert "operational" in result["lenses"] or "procedural" in result["lenses"]
+    assert result["results"][0]["validation_checks"]["temporal"]["status"] == "not_run"
+
+
+def test_context_packet_v2_separates_evidence_belief_and_provenance(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Recipe cards stay compact",
+            body="Recipe cards should keep confirmed ingredients separate from assistant draft suggestions.",
+            subject_id=subject.id,
+            trust_level="high",
+            source_kind="manual",
+            source_ref="recipe-standard",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="what recipe context should the assistant know",
+        subject="Recipes and Baking",
+        depth="full",
+    )
+    context_items = compact_context_items(result["results"])
+    packet = build_context_packet(
+        query=result["query"],
+        retrieval_event_id="ret_test",
+        search_result=result,
+        context_items=context_items,
+        requested_depth="full",
+    )
+
+    assert packet["schema_version"] == 2
+    assert packet["context_packet_id"].startswith("ctx_")
+    assert packet["task"]["query"] == result["query"]
+    assert packet["task"]["depth"] == "full"
+    assert packet["relevant_preferences"]
+    assert packet["provenance"]["retrieval_event_id"] == "ret_test"
+    assert packet["provenance"]["source_ids"]
+    assert set(packet) >= {
+        "critical_constraints",
+        "current_state",
+        "relevant_preferences",
+        "relevant_outcomes",
+        "failures_and_lessons",
+        "contradictions_and_qualifications",
+        "inferred_patterns",
+        "analogies",
+        "uncertainty",
+        "omitted_but_available",
+        "provenance",
+    }
+    assert all("source_ids" in item and "epistemic_status" in item for item in packet["relevant_preferences"])
+
+
+def test_context_controls_separate_retrieval_packet_and_disclosure_depth() -> None:
+    controls = normalize_context_controls(
+        depth="medium",
+        retrieval_depth="broad",
+        packet_detail="complete",
+        disclosure_tier="far",
+        effort=2,
+    )
+
+    assert controls.retrieval_depth == "broad"
+    assert controls.packet_detail == "complete"
+    assert controls.disclosure_tier == "far"
+    assert controls.legacy_depth_alias is False
+
+
+def test_context_packet_classifies_slots_and_does_not_duplicate_uncertainty() -> None:
+    packet = build_context_packet(
+        query="starter tracking",
+        retrieval_event_id="ret_slots",
+        search_result={"ranking_profile": "test", "candidate_counts": {}, "filters_applied": []},
+        context_items=[
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_user_outcome",
+                "title": "Starter log",
+                "snippet": "Starter rose 75 percent, then fell after peak.",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_assistant",
+                "title": "Starter advice",
+                "snippet": "Assistant suggested waiting until the starter doubled.",
+                "source_role": "assistant",
+                "epistemic_status": "assistant_suggested",
+            },
+        ],
+        requested_depth="medium",
+        retrieval_depth="broad",
+        packet_detail="complete",
+        disclosure_tier="medium",
+    )
+
+    assert packet["task"]["retrieval_depth"] == "broad"
+    assert packet["task"]["packet_detail"] == "complete"
+    assert packet["task"]["disclosure_tier"] == "medium"
+    assert packet["relevant_outcomes"][0]["source_ids"] == ["src_user_outcome"]
+    assert [item["source_ids"] for item in packet["uncertainty"]] == [["src_assistant"]]
+    assert any(note["category"] == "empty_context_slots" for note in packet["omitted_but_available"])
+
+
+def test_context_packet_keeps_assistant_advice_out_of_factual_slots() -> None:
+    packet = build_context_packet(
+        query="starter tracking",
+        retrieval_event_id="ret_assistant_slots",
+        search_result={"ranking_profile": "test", "candidate_counts": {}, "filters_applied": []},
+        context_items=[
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_assistant_constraint",
+                "title": "Starter advice",
+                "snippet": "You must wait until the starter doubles before baking.",
+                "source_role": "assistant",
+                "epistemic_status": "assistant_suggested",
+                "packet_slot_hint": "critical_constraints",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_user_state",
+                "title": "Starter readiness",
+                "snippet": "My starter rose 75 to 100 percent after feeding, then fell by 25 percent. Is it ready?",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+            },
+        ],
+        requested_depth="medium",
+    )
+
+    factual_source_ids = {
+        source_id
+        for section in ("critical_constraints", "current_state", "relevant_outcomes")
+        for entry in packet[section]
+        for source_id in entry["source_ids"]
+    }
+    assert "src_assistant_constraint" not in factual_source_ids
+    assert [item["source_ids"] for item in packet["uncertainty"]] == [["src_assistant_constraint"]]
+    assert packet["relevant_outcomes"][0]["source_ids"] == ["src_user_state"]
+
+
+def test_context_packet_omits_question_only_user_chunks_from_current_state() -> None:
+    packet = build_context_packet(
+        query="starter tracking",
+        retrieval_event_id="ret_question_state",
+        search_result={"ranking_profile": "test", "candidate_counts": {}, "filters_applied": []},
+        context_items=[
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_question",
+                "title": "Sourdough ambition",
+                "snippet": "Can I make Tartine quality sourdough on the first try?",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+                "packet_slot_hint": "current_state",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_observation",
+                "title": "Starter readiness",
+                "snippet": "I fed the starter and it rose 75 to 100 percent, then fell by 25 percent. Is it ready?",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+            },
+        ],
+        requested_depth="medium",
+    )
+
+    assert [item["source_ids"] for item in packet["current_state"]] == [["src_observation"]]
+    assert packet["relevant_outcomes"][0]["source_ids"] == ["src_observation"]
+    assert any(
+        note.get("category") == "question_only_context_item" and note.get("source_ids") == ["src_question"]
+        for note in packet["omitted_but_available"]
+    )
+
+
+def test_context_packet_resolves_latest_specific_starter_state() -> None:
+    packet = build_context_packet(
+        query="what should an agent know before helping me with sourdough starter tracking and baking?",
+        retrieval_event_id="ret_state_resolution",
+        search_result={"ranking_profile": "test", "candidate_counts": {}, "filters_applied": []},
+        context_items=[
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_older_state",
+                "title": "Starter readiness",
+                "snippet": "My sourdough starter was not quite ready last week.",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+                "message_created_at": "2026-07-28T12:00:00Z",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_ambiguous_state",
+                "title": "Starter readiness",
+                "snippet": "It has risen and fallen by maybe 25 percent. Is it ready?",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+                "message_created_at": "2026-08-02T18:30:00Z",
+                "packet_slot_hint": "current_state",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_corrected_state",
+                "title": "Starter readiness",
+                "snippet": "My sourdough starter rose 75 to 100 percent after feeding, then fell by 25 percent after 24 hours.",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+                "message_created_at": "2026-08-02T18:37:54Z",
+            },
+        ],
+        requested_depth="medium",
+    )
+
+    assert [item["source_ids"] for item in packet["current_state"]] == [["src_corrected_state"]]
+    assert packet["current_state"][0]["state_resolution"] == "active_current_state"
+    qualified_ids = [item["source_ids"] for item in packet["contradictions_and_qualifications"]]
+    assert ["src_older_state"] in qualified_ids
+    assert ["src_ambiguous_state"] in qualified_ids
+    assert all(item.get("state_resolution") != "active_current_state" for item in packet["contradictions_and_qualifications"])
+
+
+def test_context_packet_omits_question_shaped_current_context_when_state_exists() -> None:
+    packet = build_context_packet(
+        query="sourdough starter tracking",
+        retrieval_event_id="ret_question_resolution",
+        search_result={"ranking_profile": "test", "candidate_counts": {}, "filters_applied": []},
+        context_items=[
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_setup_question",
+                "title": "Starter setup",
+                "snippet": "What is the best starter setup if I want Tartine quality bread?",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+                "packet_slot_hint": "current_state",
+                "message_created_at": "2026-08-01T10:00:00Z",
+            },
+            {
+                "source_kind": "message_chunk",
+                "source_id": "src_actual_state",
+                "title": "Starter log",
+                "snippet": "My sourdough starter was fed and rose 75 percent after 24 hours.",
+                "source_role": "user",
+                "epistemic_status": "user_reported",
+                "message_created_at": "2026-08-02T18:37:54Z",
+            },
+        ],
+        requested_depth="medium",
+    )
+
+    assert [item["source_ids"] for item in packet["current_state"]] == [["src_actual_state"]]
+    assert any(
+        note.get("category") == "question_only_context_item" and note.get("source_ids") == ["src_setup_question"]
+        for note in packet["omitted_but_available"]
+    )
+
+
+def test_search_chatgpt_memory_falls_back_for_natural_language_queries(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(
+        memory_dir=data_dir / "memory",
+        query="where exactly should we look when debugging the barcode workflow",
+    )
+
+    assert result["status"] == "ok"
+    assert result["count"] >= 1
+    assert any(item["field"] == "fts_strategy" and item["value"] == "broad_any_terms" for item in result["filters_applied"])
+    assert result["results"][0]["title"] == "Barcode parser debugging"
+
+
+def test_search_chatgpt_memory_effort_caps_disclosure_and_adds_validation(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode parser", depth="full", effort=1)
+
+    assert result["results"][0]["disclosure_tier"] == "far"
+    assert result["lenses"] == ["operational", "procedural", "planning"]
+
+
+def test_search_chatgpt_memory_high_effort_exposes_validation_checks(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode parser", depth="full", effort=4)
+
+    assert "temporal" in result["lenses"]
+    assert "contradiction" in result["lenses"]
+    assert result["results"][0]["validation_checks"]["temporal"]["status"] in {"current", "stale"}
+    assert result["results"][0]["validation_checks"]["contradiction"]["status"] in {"not_detected", "review", "possible"}
+
+
+def test_search_chatgpt_memory_marks_high_risk_queries_and_blocks_stale_records(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Portfolio rebalancing notes",
+            body="Rebalance index funds monthly and document the rationale.",
+            trust_level="canonical",
+        )
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Old portfolio note",
+            body="This should no longer surface in high-risk search.",
+            trust_level="low",
+            status="stale",
+        )
+
+    result = search_chatgpt_memory(memory_dir=memory_dir, query="portfolio", depth="full", effort=4)
+
+    assert result["governance"]["high_risk"] is True
+    assert "financial_caution" in result["governance"]["labels"]
+    assert all(item.get("governance_reason") != "stale_high_risk_memory" for item in result["results"])
+    assert all(item.get("governance_labels") == ["financial_caution"] for item in result["results"])
+
+
+def test_search_chatgpt_memory_supports_title_filter(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="plan", title="Finance")
+
+    assert result["count"] == 1
+    assert result["results"][0]["title"] == "Finance notes"
+    assert result["filters_applied"] == [{"field": "title", "value": "Finance"}]
+
+
+def test_search_chatgpt_memory_depth_caps_disclosure_tier(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", depth="far")
+
+    assert result["results"][0]["disclosure_tier"] == "far"
+    assert "snippet" not in result["results"][0]["exposed_fields"]
+    assert "snippet" not in result["results"][0]
+
+
+def test_search_chatgpt_memory_rejects_invalid_depth_before_effort_cap(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    with pytest.raises(ValueError, match="depth must be one of: far, medium, close, full"):
+        search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", depth="deep")
+
+
+def test_search_chatgpt_memory_includes_curated_memory_records(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Barcode parser decision",
+            body="Use the curated barcode parser workflow.",
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(memory_dir=memory_dir, query="curated barcode")
+
+    assert any(item["source_kind"] == "curated_memory" for item in result["results"])
+    assert result["candidate_counts"]["curated"] == 1
+
+
+def test_search_chatgpt_memory_retrieves_subject_curated_records_without_lexical_match(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        record = create_memory_record(
+            connection,
+            record_type="preference",
+            title="Starter feeding cadence",
+            body="Keep the mature starter on a predictable refresh timeline and record rise behavior.",
+            subject_id=subject.id,
+            trust_level="canonical",
+            source_kind="manual",
+            source_ref="recipe-note-1",
+            provenance={"source": {"note_id": "recipe-note-1"}},
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="what are the current baking operating rules",
+        subject="Recipes and Baking",
+        depth="full",
+    )
+
+    curated = [item for item in result["results"] if item["source_kind"] == "curated_memory"]
+    assert curated
+    assert curated[0]["memory_record_id"] == record.id
+    assert curated[0]["source_id"] == record.id
+    assert curated[0]["record_type"] == "preference"
+    assert curated[0]["curated_source_ref"] == "recipe-note-1"
+    assert curated[0]["provenance"] == {"source": {"note_id": "recipe-note-1"}}
+    assert curated[0]["score_breakdown"]["components"]["subject_match"]["value"] == 1.0
+    assert result["candidate_counts"]["curated"] == 1
+
+
+def test_search_chatgpt_memory_subject_filter_uses_curated_source_links(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        assign_conversation_subject(connection, conversation_id, "Lab Automation", include_chunks=True)
+        chunk_id = connection.execute(
+            "SELECT id FROM message_chunks WHERE conversation_id = ? ORDER BY chunk_index LIMIT 1",
+            (conversation_id,),
+        ).fetchone()[0]
+        record = promote_chunk_to_memory_record(
+            connection,
+            chunk_id,
+            record_type="decision",
+            title="Scanner workflow rule",
+            body="Use the curated scanner workflow for incoming lab automation samples.",
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="which scanner rule should the agent use",
+        subject="Lab Automation",
+        depth="full",
+    )
+
+    curated = [item for item in result["results"] if item.get("memory_record_id") == record.id]
+    assert curated
+    assert curated[0]["source_refs"] == [
+        {
+            "source_kind": "conversation",
+            "source_id": conversation_id,
+            "link_type": "derived_from",
+            "confidence": 1.0,
+            "notes": "Source conversation for promoted memory.",
+        },
+        {
+            "source_kind": "message_chunk",
+            "source_id": chunk_id,
+            "link_type": "derived_from",
+            "confidence": 1.0,
+            "notes": "Promoted from ChatGPT export chunk.",
+        },
+    ]
+    assert curated[0]["score_breakdown"]["components"]["curated_trust"]["value"] == 1.0
+
+
+def test_search_chatgpt_memory_canonical_curated_records_outrank_weak_raw_chunks(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Lab Automation")
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Barcode parser source of truth",
+            body="The durable rule is to use the curated barcode parser workflow.",
+            subject_id=subject.id,
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="barcode parser",
+        subject="Lab Automation",
+        depth="full",
+    )
+
+    assert result["results"][0]["source_kind"] == "curated_memory"
+    assert result["results"][0]["trust_level"] == "canonical"
+    assert result["results"][0]["score_breakdown"]["components"]["curated_trust"]["value"] == 1.0
+
+
+def test_search_chatgpt_memory_demotes_irrelevant_smoke_test_curated_records(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        relevant = create_memory_record(
+            connection,
+            record_type="preference",
+            title="Starter feeding cadence",
+            body="Track starter rise timing after feeding and use that record to plan sourdough bakes.",
+            subject_id=subject.id,
+            trust_level="canonical",
+            source_kind="manual",
+            source_ref="starter-note",
+        )
+        smoke = create_memory_record(
+            connection,
+            record_type="research_note",
+            title="Smoke Test Focaccia",
+            body="Disposable browser smoke-test recipe record.",
+            subject_id=subject.id,
+            trust_level="canonical",
+            source_kind="manual",
+            source_ref="browser-smoke-test",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise timing after feeding",
+        subject="Recipes and Baking",
+        depth="full",
+    )
+
+    ids = [item.get("memory_record_id") for item in result["results"] if item["source_kind"] == "curated_memory"]
+    assert relevant.id in ids
+    assert smoke.id not in ids
+    assert result["candidate_counts"]["relevance_filtered"] >= 1
+
+
+def test_search_chatgpt_memory_uses_vector_hits_when_fts_has_no_recall(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        connection.execute("DELETE FROM chatgpt_chunks_fts")
+        connection.execute("DELETE FROM message_chunks")
+        connection.execute("DELETE FROM messages")
+        connection.execute("DELETE FROM conversations")
+        text = "Track the sourdough starter fermentation rise timeline after feeding."
+        connection.execute(
+            """
+            INSERT INTO conversations (
+                id, import_id, source_conversation_id, title, created_at, updated_at,
+                message_count, first_message_at, last_message_at, summary, content_sha256,
+                is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                "conv_baking",
+                import_id,
+                "conversation-baking",
+                "Starter rise notebook",
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+                1,
+                "2026-07-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+                None,
+                "hash-conversation-baking",
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO messages (
+                id, conversation_id, import_id, source_message_id, parent_message_id, role,
+                author_name, turn_index, created_at, content_text, content_sha256,
+                token_estimate, attachment_count, is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+            """,
+            (
+                "msg_baking",
+                "conv_baking",
+                import_id,
+                "msg-baking",
+                None,
+                "user",
+                None,
+                0,
+                "2026-07-01T00:00:00Z",
+                text,
+                "hash-message-baking",
+                9,
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO message_chunks (
+                id, message_id, conversation_id, import_id, chunk_index, text,
+                text_sha256, token_estimate, start_char, end_char, source_kind, summary,
+                is_deleted, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                "chk_baking",
+                "msg_baking",
+                "conv_baking",
+                import_id,
+                0,
+                text,
+                "hash-baking",
+                9,
+                0,
+                len(text),
+                "chatgpt_export",
+                None,
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chatgpt_chunks_fts(title, role, text, import_id, conversation_id, message_id, chunk_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Starter rise notebook",
+                "user",
+                text,
+                import_id,
+                "conv_baking",
+                "msg_baking",
+                "chk_baking",
+            ),
+        )
+        connection.commit()
+        embed_missing_chunks(
+            connection,
+            spec=ollama_model_spec(model="test-semantic", dimension=32, host="http://127.0.0.1:11434"),
+            embedder=lambda _text, _dimension: [1.0] + [0.0] * 31,
+        )
+
+    lexical = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="leavened loaf proving schedule",
+        query_embedder=lambda _text, _dimension: [1.0] + [0.0] * 31,
+    )
+    assert lexical["candidate_counts"]["fts"] == 0
+    assert lexical["candidate_counts"]["vector"] == 1
+    assert lexical["results"][0]["chunk_id"] == "chk_baking"
+    assert lexical["results"][0]["score_breakdown"]["components"]["semantic_similarity"]["value"] >= 0.58
+    assert lexical["results"][0]["retrieval_sources"] == ["vector"]
+
+
+def test_search_chatgpt_memory_uses_query_embedder_for_ollama_vectors(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        spec = ollama_model_spec(model="nomic-embed-text", dimension=3, host="http://127.0.0.1:11434")
+
+        def chunk_embedder(text: str, _dimension: int) -> list[float]:
+            if "barcode parser" in text.lower():
+                return [1.0, 0.0, 0.0]
+            return [0.0, 1.0, 0.0]
+
+        embed_missing_chunks(connection, spec=spec, embedder=chunk_embedder)
+
+    without_query_embedder = search_chatgpt_memory(memory_dir=memory_dir, query="vector recall unrelated lexical terms")
+    assert without_query_embedder["candidate_counts"]["vector"] == 0
+
+    with_query_embedder = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="vector recall unrelated lexical terms",
+        allow_cross_domain=True,
+        query_embedder=lambda _text, _dimension: [1.0, 0.0, 0.0],
+    )
+
+    assert with_query_embedder["candidate_counts"]["fts"] == 0
+    assert with_query_embedder["candidate_counts"]["vector"] >= 1
+    assert with_query_embedder["results"][0]["embedding_model_id"] == spec.id
+    assert with_query_embedder["results"][0]["semantic_similarity"] == 1.0
+
+
+def test_search_chatgpt_memory_subject_filter_is_explicit_for_unknown_subject(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="unknown subject")
+
+    assert result["count"] == 0
+    assert result["filters_applied"] == [{"field": "subject", "value": "unknown subject"}]
+
+
+def test_search_chatgpt_memory_supports_conversation_level_subjects(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    report = import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+    db_path = data_dir / "memory" / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        assign_conversation_subject(connection, conversation_id, "Lab Automation", include_chunks=False)
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="Lab Automation")
+
+    assert result["count"] == 2
+    assert result["filters_applied"] == [{"field": "subject", "value": "Lab Automation"}]
+
+
+def test_search_chatgpt_memory_subject_filter_resolves_known_aliases(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+    db_path = data_dir / "memory" / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        assign_conversation_subject(connection, conversation_id, "AI Memory and Local LLMs", include_chunks=False)
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="Memory System")
+
+    assert result["count"] == 0
+    assert result["candidate_counts"]["domain_filtered"] == 2
+    assert result["filters_applied"] == [
+        {
+            "field": "subject",
+            "value": "AI Memory and Local LLMs",
+            "requested": "Memory System",
+            "alias_target": "AI Memory and Local LLMs",
+        }
+    ]
+
+
+def test_search_chatgpt_memory_subject_filter_uses_candidate_domain_fallback(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        init_subject_schema(connection)
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        connection.execute("DELETE FROM chunk_subjects")
+        connection.execute("DELETE FROM conversation_subjects")
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_recent_starter",
+            message_id="msg_recent_starter",
+            chunk_id="chk_recent_starter",
+            title="Sourdough Starter Tracking",
+            role="user",
+            text="My sourdough starter rose 75 to 100 percent after feeding, then fell back before baking.",
+        )
+        connection.execute(
+            """
+            INSERT INTO candidate_memories (
+                id, import_id, conversation_id, message_id, chunk_id, source_kind, source_ref,
+                source_role, memory_type, reason_type, domain_primary, domains_json, confidence,
+                valid_from, valid_to, last_confirmed_at, review_status, review_notes, origin,
+                assistant_suggestion, source_links_json, content, metadata_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                "cand_recent_starter",
+                import_id,
+                "conv_recent_starter",
+                "msg_recent_starter",
+                "chk_recent_starter",
+                "chatgpt_export",
+                "chk_recent_starter",
+                "user",
+                "episodic",
+                "user_reported_outcome",
+                "cooking_baking",
+                json.dumps(["cooking_baking"]),
+                0.9,
+                "pending",
+                "heuristic",
+                "{}",
+                "Starter rose 75 to 100 percent after feeding, then fell back.",
+                "{}",
+                "2026-08-02T00:00:00Z",
+                "2026-08-02T00:00:00Z",
+            ),
+        )
+        embed_missing_chunks(
+            connection,
+            spec=ollama_model_spec(model="nomic-embed-text", dimension=3, host="http://127.0.0.1:11434"),
+            embedder=lambda _text, _dimension: [1.0, 0.0, 0.0],
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise after feeding",
+        subject="Recipes and Baking",
+        query_embedder=lambda _text, _dimension: [1.0, 0.0, 0.0],
+        limit=5,
+    )
+
+    assert result["candidate_counts"]["fts"] >= 1
+    assert result["candidate_counts"]["vector"] >= 1
+    assert result["results"][0]["chunk_id"] == "chk_recent_starter"
+    assert result["results"][0]["score_breakdown"]["components"]["subject_match"]["value"] == 1.0
+
+
+def test_search_chatgpt_memory_returns_no_reliable_results_for_weak_curated_subject_match(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        subject = upsert_subject(connection, "Recipes and Baking")
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Recipe card standard",
+            body="Keep recipe notes compact and separate confirmed facts from drafts.",
+            subject_id=subject.id,
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="qzvorn 9472 xenolith checksum gasket",
+        subject="Recipes and Baking",
+    )
+
+    assert result["status"] == "ok"
+    assert result["result_quality"] == "no_reliable_results"
+    assert result["count"] == 0
+    assert result["candidate_counts"]["curated"] == 1
+    assert result["candidate_counts"]["relevance_filtered"] == 1
+
+
+def test_search_chatgpt_memory_blocks_wrong_domain_subject_leak_when_cross_domain_disabled(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_bad_domain",
+            message_id="msg_bad_domain",
+            chunk_id="chk_bad_domain",
+            title="AI Automation Micro-Business",
+            role="assistant",
+            text="Project preferences, available time, and desired difficulty for a lab automation workflow.",
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_good_domain",
+            message_id="msg_good_domain",
+            chunk_id="chk_good_domain",
+            title="Baking Project Planning",
+            role="user",
+            text="For baking project preferences, I want ambitious cake and bread work scaled to available time.",
+        )
+        assign_conversation_subject(connection, "conv_bad_domain", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(connection, "conv_good_domain", "Recipes and Baking", include_chunks=True)
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="baking project preferences available time desired difficulty",
+        subject="Recipes and Baking",
+        allow_cross_domain=False,
+        depth="full",
+    )
+
+    assert [item["chunk_id"] for item in result["results"]] == ["chk_good_domain"]
+    assert result["candidate_counts"]["domain_filtered"] >= 1
+    assert result["results"][0]["domain_primary"] == "cooking_baking"
+
+
+def test_search_chatgpt_memory_applies_default_message_and_conversation_diversity_caps(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        for index in range(5):
+            _insert_chunk(
+                connection,
+                import_id=import_id,
+                conversation_id="conv_long_doc",
+                message_id="msg_long_doc",
+                chunk_id=f"chk_long_doc_{index}",
+                title="Top Tier Sourdough Recipe",
+                role="assistant",
+                text=f"Sourdough starter feeding rise fermentation timing note {index}.",
+                chunk_index=index,
+            )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_second_doc",
+            message_id="msg_second_doc",
+            chunk_id="chk_second_doc",
+            title="Starter Tracking Note",
+            role="user",
+            text="My sourdough starter feeding rise timing should be tracked separately.",
+        )
+
+    default = search_chatgpt_memory(memory_dir=memory_dir, query="sourdough starter feeding rise timing", limit=6)
+    default_long_doc = [item for item in default["results"] if item["message_id"] == "msg_long_doc"]
+    assert len(default_long_doc) == 2
+    assert any(item["chunk_id"] == "chk_second_doc" for item in default["results"])
+    assert default["candidate_counts"]["diversity_filtered"] >= 3
+
+    document = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="sourdough starter feeding rise timing",
+        limit=6,
+        title="Top Tier Sourdough Recipe",
+        document_mode=True,
+    )
+    assert [item["chunk_id"] for item in document["results"]] == [f"chk_long_doc_{index}" for index in range(5)]
+    assert document["candidate_counts"]["diversity_filtered"] == 0
+
+
+def test_search_chatgpt_memory_requires_starter_entity_match_for_starter_queries(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_starter",
+            message_id="msg_starter",
+            chunk_id="chk_starter",
+            title="Starter Tracking",
+            role="user",
+            text="My sourdough starter feeding rise timing peaked after 6 hours.",
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_generic_dough",
+            message_id="msg_generic_dough",
+            chunk_id="chk_generic_dough",
+            title="Khachapuri Dough Timing",
+            role="assistant",
+            text="Generic dough rise fermentation timing after mixing is about 2 hours.",
+        )
+        assign_conversation_subject(connection, "conv_starter", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(connection, "conv_generic_dough", "Recipes and Baking", include_chunks=True)
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding",
+        subject="Recipes and Baking",
+        limit=5,
+    )
+
+    assert result["results"][0]["chunk_id"] == "chk_starter"
+    assert all(item["chunk_id"] != "chk_generic_dough" for item in result["results"])
+    assert result["candidate_counts"]["relevance_filtered"] >= 1
+    assert result["results"][0]["score_breakdown"]["components"]["subject_match"]["value"] == 1.0
+
+
+def test_search_chatgpt_memory_prioritizes_user_observations_over_assistant_advice(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_user_starter_observation",
+            message_id="msg_user_starter_observation",
+            chunk_id="chk_user_starter_observation",
+            title="Sourdough Starter Readiness",
+            role="user",
+            text="I fed the sourdough starter and after 24 hours it rose 75 to 100 percent and fell by 25 percent.",
+        )
+        for index in range(6):
+            _insert_chunk(
+                connection,
+                import_id=import_id,
+                conversation_id=f"conv_assistant_starter_advice_{index}",
+                message_id=f"msg_assistant_starter_advice_{index}",
+                chunk_id=f"chk_assistant_starter_advice_{index}",
+                title="Sourdough Starter Advice",
+                role="assistant",
+                text=(
+                    "Sourdough starter rise fermentation timing after feeding can indicate readiness; "
+                    f"assistant guidance item {index} suggests watching for peak and fall."
+                ),
+            )
+            assign_conversation_subject(
+                connection,
+                f"conv_assistant_starter_advice_{index}",
+                "Recipes and Baking",
+                include_chunks=True,
+            )
+        assign_conversation_subject(connection, "conv_user_starter_observation", "Recipes and Baking", include_chunks=True)
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding recent sourdough starter tracking",
+        subject="Recipes and Baking",
+        limit=8,
+    )
+
+    assert result["results"][0]["chunk_id"] == "chk_user_starter_observation"
+    assert result["results"][0]["source_role"] == "user"
+    assert result["results"][0]["score_breakdown"]["components"]["source_provenance"]["value"] == 1.0
+    assistant_items = [item for item in result["results"] if item["source_role"] == "assistant"]
+    assert assistant_items
+    assert all(item["score_breakdown"]["components"]["source_provenance"]["value"] == 0.15 for item in assistant_items)
+
+
+def test_search_chatgpt_memory_downranks_memory_test_artifacts_for_starter_queries(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_starter_observation",
+            message_id="msg_starter_observation",
+            chunk_id="chk_starter_observation",
+            title="Sourdough Starter Tracking",
+            role="user",
+            text="My sourdough starter rose 75 to 100 percent after feeding and then fell before baking.",
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_memory_acceptance",
+            message_id="msg_memory_acceptance",
+            chunk_id="chk_memory_acceptance",
+            title="MiniLLM/Home Acceptance Report",
+            role="user",
+            text=(
+                "Evaluate: are top results actually about starter rise fermentation proofing feeding "
+                "or sourdough timing? Include run_id trace_id memory_search memory_context."
+            ),
+        )
+        assign_conversation_subject(connection, "conv_starter_observation", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(connection, "conv_memory_acceptance", "Recipes and Baking", include_chunks=True)
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding",
+        subject="Recipes and Baking",
+        limit=5,
+    )
+
+    assert result["results"][0]["chunk_id"] == "chk_starter_observation"
+    assert all(item["chunk_id"] != "chk_memory_acceptance" for item in result["results"])
+    assert result["candidate_counts"]["relevance_filtered"] >= 1
+
+
+def test_search_chatgpt_memory_blocks_cross_topic_infra_artifacts_for_starter_queries(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_fixture_culture_state",
+            message_id="msg_fixture_culture_state",
+            chunk_id="chk_fixture_culture_state",
+            title="Synthetic Culture Readiness",
+            role="user",
+            text="The synthetic starter culture rose about 60 percent after feeding and later returned near baseline.",
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_vpn_artifact",
+            message_id="msg_vpn_artifact",
+            chunk_id="chk_vpn_artifact",
+            title="VPN Connector Limitations",
+            role="assistant",
+            text=(
+                "The transcript analysis mentions sourdough starter feeding, rise, fermentation timing, "
+                "and memory_context while discussing a VPN connector setup."
+            ),
+        )
+        assign_conversation_subject(connection, "conv_fixture_culture_state", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(connection, "conv_vpn_artifact", "Recipes and Baking", include_chunks=True)
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding",
+        subject="Recipes and Baking",
+        limit=5,
+        allow_cross_domain=False,
+    )
+
+    assert result["results"][0]["chunk_id"] == "chk_fixture_culture_state"
+    assert all(item["chunk_id"] != "chk_vpn_artifact" for item in result["results"])
+    assert result["candidate_counts"]["relevance_filtered"] >= 1
+
+
+def test_search_chatgpt_memory_blocks_candidate_review_artifacts_for_starter_queries(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_fixture_culture_report",
+            message_id="msg_fixture_culture_report",
+            chunk_id="chk_fixture_culture_report",
+            title="Synthetic Culture Readiness",
+            role="user",
+            text=(
+                "The synthetic starter culture was fed and monitored for 18 hours: "
+                "it rose about 60 percent and later returned near baseline during fermentation."
+            ),
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_candidate_review_filter_test",
+            message_id="msg_candidate_review_filter_test",
+            chunk_id="chk_candidate_review_filter_test",
+            title="Candidate Review Filter Test",
+            role="assistant",
+            text=(
+                "Candidate review filter test for memory_review_subjects discusses memory retrieval design. "
+                "It uses cooking examples including sourdough starter rise fermentation timing after feeding, "
+                "current state, stable preferences, constraints, outcomes, and failures."
+            ),
+        )
+        assign_conversation_subject(connection, "conv_fixture_culture_report", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(
+            connection,
+            "conv_candidate_review_filter_test",
+            "Recipes and Baking",
+            include_chunks=True,
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding",
+        subject="Recipes and Baking",
+        limit=5,
+        allow_cross_domain=False,
+    )
+
+    assert result["results"][0]["chunk_id"] == "chk_fixture_culture_report"
+    assert all(item["chunk_id"] != "chk_candidate_review_filter_test" for item in result["results"])
+    assert result["candidate_counts"]["relevance_filtered"] >= 1
+
+
+def test_search_chatgpt_memory_consumes_only_applied_feedback_controls(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        import_id = connection.execute("SELECT id FROM imports ORDER BY imported_at DESC LIMIT 1").fetchone()[0]
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_feedback_good",
+            message_id="msg_feedback_good",
+            chunk_id="chk_feedback_good",
+            title="Starter Tracking",
+            role="user",
+            text="My sourdough starter feeding rise timing peaked after 6 hours.",
+        )
+        _insert_chunk(
+            connection,
+            import_id=import_id,
+            conversation_id="conv_feedback_bad",
+            message_id="msg_feedback_bad",
+            chunk_id="chk_feedback_bad",
+            title="Starter Tracking",
+            role="assistant",
+            text="Sourdough starter feeding rise timing can be compared to generic dough timing.",
+        )
+        assign_conversation_subject(connection, "conv_feedback_good", "Recipes and Baking", include_chunks=True)
+        assign_conversation_subject(connection, "conv_feedback_bad", "Recipes and Baking", include_chunks=True)
+        feedback = record_agent_feedback(
+            connection,
+            run_id="run_feedback",
+            component="memory_search",
+            category="retrieval_noise",
+            severity="high",
+            observed_behavior="Generic analogy source ranked too high.",
+            expected_behavior="Penalize it for starter timing queries.",
+            confidence=0.9,
+            relevant_source_ids=["chk_feedback_bad"],
+        )
+        create_feedback_ranking_control(
+            connection,
+            feedback_id=feedback.id,
+            control_type="query_source_penalty",
+            query_pattern="starter rise fermentation",
+            source_id="chk_feedback_bad",
+            subject="Recipes and Baking",
+            weight=-0.8,
+            rationale="Fixture penalty.",
+            status="reviewed",
+        )
+
+    reviewed_only = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding",
+        subject="Recipes and Baking",
+        limit=5,
+    )
+    bad_reviewed = next(item for item in reviewed_only["results"] if item["chunk_id"] == "chk_feedback_bad")
+    assert bad_reviewed["score_breakdown"]["components"]["spam_penalty"]["value"] == 0.0
+    assert reviewed_only["retrieval_controls"]["feedback_controls"]["applied_count"] == 0
+
+    with sqlite3.connect(db_path) as connection:
+        feedback = record_agent_feedback(
+            connection,
+            run_id="run_feedback_applied",
+            component="memory_search",
+            category="retrieval_noise",
+            severity="high",
+            observed_behavior="Generic analogy source ranked too high.",
+            expected_behavior="Penalize it for starter timing queries.",
+            confidence=0.9,
+            relevant_source_ids=["chk_feedback_bad"],
+        )
+        create_feedback_ranking_control(
+            connection,
+            feedback_id=feedback.id,
+            control_type="query_source_penalty",
+            query_pattern="starter rise fermentation",
+            source_id="chk_feedback_bad",
+            subject="Recipes and Baking",
+            weight=-0.8,
+            rationale="Fixture penalty.",
+            status="applied",
+        )
+
+    applied = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="starter rise fermentation timing after feeding",
+        subject="Recipes and Baking",
+        limit=5,
+    )
+    bad_applied = next(item for item in applied["results"] if item["chunk_id"] == "chk_feedback_bad")
+    assert bad_applied["score_breakdown"]["components"]["spam_penalty"]["value"] == 0.8
+    assert applied["retrieval_controls"]["feedback_controls"]["applied_count"] == 1
+
+
+def test_search_chatgpt_memory_debug_min_disclosure_tier_exposes_snippets(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+
+    result = search_chatgpt_memory(
+        memory_dir=data_dir / "memory",
+        query="barcode parser",
+        depth="full",
+        debug_min_disclosure_tier="medium",
+    )
+
+    assert result["debug_disclosure"]["min_tier"] == "medium"
+    assert result["results"][0]["disclosure_tier"] in {"medium", "close", "full"}
+    if result["results"][0].get("debug_disclosure_forced"):
+        assert result["results"][0]["debug_disclosure_forced"] is True
+    assert "snippet" in result["results"][0]
+
+
+def test_search_chatgpt_memory_normalizes_unicode_subjects(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=data_dir / "memory")
+    db_path = data_dir / "memory" / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        assign_conversation_subject(connection, conversation_id, "Café workflow", include_chunks=False)
+
+    result = search_chatgpt_memory(memory_dir=data_dir / "memory", query="barcode", subject="Cafe workflow")
+
+    assert result["count"] == 2
+    assert result["filters_applied"] == [{"field": "subject", "value": "Café workflow"}]
+
+
+def test_search_chatgpt_memory_excludes_curated_records_by_subject(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    with sqlite3.connect(memory_dir / "chatgpt_memory.sqlite3") as connection:
+        conversation_id = connection.execute(
+            "SELECT id FROM conversations WHERE title = 'Barcode parser debugging'"
+        ).fetchone()[0]
+        subject = assign_conversation_subject(connection, conversation_id, "Lab Automation", include_chunks=False)
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Curated barcode decision",
+            body="Use the curated barcode parser workflow.",
+            subject_id=subject.id,
+            trust_level="canonical",
+        )
+
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query="curated barcode",
+        exclude_subjects=["Lab Automation"],
+    )
+
+    assert result["count"] == 0
+    assert {"field": "exclude_subject", "value": ["Lab Automation"]} in result["filters_applied"]
+
+
+def test_search_chatgpt_memory_blocks_curated_records_from_tombstoned_sources(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    memory_dir = data_dir / "memory"
+    import_chatgpt_export(input_path=_write_export(tmp_path), data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        chunk_id = connection.execute(
+            "SELECT id FROM message_chunks WHERE text LIKE '%barcode parser%' LIMIT 1"
+        ).fetchone()[0]
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Curated barcode decision",
+            body="Use the curated barcode parser workflow.",
+            trust_level="canonical",
+            source_ref=chunk_id,
+        )
+
+    first = search_chatgpt_memory(memory_dir=memory_dir, query="curated barcode")
+    assert any(item["source_kind"] == "curated_memory" for item in first["results"])
+
+    with sqlite3.connect(db_path) as connection:
+        from local_agent_lab.memory.audit import tombstone_source
+
+        tombstone_source(connection, source_kind="chatgpt_export", source_id=chunk_id, reason="private")
+
+    second = search_chatgpt_memory(memory_dir=memory_dir, query="curated barcode")
+    assert all(item["chunk_id"] != chunk_id for item in second["results"])
+    assert all(item["source_kind"] != "curated_memory" for item in second["results"])
+
+
+def test_search_chatgpt_memory_errors_when_database_missing(tmp_path) -> None:
+    with pytest.raises(MemoryObservationError) as exc_info:
+        search_chatgpt_memory(memory_dir=tmp_path / "memory", query="barcode")
+
+    assert exc_info.value.stage == "retrieve_candidates"
+    assert exc_info.value.error_code == "memory_database_not_found"
+
+
+def _insert_chunk(
+    connection: sqlite3.Connection,
+    *,
+    import_id: str,
+    conversation_id: str,
+    message_id: str,
+    chunk_id: str,
+    title: str,
+    role: str,
+    text: str,
+    chunk_index: int = 0,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO conversations (
+            id, import_id, source_conversation_id, title, created_at, updated_at,
+            message_count, first_message_at, last_message_at, summary, content_sha256,
+            is_deleted, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            conversation_id,
+            import_id,
+            conversation_id,
+            title,
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            1,
+            "2026-07-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+            None,
+            f"hash-{conversation_id}",
+            "{}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO messages (
+            id, conversation_id, import_id, source_message_id, parent_message_id, role,
+            author_name, turn_index, created_at, content_text, content_sha256,
+            token_estimate, attachment_count, is_deleted, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+        """,
+        (
+            message_id,
+            conversation_id,
+            import_id,
+            message_id,
+            None,
+            role,
+            None,
+            0,
+            "2026-07-01T00:00:00Z",
+            text,
+            f"hash-{message_id}",
+            len(text.split()),
+            "{}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO message_chunks (
+            id, message_id, conversation_id, import_id, chunk_index, text,
+            text_sha256, token_estimate, start_char, end_char, source_kind, summary,
+            is_deleted, metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            chunk_id,
+            message_id,
+            conversation_id,
+            import_id,
+            chunk_index,
+            text,
+            f"hash-{chunk_id}",
+            len(text.split()),
+            0,
+            len(text),
+            "chatgpt_export",
+            None,
+            "{}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO chatgpt_chunks_fts(title, role, text, import_id, conversation_id, message_id, chunk_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (title, role, text, import_id, conversation_id, message_id, chunk_id),
+    )

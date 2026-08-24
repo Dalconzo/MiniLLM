@@ -1,0 +1,1640 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from ..sqlite_utils import sqlite_connection
+
+from .audit import blocked_source_ids, init_audit_schema
+from .candidates import SUBJECT_DOMAIN_FALLBACKS
+from .curated import init_curated_memory_schema
+from .domain_scoping import (
+    apply_governance_policy,
+    classify_text_domains,
+    detect_query_domains,
+    dominant_domain,
+    high_risk_domains,
+    high_risk_lenses,
+    scope_candidate_domains,
+    select_lenses_for_query,
+)
+from .embeddings import LOCAL_VECTOR_BACKEND, EmbeddingFunction, cosine_similarity, deterministic_fallback_embedding, load_local_vector
+from .feedback import applied_feedback_controls_for_query
+from .high_risk import HIGH_RISK_POLICY_VERSION, evaluate_high_risk_evidence
+from .observability import MemoryObservationError, memory_db_path
+from .privacy import redact_obvious_secrets
+from .ranking import DISCLOSURE_TIERS, EXPOSED_FIELDS_BY_TIER, rank_memory_hits
+from .subjects import normalize_subject_slug, resolve_subject
+
+
+MIN_LEXICAL_RELEVANCE = 0.30
+MIN_CURATED_LEXICAL_RELEVANCE = 0.20
+MIN_SEMANTIC_SIMILARITY = 0.58
+MIN_VECTOR_ONLY_SEMANTIC_SIMILARITY = 0.72
+
+
+def search_chatgpt_memory(
+    *,
+    memory_dir: Path,
+    query: str,
+    limit: int = 8,
+    subject: str | None = None,
+    title: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    exclude_source_ids: list[str] | None = None,
+    exclude_subjects: list[str] | None = None,
+    depth: str = "medium",
+    effort: int = 2,
+    allow_cross_domain: bool = False,
+    debug_min_disclosure_tier: str | None = None,
+    query_embedder: EmbeddingFunction | None = None,
+    max_chunks_per_message: int | None = 2,
+    max_chunks_per_conversation: int | None = 4,
+    document_mode: bool = False,
+) -> dict[str, Any]:
+    sqlite_path = memory_db_path(memory_dir)
+    if not sqlite_path.exists():
+        raise MemoryObservationError(
+            f"ChatGPT memory database does not exist: {sqlite_path}",
+            stage="retrieve_candidates",
+            error_code="memory_database_not_found",
+            source_ref=str(sqlite_path),
+        )
+
+    query_tokens = _search_tokens(query)
+    fts_queries = _fts_queries(query)
+    if not fts_queries:
+        raise MemoryObservationError(
+            "memory search query did not contain searchable terms",
+            stage="retrieve_candidates",
+            error_code="empty_search_query",
+            source_ref=None,
+        )
+
+    with sqlite_connection(sqlite_path) as connection:
+        connection.row_factory = sqlite3.Row
+        init_audit_schema(connection)
+        filters_applied: list[dict[str, Any]] = []
+        query_domains = detect_query_domains(query)
+        resolved_subject = None
+        subject_alias_target = None
+        if subject:
+            try:
+                resolved_subject, subject_alias_target = resolve_subject(connection, subject)
+            except KeyError:
+                resolved_subject = None
+        where = [
+            "chatgpt_chunks_fts MATCH ?",
+            "message_chunks.is_deleted = 0",
+            "messages.is_deleted = 0",
+            "conversations.is_deleted = 0",
+        ]
+        params: list[Any] = [fts_queries[0][1]]
+        excluded_ids = sorted(set(exclude_source_ids or []) | blocked_source_ids(connection))
+        if excluded_ids:
+            placeholders = ", ".join("?" for _ in excluded_ids)
+            where.append(f"message_chunks.id NOT IN ({placeholders})")
+            where.append(f"messages.id NOT IN ({placeholders})")
+            where.append(f"conversations.id NOT IN ({placeholders})")
+            params.extend(excluded_ids)
+            params.extend(excluded_ids)
+            params.extend(excluded_ids)
+            filters_applied.append({"field": "exclude_source", "value": excluded_ids})
+        if title:
+            where.append("conversations.title LIKE ?")
+            params.append(f"%{title}%")
+            filters_applied.append({"field": "title", "value": title})
+        if date_from:
+            where.append("COALESCE(messages.created_at, conversations.created_at, '') >= ?")
+            params.append(date_from)
+            filters_applied.append({"field": "date_from", "value": date_from})
+        if date_to:
+            where.append("COALESCE(messages.created_at, conversations.created_at, '') <= ?")
+            params.append(date_to)
+            filters_applied.append({"field": "date_to", "value": date_to})
+        if subject:
+            if _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
+                subject_slug = resolved_subject.slug if resolved_subject is not None else normalize_subject_slug(subject)
+                subject_name = resolved_subject.name if resolved_subject is not None else subject
+                subject_clause, subject_params = _message_subject_scope_clause(
+                    connection,
+                    subject_slug=subject_slug,
+                    subject_name=subject_name,
+                    chunk_ref="message_chunks.id",
+                    conversation_ref="conversations.id",
+                )
+                where.append(subject_clause)
+                params.extend(subject_params)
+                subject_filter: dict[str, Any] = {"field": "subject", "value": subject_name}
+                if subject_alias_target:
+                    subject_filter["requested"] = subject
+                    subject_filter["alias_target"] = subject_alias_target
+                filters_applied.append(subject_filter)
+            else:
+                return _empty_result(
+                    query=query,
+                    ranking_profile="fts_bm25_v1",
+                    filters_applied=[
+                        *filters_applied,
+                        {
+                            "field": "subject",
+                            "value": subject,
+                            "warning": "subject tables do not exist yet",
+                        },
+                    ],
+                )
+        if exclude_subjects:
+            if _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
+                subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
+                placeholders = ", ".join("?" for _ in subject_slugs)
+                where.append(
+                    f"""
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM chunk_subjects excluded_chunk_subjects
+                        JOIN subjects excluded_subjects
+                          ON excluded_subjects.id = excluded_chunk_subjects.subject_id
+                        WHERE excluded_chunk_subjects.chunk_id = message_chunks.id
+                          AND excluded_subjects.slug IN ({placeholders})
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM conversation_subjects excluded_conversation_subjects
+                        JOIN subjects excluded_subjects
+                          ON excluded_subjects.id = excluded_conversation_subjects.subject_id
+                        WHERE excluded_conversation_subjects.conversation_id = conversations.id
+                          AND excluded_subjects.slug IN ({placeholders})
+                    )
+                    """
+                )
+                params.extend(subject_slugs)
+                params.extend(subject_slugs)
+            filters_applied.append({"field": "exclude_subject", "value": exclude_subjects})
+
+        sql = f"""
+            SELECT
+                conversations.id AS conversation_id,
+                conversations.source_conversation_id,
+                conversations.title,
+                messages.id AS message_id,
+                messages.role,
+                messages.turn_index,
+                messages.created_at AS message_created_at,
+                message_chunks.id AS chunk_id,
+                message_chunks.chunk_index,
+                message_chunks.source_kind,
+                bm25(chatgpt_chunks_fts) AS bm25_score,
+                snippet(chatgpt_chunks_fts, 2, '[', ']', '...', 24) AS snippet
+            FROM chatgpt_chunks_fts
+            JOIN message_chunks ON message_chunks.id = chatgpt_chunks_fts.chunk_id
+            JOIN messages ON messages.id = chatgpt_chunks_fts.message_id
+            JOIN conversations ON conversations.id = chatgpt_chunks_fts.conversation_id
+            WHERE {' AND '.join(where)}
+            ORDER BY bm25_score ASC
+            LIMIT ?
+        """
+        candidate_limit = max(limit * 4, 20)
+        rows = []
+        fts_strategies_used: list[str] = []
+        seen_fts_chunks: set[str] = set()
+        for strategy, candidate_fts_query in fts_queries:
+            candidate_params = list(params)
+            candidate_params[0] = candidate_fts_query
+            candidate_rows = connection.execute(sql, [*candidate_params, candidate_limit]).fetchall()
+            if candidate_rows:
+                fts_strategies_used.append(strategy)
+            for row in candidate_rows:
+                chunk_id = str(row["chunk_id"])
+                if chunk_id in seen_fts_chunks:
+                    continue
+                seen_fts_chunks.add(chunk_id)
+                rows.append(row)
+                if len(rows) >= candidate_limit:
+                    break
+            if len(rows) >= candidate_limit:
+                break
+        fts_strategy = "+".join(fts_strategies_used) if fts_strategies_used else fts_queries[0][0]
+        if fts_strategy != "precise_all_terms":
+            filters_applied.append({"field": "fts_strategy", "value": fts_strategy})
+        fts_results = [
+            {
+                **_row_to_hit(index, row),
+                "keyword_relevance": _lexical_relevance(
+                    query_tokens,
+                    str(row["title"] or ""),
+                    str(row["snippet"] or ""),
+                    str(row["role"] or ""),
+                ),
+                "subject_match": 1.0 if subject else 0.0,
+            }
+            for index, row in enumerate(rows, start=1)
+        ]
+        vector_results = _vector_hits(
+            connection,
+            query=query,
+            query_embedder=query_embedder,
+            subject=subject,
+            resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
+            exclude_source_ids=excluded_ids,
+            exclude_subjects=exclude_subjects,
+            title=title,
+            date_from=date_from,
+            date_to=date_to,
+            limit=candidate_limit,
+        )
+        curated_results = _curated_hits(
+            connection,
+            query=query,
+            subject=subject,
+            resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
+            exclude_source_ids=excluded_ids,
+            exclude_subjects=exclude_subjects,
+            title=title,
+            date_from=date_from,
+            date_to=date_to,
+            limit=candidate_limit,
+        )
+
+        retrieved_results = _merge_retrieval_hits(fts_results, vector_results)
+        scoped_results = []
+        domain_filtered_count = 0
+        governance_filtered_count = 0
+        governance_rejections: list[dict[str, Any]] = []
+        boundary_domains = _strict_boundary_domains(
+            query_domains,
+            resolved_subject.name if resolved_subject is not None else subject,
+        )
+        feedback_controls = applied_feedback_controls_for_query(
+            connection,
+            query=query,
+            subject=resolved_subject.name if resolved_subject is not None else subject,
+        )
+        applied_feedback_controls: list[dict[str, Any]] = []
+        advice_requested = _query_requests_advice(query)
+        for hit in [*retrieved_results, *curated_results]:
+            hit_domains = classify_text_domains(
+                hit.get("title"),
+                hit.get("snippet"),
+                hit.get("subject_name"),
+                hit.get("role"),
+            )
+            allowed, relation = scope_candidate_domains(
+                query_domains,
+                hit_domains,
+                effort=effort,
+                allow_cross_domain=allow_cross_domain,
+            )
+            if not allowed:
+                domain_filtered_count += 1
+                continue
+            if not allow_cross_domain and boundary_domains and not _passes_strict_domain_boundary(hit_domains, boundary_domains):
+                domain_filtered_count += 1
+                continue
+            governance_allowed, governance_reason, governance_labels = apply_governance_policy(
+                query_domains,
+                hit_domains,
+                effort=effort,
+                allow_cross_domain=allow_cross_domain,
+                candidate_status=str(hit.get("status") or "") or None,
+                candidate_trust_level=str(hit.get("trust_level") or "") or None,
+                source_role=str(hit.get("source_role") or hit.get("role") or "") or None,
+                domain_relation=relation,
+            )
+            if not governance_allowed:
+                governance_filtered_count += 1
+                governance_rejections.append(
+                    {
+                        "source_id": str(hit.get("source_id") or hit.get("chunk_id") or "") or None,
+                        "policy": HIGH_RISK_POLICY_VERSION,
+                        "disposition": "reject",
+                        "reasons": [governance_reason],
+                    }
+                )
+                continue
+            high_risk_decision = evaluate_high_risk_evidence(
+                query_domains=query_domains,
+                candidate_domains=hit_domains,
+                source_role=str(hit.get("source_role") or hit.get("role") or "") or None,
+                epistemic_status=str(hit.get("epistemic_status") or "") or None,
+                trust_level=str(hit.get("trust_level") or "") or None,
+                status=str(hit.get("status") or "") or None,
+                age_days=_evidence_age_days(hit.get("message_created_at")),
+                advice_requested=advice_requested,
+                authoritative_source=_is_authoritative_high_risk_source(hit),
+                confirmed_by_user=bool(hit.get("confirmed_by_user", False)),
+                source_id=str(hit.get("source_id") or hit.get("chunk_id") or "") or None,
+            )
+            if high_risk_decision.disposition == "reject":
+                governance_filtered_count += 1
+                governance_rejections.append(high_risk_decision.to_dict())
+                continue
+            scoped_hit = dict(hit)
+            scoped_hit["domains"] = hit_domains
+            scoped_hit["domain_primary"] = dominant_domain(hit_domains)
+            scoped_hit["domain_relation"] = relation
+            scoped_hit["domain_reason"] = "query_domain_match" if relation in {"primary", "broad"} else relation
+            scoped_hit["governance_reason"] = governance_reason
+            scoped_hit["governance_labels"] = governance_labels
+            scoped_hit["high_risk_decision"] = high_risk_decision.to_dict()
+            scoped_hit = _apply_task_entity_precision(scoped_hit, query_tokens=query_tokens)
+            scoped_hit = _apply_meta_test_noise_penalty(scoped_hit, query_tokens=query_tokens)
+            scoped_hit, hit_controls = _apply_feedback_controls(scoped_hit, feedback_controls)
+            applied_feedback_controls.extend(hit_controls)
+            scoped_results.append(scoped_hit)
+
+        effective_depth = _effort_depth_cap(depth, effort)
+        ranked_results = rank_memory_hits(scoped_results, depth=effective_depth)
+        relevant_results = [item for item in ranked_results if _passes_relevance_floor(item, query_tokens=query_tokens)]
+        relevance_filtered_count = len(ranked_results) - len(relevant_results)
+        if document_mode:
+            diverse_results = relevant_results
+            diversity_filtered_count = 0
+        else:
+            diverse_results, diversity_filtered_count = _apply_diversity_caps(
+                relevant_results,
+                max_chunks_per_message=max_chunks_per_message,
+                max_chunks_per_conversation=max_chunks_per_conversation,
+            )
+        results = _renumber_results(diverse_results[:limit])
+        if debug_min_disclosure_tier:
+            results = [_force_min_disclosure_tier(result, debug_min_disclosure_tier) for result in results]
+        results = [_project_hit_for_depth(result) for result in results]
+        lenses = select_lenses_for_query(query_domains, effort)
+        results = [_attach_effort_checks(result, effort=effort, query=query, query_domains=query_domains) for result in results]
+        candidate_counts = {
+            "fts": len(fts_results),
+            "vector": len(vector_results),
+            "curated": len(curated_results),
+            "merged": len(retrieved_results),
+            "before_domain_governance": len(retrieved_results) + len(curated_results),
+            "domain_filtered": domain_filtered_count,
+            "governance_filtered": governance_filtered_count,
+            "scoped": len(scoped_results),
+            "ranked": len(ranked_results),
+            "relevance_filtered": relevance_filtered_count,
+            "after_relevance": len(relevant_results),
+            "diversity_filtered": diversity_filtered_count,
+            "after_diversity": len(diverse_results),
+            "after_filters": len(results),
+        }
+        trace_diagnostics = _search_trace_diagnostics(
+            query=query,
+            requested_subject=subject,
+            resolved_subject_name=resolved_subject.name if resolved_subject is not None else None,
+            subject_alias_target=subject_alias_target,
+            query_domains=query_domains,
+            fts_strategy=fts_strategy,
+            requested_depth=depth,
+            effective_depth=effective_depth,
+            effort=effort,
+            allow_cross_domain=allow_cross_domain,
+            filters_applied=filters_applied,
+            candidate_counts=candidate_counts,
+            debug_min_disclosure_tier=debug_min_disclosure_tier,
+            results=results,
+        )
+        return {
+            "status": "ok",
+            "query": query,
+            "ranking_profile": "hybrid_memory_v1",
+            "domain_detection": {
+                "primary_domain": dominant_domain(query_domains),
+                "domains": query_domains,
+                "effort": effort,
+                "allow_cross_domain": allow_cross_domain,
+                "policy": "heuristic_domain_scoping_v1",
+            },
+            "lenses": lenses,
+            "governance": {
+                "high_risk": bool(high_risk_domains(query_domains)),
+                "domains": high_risk_domains(query_domains),
+                "labels": high_risk_lenses(query_domains),
+                "policy": HIGH_RISK_POLICY_VERSION if high_risk_domains(query_domains) else "standard_v1",
+                "advice_requested": advice_requested,
+                "refuse_unsupported_advice": bool(
+                    high_risk_domains(query_domains)
+                    and advice_requested
+                    and not any(
+                        item.get("high_risk_decision", {}).get("supports_advice")
+                        for item in results
+                    )
+                ),
+                "rejected_evidence": governance_rejections[:20],
+            },
+            "candidate_counts": candidate_counts,
+            "filters_applied": filters_applied,
+            "debug_disclosure": {
+                "min_tier": debug_min_disclosure_tier,
+                "policy": "debug_only" if debug_min_disclosure_tier else None,
+            },
+            "result_quality": _result_quality(results=results, ranked_count=len(ranked_results)),
+            "retrieval_controls": {
+                "minimum_relevance": {
+                    "policy": "lexical_or_semantic_floor_v1",
+                    "lexical_relevance": MIN_LEXICAL_RELEVANCE,
+                    "semantic_similarity": MIN_SEMANTIC_SIMILARITY,
+                    "vector_only_semantic_similarity": MIN_VECTOR_ONLY_SEMANTIC_SIMILARITY,
+                    "curated_lexical_relevance": MIN_CURATED_LEXICAL_RELEVANCE,
+                },
+                "diversity": {
+                    "document_mode": document_mode,
+                    "max_chunks_per_message": None if document_mode else max_chunks_per_message,
+                    "max_chunks_per_conversation": None if document_mode else max_chunks_per_conversation,
+                },
+                "feedback_controls": {
+                    "applied": _dedupe_control_summaries(applied_feedback_controls),
+                    "applied_count": len(_dedupe_control_summaries(applied_feedback_controls)),
+                    "policy": "explicit_applied_controls_only_v1",
+                },
+            },
+            "trace_diagnostics": trace_diagnostics,
+            "results": results,
+            "count": len(results),
+        }
+
+
+def _vector_hits(
+    connection: sqlite3.Connection,
+    *,
+    query: str,
+    query_embedder: EmbeddingFunction | None,
+    subject: str | None,
+    resolved_subject_name: str | None,
+    exclude_source_ids: list[str],
+    exclude_subjects: list[str] | None,
+    title: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    required_tables = {"embedding_models", "chunk_embeddings", "local_embedding_vectors"}
+    if not all(_table_exists(connection, table) for table in required_tables):
+        return []
+
+    model = connection.execute(
+        """
+        SELECT id, provider, model, dimension
+        FROM embedding_models
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if model is None:
+        return []
+
+    embedding_model_id = str(model["id"] if isinstance(model, sqlite3.Row) else model[0])
+    provider = str(model["provider"] if isinstance(model, sqlite3.Row) else model[1])
+    dimension = int(model["dimension"] if isinstance(model, sqlite3.Row) else model[3])
+    if provider == "local":
+        query_vector = deterministic_fallback_embedding(query, dimension)
+    elif query_embedder is not None:
+        query_vector = query_embedder(query, dimension)
+        if len(query_vector) != dimension:
+            raise MemoryObservationError(
+                f"query embedding dimension {len(query_vector)} does not match active model dimension {dimension}",
+                stage="retrieve_vectors",
+                error_code="embedding_dimension_mismatch",
+                source_ref=embedding_model_id,
+            )
+    else:
+        return []
+
+    where = [
+        "chunk_embeddings.embedding_model_id = ?",
+        "chunk_embeddings.vector_backend = ?",
+        "chunk_embeddings.is_stale = 0",
+        "chunk_embeddings.text_sha256 = message_chunks.text_sha256",
+        "message_chunks.is_deleted = 0",
+        "messages.is_deleted = 0",
+        "conversations.is_deleted = 0",
+    ]
+    params: list[Any] = [embedding_model_id, LOCAL_VECTOR_BACKEND]
+    if exclude_source_ids:
+        placeholders = ", ".join("?" for _ in exclude_source_ids)
+        where.append(f"message_chunks.id NOT IN ({placeholders})")
+        where.append(f"messages.id NOT IN ({placeholders})")
+        where.append(f"conversations.id NOT IN ({placeholders})")
+        params.extend(exclude_source_ids)
+        params.extend(exclude_source_ids)
+        params.extend(exclude_source_ids)
+    if title:
+        where.append("conversations.title LIKE ?")
+        params.append(f"%{title}%")
+    if date_from:
+        where.append("COALESCE(messages.created_at, conversations.created_at, '') >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("COALESCE(messages.created_at, conversations.created_at, '') <= ?")
+        params.append(date_to)
+    if subject:
+        if not (_table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects")):
+            return []
+        subject_name = resolved_subject_name or subject
+        subject_clause, subject_params = _message_subject_scope_clause(
+            connection,
+            subject_slug=normalize_subject_slug(subject_name),
+            subject_name=subject_name,
+            chunk_ref="message_chunks.id",
+            conversation_ref="conversations.id",
+        )
+        where.append(subject_clause)
+        params.extend(subject_params)
+    if exclude_subjects and _table_exists(connection, "subjects") and _table_exists(connection, "chunk_subjects"):
+        subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
+        placeholders = ", ".join("?" for _ in subject_slugs)
+        where.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM chunk_subjects excluded_chunk_subjects
+                JOIN subjects excluded_subjects
+                  ON excluded_subjects.id = excluded_chunk_subjects.subject_id
+                WHERE excluded_chunk_subjects.chunk_id = message_chunks.id
+                  AND excluded_subjects.slug IN ({placeholders})
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM conversation_subjects excluded_conversation_subjects
+                JOIN subjects excluded_subjects
+                  ON excluded_subjects.id = excluded_conversation_subjects.subject_id
+                WHERE excluded_conversation_subjects.conversation_id = conversations.id
+                  AND excluded_subjects.slug IN ({placeholders})
+            )
+            """
+        )
+        params.extend(subject_slugs)
+        params.extend(subject_slugs)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            conversations.id AS conversation_id,
+            conversations.source_conversation_id,
+            conversations.title,
+            messages.id AS message_id,
+            messages.role,
+            messages.turn_index,
+            messages.created_at AS message_created_at,
+            message_chunks.id AS chunk_id,
+            message_chunks.chunk_index,
+            message_chunks.source_kind,
+            message_chunks.text,
+            chunk_embeddings.vector_ref
+        FROM chunk_embeddings
+        JOIN local_embedding_vectors ON local_embedding_vectors.vector_ref = chunk_embeddings.vector_ref
+        JOIN message_chunks ON message_chunks.id = chunk_embeddings.chunk_id
+        JOIN messages ON messages.id = message_chunks.message_id
+        JOIN conversations ON conversations.id = message_chunks.conversation_id
+        WHERE {' AND '.join(where)}
+        """,
+        params,
+    ).fetchall()
+
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        similarity = cosine_similarity(query_vector, load_local_vector(connection, str(row["vector_ref"])))
+        if similarity <= 0.0:
+            continue
+        scored.append(
+            _row_to_vector_hit(
+                len(scored) + 1,
+                row,
+                similarity=similarity,
+                embedding_model_id=embedding_model_id,
+                query_tokens=_search_tokens(query),
+                subject_match=1.0 if subject else 0.0,
+            )
+        )
+
+    scored.sort(key=lambda item: (-float(item["semantic_similarity"]), str(item["chunk_id"])))
+    return [{**item, "rank": index} for index, item in enumerate(scored[:limit], start=1)]
+
+
+def _row_to_vector_hit(
+    rank: int,
+    row: sqlite3.Row,
+    *,
+    similarity: float,
+    embedding_model_id: str,
+    query_tokens: list[str],
+    subject_match: float = 0.0,
+) -> dict[str, Any]:
+    text = str(row["text"] or "")
+    redacted = redact_obvious_secrets(text[:280])
+    source_role = row["role"]
+    return {
+        "rank": rank,
+        "score": similarity,
+        "score_breakdown": {
+            "fts_bm25": None,
+            "semantic_similarity": round(similarity, 6),
+            "source_trust": None,
+            "personal_feedback": None,
+        },
+        "keyword_relevance": _lexical_relevance(
+            query_tokens,
+            str(row["title"] or ""),
+            text,
+            str(source_role or ""),
+        ),
+        "semantic_similarity": max(0.0, min(1.0, similarity)),
+        "subject_match": subject_match,
+        "source_kind": row["source_kind"],
+        "retrieval_sources": ["vector"],
+        "embedding_model_id": embedding_model_id,
+        "disclosure_tier": "medium",
+        "exposed_fields": ["title", "role", "snippet", "message_created_at", "ids"],
+        "conversation_id": row["conversation_id"],
+        "source_conversation_id": row["source_conversation_id"],
+        "message_id": row["message_id"],
+        "chunk_id": row["chunk_id"],
+        "title": redact_obvious_secrets(row["title"] or "").text,
+        "role": source_role,
+        "source_role": source_role,
+        "epistemic_status": "assistant_suggested" if source_role == "assistant" else "user_reported",
+        "confidence_basis": "assistant_suggestion_only" if source_role == "assistant" else "single_user_statement",
+        "status": None,
+        "trust_level": None,
+        "turn_index": row["turn_index"],
+        "chunk_index": row["chunk_index"],
+        "message_created_at": row["message_created_at"],
+        "snippet": redacted.text,
+        "chunk_text": redact_obvious_secrets(text).text,
+        "redacted_secret_count": redacted.redacted_count,
+    }
+
+
+def _merge_retrieval_hits(fts_results: list[dict[str, Any]], vector_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for hit in fts_results:
+        chunk_id = str(hit["chunk_id"])
+        merged[chunk_id] = {**hit, "retrieval_sources": ["fts"]}
+    for hit in vector_results:
+        chunk_id = str(hit["chunk_id"])
+        existing = merged.get(chunk_id)
+        if existing is None:
+            merged[chunk_id] = hit
+            continue
+        sources = sorted(set(existing.get("retrieval_sources", [])) | {"vector"})
+        existing["retrieval_sources"] = sources
+        existing["semantic_similarity"] = hit.get("semantic_similarity")
+        existing["embedding_model_id"] = hit.get("embedding_model_id")
+        if isinstance(existing.get("score_breakdown"), dict):
+            existing["score_breakdown"]["semantic_similarity"] = hit.get("semantic_similarity")
+    return list(merged.values())
+
+
+def _row_to_hit(rank: int, row: sqlite3.Row) -> dict[str, Any]:
+    score = float(row["bm25_score"])
+    redacted = redact_obvious_secrets(row["snippet"] or "")
+    source_role = row["role"]
+    return {
+        "rank": rank,
+        "score": score,
+        "score_breakdown": {
+            "fts_bm25": score,
+            "semantic_similarity": None,
+            "source_trust": None,
+            "personal_feedback": None,
+        },
+        "source_kind": row["source_kind"],
+        "disclosure_tier": "medium",
+        "exposed_fields": ["title", "role", "snippet", "message_created_at", "ids"],
+        "conversation_id": row["conversation_id"],
+        "source_conversation_id": row["source_conversation_id"],
+        "message_id": row["message_id"],
+        "chunk_id": row["chunk_id"],
+        "title": redact_obvious_secrets(row["title"] or "").text,
+        "role": source_role,
+        "source_role": source_role,
+        "epistemic_status": "assistant_suggested" if source_role == "assistant" else "user_reported",
+        "confidence_basis": "assistant_suggestion_only" if source_role == "assistant" else "single_user_statement",
+        "status": None,
+        "trust_level": None,
+        "turn_index": row["turn_index"],
+        "chunk_index": row["chunk_index"],
+        "message_created_at": row["message_created_at"],
+        "snippet": redacted.text,
+        "redacted_secret_count": redacted.redacted_count,
+    }
+
+
+def _curated_hits(
+    connection: sqlite3.Connection,
+    *,
+    query: str,
+    subject: str | None,
+    resolved_subject_name: str | None,
+    exclude_source_ids: list[str],
+    exclude_subjects: list[str] | None,
+    title: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not _table_exists(connection, "memory_records"):
+        return []
+    init_curated_memory_schema(connection)
+    tokens = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]*", query)
+    if not tokens:
+        return []
+
+    where = ["memory_records.status = 'active'"]
+    params: list[Any] = []
+    token_clauses, token_params = _curated_token_filter(tokens)
+    if token_clauses and not subject:
+        where.append(f"({' OR '.join(token_clauses)})")
+        params.extend(token_params)
+    if title:
+        where.append("memory_records.title LIKE ?")
+        params.append(f"%{title}%")
+    if date_from:
+        where.append("COALESCE(memory_records.valid_from, memory_records.updated_at, memory_records.created_at, '') >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("COALESCE(memory_records.valid_from, memory_records.updated_at, memory_records.created_at, '') <= ?")
+        params.append(date_to)
+    if exclude_source_ids:
+        placeholders = ", ".join("?" for _ in exclude_source_ids)
+        where.append(f"memory_records.id NOT IN ({placeholders})")
+        params.extend(exclude_source_ids)
+        where.append(f"(memory_records.source_ref IS NULL OR memory_records.source_ref NOT IN ({placeholders}))")
+        params.extend(exclude_source_ids)
+        where.append(
+            f"""
+            NOT EXISTS (
+                SELECT 1
+                FROM memory_links blocked_links
+                WHERE blocked_links.from_kind = 'memory_record'
+                  AND blocked_links.from_id = memory_records.id
+                  AND blocked_links.to_id IN ({placeholders})
+            )
+            """
+        )
+        params.extend(exclude_source_ids)
+    if subject and _table_exists(connection, "subjects"):
+        subject_where, subject_params = _curated_subject_filter(resolved_subject_name or subject)
+        where.append(subject_where)
+        params.extend(subject_params)
+    if exclude_subjects and _table_exists(connection, "subjects"):
+        subject_slugs = [normalize_subject_slug(item) for item in exclude_subjects]
+        placeholders = ", ".join("?" for _ in subject_slugs)
+        where.append(
+            f"""
+            (memory_records.subject_id IS NULL OR memory_records.subject_id NOT IN (
+                SELECT id FROM subjects WHERE slug IN ({placeholders})
+            ))
+            """
+        )
+        params.extend(subject_slugs)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            id, record_type, title, body, subject_id, trust_level,
+            source_kind, source_ref, provenance_json, status, updated_at
+        FROM memory_records
+        WHERE {' AND '.join(where)}
+        ORDER BY updated_at DESC, title COLLATE NOCASE ASC
+        LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
+
+    trust_scores = {"canonical": 1.0, "high": 0.8, "medium": 0.55, "low": 0.25}
+    hits: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, start=1):
+        redacted = redact_obvious_secrets(str(row[3])[:280])
+        trust_level = str(row[5])
+        keyword_relevance = _curated_keyword_relevance(tokens, title=str(row[2] or ""), body=str(row[3] or ""))
+        subject_match = 1.0 if subject else 0.0
+        source_refs = _curated_source_refs(connection, str(row[0]))
+        provenance = _safe_json_loads(str(row[8] or "{}"))
+        subject_name = _curated_subject_name(connection, str(row[4]) if row[4] else None)
+        spam_penalty = 1.0 if _is_low_value_curated_record(title=str(row[2] or ""), body=str(row[3] or ""), source_ref=str(row[7] or "")) else 0.0
+        hits.append(
+            {
+                "rank": index,
+                "score": trust_scores.get(trust_level, 0.5),
+                "score_breakdown": {
+                    "fts_bm25": None,
+                    "semantic_similarity": None,
+                    "source_trust": trust_scores.get(trust_level, 0.5),
+                    "personal_feedback": None,
+                },
+                "keyword_relevance": keyword_relevance,
+                "subject_match": subject_match,
+                "source_kind": "curated_memory",
+                "retrieval_sources": ["curated"],
+                "disclosure_tier": "medium",
+                "exposed_fields": ["title", "record_type", "snippet", "ids"],
+                "conversation_id": None,
+                "source_conversation_id": None,
+                "message_id": None,
+                "chunk_id": row[0],
+                "source_id": row[0],
+                "memory_record_id": row[0],
+                "record_type": row[1],
+                "title": redact_obvious_secrets(str(row[2]) or "").text,
+                "role": row[1],
+                "source_role": None,
+                "epistemic_status": "confirmed" if trust_level in {"canonical", "high"} else "user_reported",
+                "confidence_basis": "multiple_sources_agree" if trust_level == "canonical" else "single_user_statement",
+                "status": row[9],
+                "trust_level": trust_level,
+                "turn_index": None,
+                "chunk_index": None,
+                "message_created_at": row[10],
+                "snippet": redacted.text,
+                "redacted_secret_count": redacted.redacted_count,
+                "curated_trust": trust_scores.get(trust_level, 0.5),
+                "spam_penalty": spam_penalty,
+                "curated_subject_id": row[4],
+                "subject_name": subject_name,
+                "curated_source_kind": row[6],
+                "curated_source_ref": row[7],
+                "source_refs": source_refs,
+                "provenance": provenance,
+            }
+        )
+    return hits
+
+
+def _curated_token_filter(tokens: list[str]) -> tuple[list[str], list[Any]]:
+    token_clauses: list[str] = []
+    params: list[Any] = []
+    for token in tokens:
+        token_clauses.append("(memory_records.title LIKE ? OR memory_records.body LIKE ?)")
+        params.extend([f"%{token}%", f"%{token}%"])
+    return token_clauses, params
+
+
+def _curated_subject_filter(subject: str) -> tuple[str, list[Any]]:
+    subject_slug = normalize_subject_slug(subject)
+    subject_like = f"%{subject}%"
+    return (
+        """
+        (
+            memory_records.subject_id IN (
+                SELECT id FROM subjects WHERE slug = ? OR name LIKE ?
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_links linked_chunks
+                JOIN chunk_subjects ON chunk_subjects.chunk_id = linked_chunks.to_id
+                JOIN subjects linked_chunk_subjects ON linked_chunk_subjects.id = chunk_subjects.subject_id
+                WHERE linked_chunks.from_kind = 'memory_record'
+                  AND linked_chunks.from_id = memory_records.id
+                  AND linked_chunks.to_kind = 'message_chunk'
+                  AND (linked_chunk_subjects.slug = ? OR linked_chunk_subjects.name LIKE ?)
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_links linked_conversations
+                JOIN conversation_subjects ON conversation_subjects.conversation_id = linked_conversations.to_id
+                JOIN subjects linked_conversation_subjects ON linked_conversation_subjects.id = conversation_subjects.subject_id
+                WHERE linked_conversations.from_kind = 'memory_record'
+                  AND linked_conversations.from_id = memory_records.id
+                  AND linked_conversations.to_kind = 'conversation'
+                  AND (linked_conversation_subjects.slug = ? OR linked_conversation_subjects.name LIKE ?)
+            )
+        )
+        """,
+        [subject_slug, subject_like, subject_slug, subject_like, subject_slug, subject_like],
+    )
+
+
+def _curated_keyword_relevance(tokens: list[str], *, title: str, body: str) -> float:
+    if not tokens:
+        return 0.0
+    searchable = f"{title} {body}".lower()
+    matched = sum(1 for token in tokens if token.lower() in searchable)
+    if matched == 0:
+        return 0.0
+    joined = " ".join(token.lower() for token in tokens)
+    title_lower = title.lower()
+    phrase_boost = 0.2 if joined and joined in title_lower else 0.1 if joined and joined in searchable else 0.0
+    title_boost = 0.15 if any(token.lower() in title_lower for token in tokens) else 0.0
+    return min(1.0, 0.25 + (matched / len(tokens)) * 0.55 + phrase_boost + title_boost)
+
+
+def _is_low_value_curated_record(*, title: str, body: str, source_ref: str) -> bool:
+    text = f"{title} {body} {source_ref}".lower()
+    return any(marker in text for marker in ("smoke-test", "smoke test", "browser-smoke", "test focaccia"))
+
+
+def _strict_boundary_domains(query_domains: list[str], subject_name: str | None) -> list[str]:
+    query_specific = [domain for domain in query_domains if domain != "misc"]
+    if query_specific:
+        return query_specific
+    if not subject_name:
+        return []
+    return [domain for domain in classify_text_domains(subject_name) if domain != "misc"]
+
+
+def _passes_strict_domain_boundary(candidate_domains: list[str], boundary_domains: list[str]) -> bool:
+    candidate_specific = [domain for domain in candidate_domains if domain != "misc"]
+    if not candidate_specific:
+        return False
+    return bool(set(candidate_specific) & set(boundary_domains))
+
+
+def _passes_relevance_floor(hit: dict[str, Any], *, query_tokens: list[str]) -> bool:
+    keyword = _float_value(hit.get("score_breakdown"), "keyword_relevance", fallback=hit.get("keyword_relevance"))
+    semantic = _float_value(hit.get("score_breakdown"), "semantic_similarity", fallback=hit.get("semantic_similarity"))
+    source_kind = str(hit.get("source_kind") or "")
+    if hit.get("test_artifact_penalty_reason") and not _query_is_about_memory_testing(query_tokens):
+        return False
+    if _requires_task_entity_match(query_tokens) and not _has_task_entity_match(hit, query_tokens=query_tokens):
+        return False
+    if keyword <= 0.0 and semantic > 0.0:
+        return semantic >= MIN_VECTOR_ONLY_SEMANTIC_SIMILARITY
+    if source_kind == "curated_memory":
+        return keyword >= MIN_CURATED_LEXICAL_RELEVANCE or semantic >= MIN_SEMANTIC_SIMILARITY
+    return keyword >= MIN_LEXICAL_RELEVANCE or semantic >= MIN_SEMANTIC_SIMILARITY
+
+
+def _apply_task_entity_precision(hit: dict[str, Any], *, query_tokens: list[str]) -> dict[str, Any]:
+    updated = dict(hit)
+    if not _requires_task_entity_match(query_tokens):
+        return updated
+    if _has_task_entity_match(updated, query_tokens=query_tokens):
+        updated["task_entity_match"] = 1.0
+        return updated
+    existing_penalty = float(updated.get("spam_penalty") or 0.0)
+    updated["task_entity_match"] = 0.0
+    updated["spam_penalty"] = max(existing_penalty, 0.75)
+    updated["task_entity_penalty_reason"] = "missing_required_query_entity"
+    return updated
+
+
+def _apply_meta_test_noise_penalty(hit: dict[str, Any], *, query_tokens: list[str]) -> dict[str, Any]:
+    if _query_is_about_memory_testing(query_tokens):
+        return hit
+    text = " ".join(str(hit.get(field) or "") for field in ("title", "snippet", "chunk_text")).lower()
+    if not _looks_like_memory_test_artifact(text) and not _looks_like_cross_topic_operational_artifact(
+        text,
+        query_tokens=query_tokens,
+    ):
+        return hit
+    updated = dict(hit)
+    existing_penalty = float(updated.get("spam_penalty") or 0.0)
+    updated["spam_penalty"] = max(existing_penalty, 1.0)
+    updated["test_artifact_penalty_reason"] = "memory_acceptance_or_test_instruction"
+    return updated
+
+
+def _query_is_about_memory_testing(query_tokens: list[str]) -> bool:
+    tokens = {token.lower() for token in query_tokens}
+    return bool(tokens & {"minillm", "acceptance", "test", "tests", "testing", "connector", "mcp", "trace"})
+
+
+def _query_requests_advice(query: str) -> bool:
+    lowered = query.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "should i",
+            "what should",
+            "recommend",
+            "advice",
+            "how much",
+            "dose",
+            "dosage",
+            "can i sue",
+            "what do i do",
+            "what should i invest",
+        )
+    )
+
+
+def _is_authoritative_high_risk_source(hit: dict[str, Any]) -> bool:
+    if hit.get("source_kind") != "curated_memory" or hit.get("trust_level") not in {"high", "canonical"}:
+        return False
+    source_kind = str(hit.get("curated_source_kind") or "").strip().lower().replace("-", "_")
+    return source_kind in {
+        "clinical_guideline",
+        "external_authoritative",
+        "official_source",
+        "regulatory_source",
+    }
+
+
+def _evidence_age_days(value: Any) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 86400.0)
+
+
+def _looks_like_memory_test_artifact(text: str) -> bool:
+    markers = (
+        "acceptance report",
+        "memory system test",
+        "minillm/home acceptance",
+        "submit_agent_feedback",
+        "memory_trace",
+        "memory_status",
+        "memory_context",
+        "memory_search",
+        "memory_review_subjects",
+        "candidate review filter test",
+        "candidate-review filter",
+        "candidate review payload",
+        "debug_min_disclosure_tier",
+        "evaluate:",
+        "run_id",
+        "trace_id",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _looks_like_cross_topic_operational_artifact(text: str, *, query_tokens: list[str]) -> bool:
+    tokens = {token.lower() for token in query_tokens}
+    if not (tokens & {"recipe", "recipes", "baking", "starter", "sourdough", "fermentation", "feeding"}):
+        return False
+    if tokens & {"tailscale", "ssh", "mcp", "connector", "codex", "server", "tunnel", "vpn"}:
+        return False
+    markers = (
+        "tailscale exit node",
+        "tailscale",
+        "ssh",
+        "home mcp",
+        "mcp connector",
+        "browser chatgpt",
+        "codex",
+        "tunnel",
+        "vpn",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _requires_task_entity_match(query_tokens: list[str]) -> bool:
+    return bool(set(token.lower() for token in query_tokens) & _TASK_ENTITY_REQUIREMENT_TOKENS)
+
+
+def _has_task_entity_match(hit: dict[str, Any], *, query_tokens: list[str]) -> bool:
+    text = " ".join(str(hit.get(field) or "") for field in ("title", "snippet", "chunk_text", "subject_name")).lower()
+    required_groups = _task_entity_groups(query_tokens)
+    if not required_groups:
+        return True
+    return all(any(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) for term in group) for group in required_groups)
+
+
+def _task_entity_groups(query_tokens: list[str]) -> list[tuple[str, ...]]:
+    tokens = {token.lower() for token in query_tokens}
+    groups: list[tuple[str, ...]] = []
+    if tokens & {"starter", "sourdough", "levain"}:
+        groups.append(("starter", "sourdough", "levain"))
+    if tokens & {"feeding", "feed", "fed"}:
+        groups.append(("feeding", "feed", "fed", "refresh"))
+    if tokens & {"peak", "peaked", "rise", "rose", "fallen", "fell"}:
+        groups.append(("peak", "peaked", "rise", "rose", "fallen", "fell", "doubled"))
+    return groups
+
+
+def _apply_feedback_controls(
+    hit: dict[str, Any],
+    controls: list[Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not controls:
+        return hit, []
+    identifiers = {
+        str(value)
+        for value in (
+            hit.get("source_id"),
+            hit.get("memory_record_id"),
+            hit.get("chunk_id"),
+            hit.get("message_id"),
+            hit.get("conversation_id"),
+        )
+        if value
+    }
+    updated = dict(hit)
+    applied: list[dict[str, Any]] = []
+    for control in controls:
+        if control.source_id and control.source_id not in identifiers:
+            continue
+        weight = float(control.weight)
+        if weight < 0:
+            updated["spam_penalty"] = max(float(updated.get("spam_penalty") or 0.0), min(1.0, abs(weight)))
+        else:
+            updated["feedback"] = max(float(updated.get("feedback") or 0.0), min(1.0, weight))
+        applied.append(
+            {
+                "id": control.id,
+                "feedback_id": control.feedback_id,
+                "control_type": control.control_type,
+                "source_id": control.source_id,
+                "weight": weight,
+            }
+        )
+    if applied:
+        updated["applied_feedback_controls"] = applied
+    return updated, applied
+
+
+def _dedupe_control_summaries(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for control in controls:
+        control_id = str(control.get("id") or "")
+        if not control_id or control_id in seen:
+            continue
+        seen.add(control_id)
+        deduped.append(control)
+    return deduped
+
+
+def _float_value(score_breakdown: Any, component: str, *, fallback: Any = None) -> float:
+    if isinstance(score_breakdown, dict):
+        components = score_breakdown.get("components")
+        if isinstance(components, dict):
+            entry = components.get(component)
+            if isinstance(entry, dict):
+                try:
+                    return float(entry.get("value") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+    try:
+        return float(fallback or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_diversity_caps(
+    results: list[dict[str, Any]],
+    *,
+    max_chunks_per_message: int | None,
+    max_chunks_per_conversation: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if max_chunks_per_message is None and max_chunks_per_conversation is None:
+        return results, 0
+
+    kept: list[dict[str, Any]] = []
+    message_counts: dict[str, int] = {}
+    conversation_counts: dict[str, int] = {}
+    filtered = 0
+    for item in results:
+        message_id = str(item.get("message_id") or "")
+        conversation_id = str(item.get("conversation_id") or "")
+        if max_chunks_per_message is not None and message_id:
+            if message_counts.get(message_id, 0) >= max_chunks_per_message:
+                filtered += 1
+                continue
+        if max_chunks_per_conversation is not None and conversation_id:
+            if conversation_counts.get(conversation_id, 0) >= max_chunks_per_conversation:
+                filtered += 1
+                continue
+        kept.append(item)
+        if message_id:
+            message_counts[message_id] = message_counts.get(message_id, 0) + 1
+        if conversation_id:
+            conversation_counts[conversation_id] = conversation_counts.get(conversation_id, 0) + 1
+    return kept, filtered
+
+
+def _renumber_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    renumbered: list[dict[str, Any]] = []
+    for rank, item in enumerate(results, start=1):
+        updated = dict(item)
+        updated["rank"] = rank
+        renumbered.append(updated)
+    return renumbered
+
+
+def _result_quality(*, results: list[dict[str, Any]], ranked_count: int) -> str:
+    if results:
+        return "reliable_results"
+    if ranked_count:
+        return "no_reliable_results"
+    return "no_results"
+
+
+def _lexical_relevance(tokens: list[str], *parts: str) -> float:
+    if not tokens:
+        return 0.0
+    searchable = " ".join(parts).lower()
+    if not searchable.strip():
+        return 0.0
+    matched = sum(1 for token in tokens if token.lower() in searchable)
+    if matched == 0:
+        return 0.0
+    joined = " ".join(token.lower() for token in tokens)
+    phrase_bonus = 0.15 if joined and joined in searchable else 0.0
+    return min(1.0, (matched / len(tokens)) + phrase_bonus)
+
+
+def _message_subject_scope_clause(
+    connection: sqlite3.Connection,
+    *,
+    subject_slug: str,
+    subject_name: str,
+    chunk_ref: str,
+    conversation_ref: str,
+) -> tuple[str, list[Any]]:
+    clauses = [
+        f"""
+        EXISTS (
+            SELECT 1
+            FROM chunk_subjects
+            JOIN subjects ON subjects.id = chunk_subjects.subject_id
+            WHERE chunk_subjects.chunk_id = {chunk_ref}
+              AND (subjects.slug = ? OR subjects.name LIKE ?)
+        )
+        """,
+        f"""
+        EXISTS (
+            SELECT 1
+            FROM conversation_subjects
+            JOIN subjects ON subjects.id = conversation_subjects.subject_id
+            WHERE conversation_subjects.conversation_id = {conversation_ref}
+              AND (subjects.slug = ? OR subjects.name LIKE ?)
+        )
+        """,
+    ]
+    params: list[Any] = [subject_slug, f"%{subject_name}%", subject_slug, f"%{subject_name}%"]
+
+    fallback_domain = SUBJECT_DOMAIN_FALLBACKS.get(subject_slug)
+    if fallback_domain is not None and _table_exists(connection, "candidate_memories"):
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM candidate_memories
+                WHERE candidate_memories.chunk_id = {chunk_ref}
+                  AND candidate_memories.domain_primary = ?
+            )
+            """
+        )
+        params.append(fallback_domain)
+
+    return "(\n" + "\nOR\n".join(clauses) + "\n)", params
+
+
+def _curated_source_refs(connection: sqlite3.Connection, record_id: str) -> list[dict[str, Any]]:
+    if not _table_exists(connection, "memory_links"):
+        return []
+    rows = connection.execute(
+        """
+        SELECT to_kind, to_id, link_type, confidence, notes
+        FROM memory_links
+        WHERE from_kind = 'memory_record'
+          AND from_id = ?
+        ORDER BY link_type, to_kind, to_id
+        """,
+        (record_id,),
+    ).fetchall()
+    return [
+        {
+            "source_kind": row[0],
+            "source_id": row[1],
+            "link_type": row[2],
+            "confidence": row[3],
+            "notes": row[4],
+        }
+        for row in rows
+    ]
+
+
+def _curated_subject_name(connection: sqlite3.Connection, subject_id: str | None) -> str | None:
+    if not subject_id or not _table_exists(connection, "subjects"):
+        return None
+    row = connection.execute("SELECT name FROM subjects WHERE id = ?", (subject_id,)).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _safe_json_loads(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _empty_result(*, query: str, ranking_profile: str, filters_applied: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_counts = {
+        "fts": 0,
+        "vector": 0,
+        "curated": 0,
+        "merged": 0,
+        "before_domain_governance": 0,
+        "domain_filtered": 0,
+        "governance_filtered": 0,
+        "scoped": 0,
+        "ranked": 0,
+        "relevance_filtered": 0,
+        "after_relevance": 0,
+        "diversity_filtered": 0,
+        "after_diversity": 0,
+        "after_filters": 0,
+    }
+    return {
+        "status": "ok",
+        "query": query,
+        "ranking_profile": ranking_profile,
+        "candidate_counts": candidate_counts,
+        "filters_applied": filters_applied,
+        "result_quality": "no_reliable_results",
+        "trace_diagnostics": _search_trace_diagnostics(
+            query=query,
+            requested_subject=None,
+            resolved_subject_name=None,
+            subject_alias_target=None,
+            query_domains=detect_query_domains(query),
+            fts_strategy="not_run",
+            requested_depth="medium",
+            effective_depth="medium",
+            effort=2,
+            allow_cross_domain=False,
+            filters_applied=filters_applied,
+            candidate_counts=candidate_counts,
+            debug_min_disclosure_tier=None,
+            results=[],
+        ),
+        "results": [],
+        "count": 0,
+    }
+
+
+def _search_trace_diagnostics(
+    *,
+    query: str,
+    requested_subject: str | None,
+    resolved_subject_name: str | None,
+    subject_alias_target: str | None,
+    query_domains: list[str],
+    fts_strategy: str,
+    requested_depth: str,
+    effective_depth: str,
+    effort: int,
+    allow_cross_domain: bool,
+    filters_applied: list[dict[str, Any]],
+    candidate_counts: dict[str, int],
+    debug_min_disclosure_tier: str | None,
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    top_results = []
+    for item in results[:5]:
+        score_breakdown = item.get("score_breakdown") if isinstance(item.get("score_breakdown"), dict) else {}
+        top_results.append(
+            {
+                "rank": item.get("rank"),
+                "source_kind": item.get("source_kind"),
+                "source_id": item.get("source_id") or item.get("memory_record_id") or item.get("chunk_id"),
+                "title": item.get("title"),
+                "score": item.get("score"),
+                "retrieval_sources": item.get("retrieval_sources", []),
+                "domain_primary": item.get("domain_primary"),
+                "domain_relation": item.get("domain_relation"),
+                "disclosure_tier": item.get("disclosure_tier"),
+                "score_components": score_breakdown.get("components", {}),
+            }
+        )
+    return [
+        {
+            "stage": "subject_resolution",
+            "message": "Resolved requested memory subject.",
+            "details": {
+                "requested_subject": requested_subject,
+                "resolved_subject": resolved_subject_name,
+                "alias_target": subject_alias_target,
+                "subject_filter_active": bool(requested_subject),
+            },
+        },
+        {
+            "stage": "domain_detection",
+            "message": "Detected query domains and governance scope.",
+            "details": {
+                "primary_domain": dominant_domain(query_domains),
+                "domains": query_domains,
+                "effort": effort,
+                "allow_cross_domain": allow_cross_domain,
+            },
+        },
+        {
+            "stage": "retrieval_sources",
+            "message": "Collected raw retrieval candidates.",
+            "details": {
+                "fts_strategy": fts_strategy,
+                "counts": {
+                    "fts": candidate_counts.get("fts", 0),
+                    "vector": candidate_counts.get("vector", 0),
+                    "curated": candidate_counts.get("curated", 0),
+                    "merged": candidate_counts.get("merged", 0),
+                },
+            },
+        },
+        {
+            "stage": "apply_filters",
+            "message": "Applied explicit filters, domain scope, and governance policy.",
+            "details": {
+                "filters_applied": filters_applied,
+                "before_domain_governance": candidate_counts.get("before_domain_governance", 0),
+                "domain_filtered": candidate_counts.get("domain_filtered", 0),
+                "governance_filtered": candidate_counts.get("governance_filtered", 0),
+                "relevance_filtered": candidate_counts.get("relevance_filtered", 0),
+                "after_relevance": candidate_counts.get("after_relevance", 0),
+                "diversity_filtered": candidate_counts.get("diversity_filtered", 0),
+                "after_diversity": candidate_counts.get("after_diversity", 0),
+                "scoped": candidate_counts.get("scoped", 0),
+            },
+        },
+        {
+            "stage": "rank_results",
+            "message": "Ranked memory results with inspectable score components.",
+            "details": {
+                "ranking_profile": "hybrid_memory_v1",
+                "ranked": candidate_counts.get("ranked", 0),
+                "returned": candidate_counts.get("after_filters", 0),
+                "top_results": top_results,
+            },
+        },
+        {
+            "stage": "apply_disclosure",
+            "message": "Projected results to the allowed disclosure tier.",
+            "details": {
+                "requested_depth": requested_depth,
+                "effective_depth": effective_depth,
+                "debug_min_disclosure_tier": debug_min_disclosure_tier,
+                "tiers": _tier_counts(results),
+            },
+        },
+    ]
+
+
+def _tier_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in results:
+        tier = str(item.get("disclosure_tier") or "unknown")
+        counts[tier] = counts.get(tier, 0) + 1
+    return counts
+
+
+def _project_hit_for_depth(hit: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(hit)
+    exposed_fields = set(projected.get("exposed_fields", []))
+    if "snippet" not in exposed_fields:
+        projected.pop("snippet", None)
+    if "role" not in exposed_fields:
+        projected.pop("role", None)
+    if "chunk_text" not in exposed_fields:
+        projected.pop("chunk_text", None)
+    if "nearby_turn_refs" not in exposed_fields:
+        projected.pop("nearby_turn_refs", None)
+    if "conversation_window" not in exposed_fields:
+        projected.pop("conversation_window", None)
+    if "related_curated_memories" not in exposed_fields:
+        projected.pop("related_curated_memories", None)
+    projected["title"] = redact_obvious_secrets(str(projected.get("title") or "")).text
+    return projected
+
+
+def _force_min_disclosure_tier(hit: dict[str, Any], min_tier: str) -> dict[str, Any]:
+    if min_tier not in DISCLOSURE_TIERS:
+        raise ValueError(f"debug_min_disclosure_tier must be one of: {', '.join(DISCLOSURE_TIERS)}")
+    current_tier = str(hit.get("disclosure_tier") or "far")
+    if current_tier not in DISCLOSURE_TIERS:
+        current_tier = "far"
+    current_index = DISCLOSURE_TIERS.index(current_tier)
+    min_index = DISCLOSURE_TIERS.index(min_tier)
+    if current_index >= min_index:
+        return hit
+    updated = dict(hit)
+    updated["disclosure_tier"] = min_tier
+    updated["exposed_fields"] = list(EXPOSED_FIELDS_BY_TIER[min_tier])
+    updated["debug_disclosure_forced"] = True
+    return updated
+
+
+def _attach_effort_checks(hit: dict[str, Any], *, effort: int, query: str, query_domains: list[str]) -> dict[str, Any]:
+    projected = dict(hit)
+    validation_checks = {
+        "temporal": {"status": "not_run" if effort < 4 else _temporal_status(projected)},
+        "contradiction": {"status": "not_run" if effort < 4 else _contradiction_status(projected, query, query_domains)},
+    }
+    projected["validation_checks"] = validation_checks
+    projected["effort"] = effort
+    return projected
+
+
+FTS_STOP_WORDS = {
+    "a",
+    "about",
+    "after",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "before",
+    "do",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "know",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "should",
+    "that",
+    "the",
+    "this",
+    "to",
+    "what",
+    "when",
+    "where",
+    "with",
+}
+
+_TASK_ENTITY_REQUIREMENT_TOKENS = {
+    "starter",
+    "sourdough",
+    "levain",
+}
+
+
+def _fts_queries(query: str) -> list[tuple[str, str]]:
+    tokens = _search_tokens(query)
+    if not tokens:
+        return []
+    precise = " ".join(_quoted_fts_token(token) for token in tokens)
+    if len(tokens) == 1:
+        return [("precise_all_terms", precise)]
+    broad = " OR ".join(_quoted_fts_token(token) for token in tokens)
+    return [("precise_all_terms", precise), ("broad_any_terms", broad)]
+
+
+def _search_tokens(query: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]*", query)
+    filtered = [token for token in tokens if token.lower() not in FTS_STOP_WORDS]
+    return filtered or tokens
+
+
+def _quoted_fts_token(token: str) -> str:
+    return f'"{token.replace(chr(34), chr(34) + chr(34))}"'
+
+
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _slug(value: str) -> str:
+    return normalize_subject_slug(value)
+
+
+def _effort_depth_cap(depth: str, effort: int) -> str:
+    effort_depth = {
+        1: "far",
+        2: "medium",
+        3: "close",
+    }.get(effort, "full")
+    tiers = ("far", "medium", "close", "full")
+    if depth not in tiers:
+        raise ValueError(f"depth must be one of: {', '.join(tiers)}")
+    return tiers[min(tiers.index(depth), tiers.index(effort_depth))]
+
+
+def _temporal_status(hit: dict[str, Any]) -> str:
+    status = str(hit.get("status") or "").lower()
+    if status in {"stale", "superseded", "archived", "deleted"}:
+        return status
+    valid_to = hit.get("valid_to")
+    if valid_to:
+        return "stale"
+    return "current"
+
+
+def _contradiction_status(hit: dict[str, Any], query: str, query_domains: list[str]) -> str:
+    text = " ".join(str(hit.get(field) or "") for field in ("title", "snippet", "role")).lower()
+    query_text = query.lower()
+    if any(token in text for token in ("not ", "never", "instead", "avoid", "failed", "wrong", "contradict")) and any(
+        token in query_text for token in ("not", "avoid", "should", "wrong", "fail")
+    ):
+        return "possible"
+    if query_domains and hit.get("domain_relation") in {"transfer", "analogy"}:
+        return "review"
+    return "not_detected"

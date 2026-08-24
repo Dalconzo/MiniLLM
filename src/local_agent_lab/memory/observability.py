@@ -1,0 +1,864 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from ..sqlite_utils import sqlite_connection
+from uuid import uuid4
+
+from ..logging.run_logger import RunContext, RunLogger
+
+
+CHATGPT_MEMORY_DB = "chatgpt_memory.sqlite3"
+TRACE_FILE = "trace.jsonl"
+
+
+class MemoryObservationError(RuntimeError):
+    def __init__(self, message: str, *, stage: str, error_code: str, source_ref: str | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.error_code = error_code
+        self.source_ref = source_ref
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "message": str(self),
+            "stage": self.stage,
+            "error_code": self.error_code,
+            "source_ref": self.source_ref,
+        }
+
+
+@dataclass
+class MemoryTraceWriter:
+    logger: RunLogger
+    run: RunContext
+    command: str
+    argv: list[str]
+    config_path: Path
+    sqlite_path: Path
+    input_paths: list[str] = field(default_factory=list)
+    output_paths: list[str] = field(default_factory=list)
+    schema_version: int | None = None
+
+    def __post_init__(self) -> None:
+        self.trace_path = self.run.run_dir / TRACE_FILE
+        self.trace_path.touch(exist_ok=True)
+
+    def trace(
+        self,
+        stage: str,
+        message: str,
+        *,
+        level: str = "info",
+        source_kind: str | None = None,
+        source_ref: str | None = None,
+        record_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        event = {
+            "id": f"trc_{uuid4().hex}",
+            "timestamp": utc_now(),
+            "stage": stage,
+            "level": level,
+            "message": message,
+            "source_kind": source_kind,
+            "source_ref": source_ref,
+            "record_id": record_id,
+            "details": details or {},
+        }
+        with self.trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        return event
+
+    def write_json(self, name: str, payload: dict[str, Any]) -> Path:
+        path = self.run.run_dir / name
+        self.logger.write_artifact(self.run, name, json.dumps(payload, indent=2, sort_keys=True))
+        if str(path) not in self.output_paths:
+            self.output_paths.append(str(path))
+        return path
+
+    def finish(self, *, status: str, result: dict[str, Any], error: dict[str, Any] | None = None) -> None:
+        command_payload = {
+            "run_id": self.run.run_id,
+            "command": self.command,
+            "argv": self.argv,
+            "started_at": self.run.started_at,
+            "finished_at": utc_now(),
+            "status": status,
+            "config_path": str(self.config_path),
+            "artifact_dir": str(self.run.run_dir),
+            "input_paths": self.input_paths,
+            "output_paths": self.output_paths,
+            "sqlite_path": str(self.sqlite_path),
+            "schema_version": self.schema_version,
+            "error": error,
+        }
+        self.logger.write_artifact(self.run, "command.json", json.dumps(command_payload, indent=2, sort_keys=True))
+        self.logger.finish(self.run, status=status, result=result)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def memory_db_path(memory_dir: Path) -> Path:
+    return memory_dir / CHATGPT_MEMORY_DB
+
+
+def validate_memory_state(*, data_dir: Path, memory_dir: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    exports_dir = data_dir / "chatgpt_exports"
+    raw_dir = exports_dir / "raw"
+    parsed_dir = exports_dir / "parsed"
+    sqlite_path = memory_db_path(memory_dir)
+
+    _check_path(checks, "chatgpt_exports_dir", exports_dir, required=False)
+    _check_path(checks, "raw_exports_dir", raw_dir, required=False)
+    _check_path(checks, "parsed_exports_dir", parsed_dir, required=False)
+    _check_path(checks, "memory_dir", memory_dir, required=True)
+
+    if sqlite_path.exists():
+        checks.extend(_validate_sqlite(sqlite_path))
+    else:
+        checks.append(
+            {
+                "name": "sqlite_database",
+                "status": "warn",
+                "message": "ChatGPT memory database does not exist yet.",
+                "path": str(sqlite_path),
+            }
+        )
+
+    if parsed_dir.exists():
+        checks.extend(_validate_jsonl_files(parsed_dir))
+
+    error_count = sum(1 for check in checks if check["status"] == "error")
+    warning_count = sum(1 for check in checks if check["status"] == "warn")
+    status = "error" if error_count else "warn" if warning_count else "ok"
+    return {
+        "status": status,
+        "checked_at": utc_now(),
+        "data_dir": str(data_dir),
+        "memory_dir": str(memory_dir),
+        "sqlite_path": str(sqlite_path),
+        "summary": {
+            "checks": len(checks),
+            "errors": error_count,
+            "warnings": warning_count,
+        },
+        "checks": checks,
+    }
+
+
+def summarize_memory_status(*, data_dir: Path, memory_dir: Path, logs_dir: Path, recent_limit: int = 5) -> dict[str, Any]:
+    report = validate_memory_state(data_dir=data_dir, memory_dir=memory_dir)
+    sqlite_path = memory_db_path(memory_dir)
+    checked_at = utc_now()
+
+    sqlite_summary: dict[str, Any] = {
+        "exists": sqlite_path.exists(),
+        "counts": {},
+        "latest_import": None,
+        "embedding_health": {
+            "status": "missing_database" if not sqlite_path.exists() else "unknown",
+            "coverage_ratio": 0.0,
+            "embedded_chunks": 0,
+            "missing_chunks": 0,
+            "stale_chunks": 0,
+            "active_model": None,
+        },
+        "corpus_freshness": {
+            "status": "missing_database" if not sqlite_path.exists() else "unknown",
+            "checked_at": checked_at,
+            "latest_source_message": None,
+            "latest_imported_at": None,
+            "latest_import_id": None,
+            "import_lag_days": None,
+            "threshold_days": {"current": 14, "stale": 45},
+        },
+    }
+    if sqlite_path.exists():
+        with sqlite_connection(sqlite_path) as connection:
+            sqlite_summary["counts"] = _sqlite_counts(connection)
+            sqlite_summary["embedding_coverage"] = _embedding_coverage_summary(connection)
+            sqlite_summary["embedding_health"] = _embedding_health_summary(sqlite_summary["embedding_coverage"])
+            latest_import = connection.execute(
+                """
+                SELECT id, source_root, raw_manifest_path, imported_at, status, parser_version,
+                       file_count, conversation_count, message_count, chunk_count, attachment_count, content_sha256, notes
+                FROM imports
+                ORDER BY imported_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest_import:
+                sqlite_summary["latest_import"] = {
+                    "id": latest_import[0],
+                    "source_root": latest_import[1],
+                    "raw_manifest_path": latest_import[2],
+                    "imported_at": latest_import[3],
+                    "status": latest_import[4],
+                    "parser_version": latest_import[5],
+                    "file_count": latest_import[6],
+                    "conversation_count": latest_import[7],
+                    "message_count": latest_import[8],
+                    "chunk_count": latest_import[9],
+                    "attachment_count": latest_import[10],
+                    "content_sha256": latest_import[11],
+                    "notes": latest_import[12],
+                    "candidate_memory_count": _count_candidates_for_import(connection, latest_import[0]),
+                }
+            sqlite_summary["corpus_freshness"] = _corpus_freshness_summary(
+                connection,
+                checked_at=checked_at,
+                latest_import=sqlite_summary["latest_import"],
+            )
+
+    recent_runs = list_recent_runs(logs_dir, limit=recent_limit)
+    return {
+        "status": report["status"],
+        "checked_at": report["checked_at"],
+        "data_dir": str(data_dir),
+        "memory_dir": str(memory_dir),
+        "logs_dir": str(logs_dir),
+        "validation": report,
+        "sqlite": sqlite_summary,
+        "recent_runs": recent_runs,
+    }
+
+
+def list_recent_runs(logs_dir: Path, *, limit: int = 5) -> list[dict[str, Any]]:
+    if not logs_dir.exists():
+        return []
+
+    runs: list[dict[str, Any]] = []
+    for run_dir in logs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        command_path = run_dir / "command.json"
+        if not command_path.exists():
+            continue
+        try:
+            command = _read_json(command_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        runs.append(
+            {
+                "run_id": command.get("run_id", run_dir.name),
+                "command": command.get("command"),
+                "status": command.get("status"),
+                "started_at": command.get("started_at"),
+                "finished_at": command.get("finished_at"),
+                "artifact_dir": command.get("artifact_dir", str(run_dir)),
+                "artifact_count": len(command.get("output_paths", []) or []),
+                "error": command.get("error"),
+            }
+        )
+
+    def sort_key(item: dict[str, Any]) -> tuple[str, str]:
+        return (str(item.get("finished_at") or item.get("started_at") or ""), str(item.get("run_id") or ""))
+
+    return sorted(runs, key=sort_key, reverse=True)[:limit]
+
+
+def dry_run_chatgpt_ingest(input_path: Path) -> dict[str, Any]:
+    if not input_path.exists():
+        raise MemoryObservationError(
+            f"input path does not exist: {input_path}",
+            stage="discover_input",
+            error_code="input_not_found",
+            source_ref=str(input_path),
+        )
+
+    conversation_files = _find_conversation_files(input_path)
+    files: list[dict[str, Any]] = []
+    total_conversations = 0
+    total_errors = 0
+
+    for path in conversation_files:
+        item: dict[str, Any] = {
+            "path": str(path),
+            "recognized": True,
+            "conversation_count": 0,
+            "error": None,
+        }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                item["conversation_count"] = len(payload)
+            elif isinstance(payload, dict):
+                item["conversation_count"] = 1
+            else:
+                raise ValueError(f"unsupported top-level JSON type: {type(payload).__name__}")
+            total_conversations += int(item["conversation_count"])
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError) as exc:
+            item["error"] = {
+                "stage": "parse_export",
+                "error_code": "invalid_json" if isinstance(exc, json.JSONDecodeError) else "parse_error",
+                "message": str(exc),
+            }
+            total_errors += 1
+        files.append(item)
+
+    if not conversation_files:
+        files.append(
+            {
+                "path": str(input_path),
+                "recognized": False,
+                "conversation_count": 0,
+                "error": {
+                    "stage": "discover_input",
+                    "error_code": "unsupported_export_shape",
+                    "message": "No conversations.json files found.",
+                },
+            }
+        )
+        total_errors += 1
+
+    return {
+        "status": "error" if total_errors else "ok",
+        "dry_run": True,
+        "input_path": str(input_path),
+        "conversation_files": files,
+        "summary": {
+            "conversation_files": len(conversation_files),
+            "conversations": total_conversations,
+            "errors": total_errors,
+        },
+        "planned_writes": [
+            "data/chatgpt_exports/parsed/<import_id>/conversations.jsonl",
+            "data/chatgpt_exports/parsed/<import_id>/messages.jsonl",
+            "data/chatgpt_exports/parsed/<import_id>/chunks.jsonl",
+            "data/chatgpt_exports/parsed/<import_id>/import_report.json",
+            "data/memory/chatgpt_memory.sqlite3",
+        ],
+    }
+
+
+def build_unimplemented_search_explain(query: str) -> dict[str, Any]:
+    return {
+        "status": "not_implemented",
+        "query": query,
+        "ranking_profile": "fts_first_v0",
+        "candidate_counts": {
+            "fts": 0,
+            "vector": 0,
+            "curated": 0,
+            "after_filters": 0,
+        },
+        "filters_applied": [],
+        "results": [],
+        "error": {
+            "stage": "retrieve_candidates",
+            "error_code": "memory_search_not_implemented",
+            "message": "ChatGPT memory search has not been implemented yet.",
+        },
+    }
+
+
+def read_memory_trace(logs_dir: Path, run_id: str) -> dict[str, Any]:
+    run_dir = logs_dir / run_id
+    if not run_dir.exists() or not run_dir.is_dir():
+        raise FileNotFoundError(f"run_id not found: {run_id}")
+
+    command_path = run_dir / "command.json"
+    command = _read_json(command_path) if command_path.exists() else None
+    events = _read_jsonl(run_dir / TRACE_FILE)
+    artifacts = sorted(path.name for path in run_dir.iterdir() if path.is_file())
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "command": command,
+        "trace_events": events,
+        "artifacts": artifacts,
+    }
+
+
+def render_memory_trace(trace: dict[str, Any]) -> str:
+    lines = [
+        f"Run: {trace['run_id']}",
+        f"Directory: {trace['run_dir']}",
+    ]
+    command = trace.get("command")
+    if command:
+        lines.extend(
+            [
+                f"Command: {command.get('command')}",
+                f"Status: {command.get('status')}",
+            ]
+        )
+        error = command.get("error")
+        if error:
+            lines.append(f"Error: {error.get('stage')} / {error.get('error_code')} - {error.get('message')}")
+
+    lines.append("Artifacts:")
+    for artifact in trace["artifacts"]:
+        lines.append(f"- {artifact}")
+
+    lines.append("Trace:")
+    if not trace["trace_events"]:
+        lines.append("- No trace events recorded.")
+    for event in trace["trace_events"]:
+        source = f" [{event.get('source_ref')}]" if event.get("source_ref") else ""
+        lines.append(f"- {event.get('timestamp')} {event.get('level')} {event.get('stage')}{source}: {event.get('message')}")
+    return "\n".join(lines)
+
+
+def _find_conversation_files(input_path: Path) -> list[Path]:
+    if input_path.is_file() and input_path.name.startswith("conversations") and input_path.suffix == ".json":
+        return [input_path]
+    if input_path.is_dir():
+        direct = input_path / "conversations.json"
+        if direct.exists():
+            return [direct]
+        return sorted(
+            path
+            for path in input_path.rglob("*.json")
+            if path.is_file() and path.name.startswith("conversations") and path.suffix == ".json"
+        )
+    return []
+
+
+def _check_path(checks: list[dict[str, Any]], name: str, path: Path, *, required: bool) -> None:
+    if path.exists():
+        checks.append({"name": name, "status": "ok", "message": "Path exists.", "path": str(path)})
+    elif required:
+        checks.append({"name": name, "status": "error", "message": "Required path is missing.", "path": str(path)})
+    else:
+        checks.append({"name": name, "status": "warn", "message": "Path does not exist yet.", "path": str(path)})
+
+
+def _sqlite_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table in (
+        "imports",
+        "conversations",
+        "messages",
+        "message_chunks",
+        "candidate_memories",
+        "memory_records",
+        "subjects",
+        "retrieval_events",
+        "retrieval_exposures",
+        "chunk_embeddings",
+    ):
+        try:
+            counts[table] = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        except sqlite3.Error:
+            counts[table] = 0
+    return counts
+
+
+def _embedding_coverage_summary(connection: sqlite3.Connection) -> dict[str, Any]:
+    tables = _sqlite_tables(connection)
+    total_chunks = _safe_count(connection, "message_chunks", "is_deleted = 0") if "message_chunks" in tables else 0
+    if "embedding_models" not in tables or "chunk_embeddings" not in tables:
+        return {
+            "status": "missing_schema" if total_chunks else "empty",
+            "total_chunks": total_chunks,
+            "embedded_chunks": 0,
+            "missing_chunks": total_chunks,
+            "stale_chunks": 0,
+            "coverage_ratio": 0.0,
+            "active_model": None,
+            "models": [],
+        }
+
+    model_rows = connection.execute(
+        """
+        SELECT id, provider, model, dimension, normalize, created_at, metadata_json
+        FROM embedding_models
+        ORDER BY created_at DESC, id DESC
+        """
+    ).fetchall()
+    models: list[dict[str, Any]] = []
+    for row in model_rows:
+        model_id = str(row[0])
+        embedded_chunks = _embedded_chunk_count(connection, model_id=model_id)
+        stale_chunks = _stale_chunk_count(connection, model_id=model_id)
+        missing_chunks = max(total_chunks - embedded_chunks, 0)
+        models.append(
+            {
+                "id": model_id,
+                "provider": row[1],
+                "model": row[2],
+                "dimension": int(row[3]),
+                "normalize": bool(row[4]),
+                "created_at": row[5],
+                "metadata": _safe_json_object(row[6]),
+                "embedded_chunks": embedded_chunks,
+                "missing_chunks": missing_chunks,
+                "stale_chunks": stale_chunks,
+                "coverage_ratio": _coverage_ratio(embedded_chunks - stale_chunks, total_chunks),
+            }
+        )
+
+    active_model = models[0] if models else None
+    if active_model is None:
+        status = "empty" if total_chunks == 0 else "no_model"
+        embedded_chunks = 0
+        missing_chunks = total_chunks
+        stale_chunks = 0
+        coverage_ratio = 0.0
+    else:
+        embedded_chunks = int(active_model["embedded_chunks"])
+        missing_chunks = int(active_model["missing_chunks"])
+        stale_chunks = int(active_model["stale_chunks"])
+        coverage_ratio = float(active_model["coverage_ratio"])
+        status = "ok" if missing_chunks == 0 and stale_chunks == 0 else "partial"
+
+    return {
+        "status": status,
+        "total_chunks": total_chunks,
+        "embedded_chunks": embedded_chunks,
+        "missing_chunks": missing_chunks,
+        "stale_chunks": stale_chunks,
+        "coverage_ratio": coverage_ratio,
+        "active_model": active_model,
+        "models": models,
+    }
+
+
+def _embedding_health_summary(embedding_coverage: dict[str, Any]) -> dict[str, Any]:
+    active_model = embedding_coverage.get("active_model")
+    return {
+        "status": embedding_coverage.get("status"),
+        "coverage_ratio": embedding_coverage.get("coverage_ratio", 0.0),
+        "total_chunks": embedding_coverage.get("total_chunks", 0),
+        "embedded_chunks": embedding_coverage.get("embedded_chunks", 0),
+        "missing_chunks": embedding_coverage.get("missing_chunks", 0),
+        "stale_chunks": embedding_coverage.get("stale_chunks", 0),
+        "active_model": active_model,
+    }
+
+
+def _corpus_freshness_summary(
+    connection: sqlite3.Connection,
+    *,
+    checked_at: str,
+    latest_import: dict[str, Any] | None,
+) -> dict[str, Any]:
+    latest_message = connection.execute(
+        """
+        SELECT messages.id, messages.created_at, messages.role, conversations.id, conversations.title
+        FROM messages
+        JOIN conversations ON conversations.id = messages.conversation_id
+        WHERE messages.created_at IS NOT NULL
+          AND messages.created_at != ''
+          AND messages.is_deleted = 0
+        ORDER BY messages.created_at DESC, messages.id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    latest_source_message = None
+    if latest_message:
+        latest_source_message = {
+            "message_id": latest_message[0],
+            "created_at": latest_message[1],
+            "role": latest_message[2],
+            "conversation_id": latest_message[3],
+            "conversation_title": latest_message[4],
+        }
+
+    latest_message_dt = _parse_datetime(latest_source_message["created_at"]) if latest_source_message else None
+    checked_dt = _parse_datetime(checked_at)
+    import_lag_days = None
+    status = "empty"
+    if latest_source_message is None:
+        status = "empty"
+    elif latest_message_dt is None or checked_dt is None:
+        status = "unknown"
+    else:
+        import_lag_days = max((checked_dt - latest_message_dt).total_seconds() / 86400, 0.0)
+        if import_lag_days <= 14:
+            status = "current"
+        elif import_lag_days <= 45:
+            status = "aging"
+        else:
+            status = "stale"
+
+    return {
+        "status": status,
+        "checked_at": checked_at,
+        "latest_source_message": latest_source_message,
+        "latest_imported_at": latest_import.get("imported_at") if latest_import else None,
+        "latest_import_id": latest_import.get("id") if latest_import else None,
+        "import_lag_days": round(import_lag_days, 3) if import_lag_days is not None else None,
+        "threshold_days": {"current": 14, "stale": 45},
+    }
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _sqlite_tables(connection: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
+        ).fetchall()
+    }
+
+
+def _safe_count(connection: sqlite3.Connection, table: str, where: str | None = None) -> int:
+    try:
+        sql = f"SELECT COUNT(*) FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        return int(connection.execute(sql).fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
+def _embedded_chunk_count(connection: sqlite3.Connection, *, model_id: str) -> int:
+    try:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM chunk_embeddings
+                JOIN message_chunks ON message_chunks.id = chunk_embeddings.chunk_id
+                WHERE chunk_embeddings.embedding_model_id = ?
+                  AND message_chunks.is_deleted = 0
+                """,
+                (model_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def _stale_chunk_count(connection: sqlite3.Connection, *, model_id: str) -> int:
+    try:
+        return int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM chunk_embeddings
+                JOIN message_chunks ON message_chunks.id = chunk_embeddings.chunk_id
+                WHERE chunk_embeddings.embedding_model_id = ?
+                  AND chunk_embeddings.is_stale = 1
+                  AND message_chunks.is_deleted = 0
+                """,
+                (model_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def _coverage_ratio(usable_embeddings: int, total_chunks: int) -> float:
+    if total_chunks <= 0:
+        return 1.0
+    return round(max(usable_embeddings, 0) / total_chunks, 6)
+
+
+def _safe_json_object(value: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _count_candidates_for_import(connection: sqlite3.Connection, import_id: str) -> int:
+    try:
+        return int(
+            connection.execute(
+                "SELECT COUNT(*) FROM candidate_memories WHERE import_id = ?",
+                (import_id,),
+            ).fetchone()[0]
+        )
+    except sqlite3.Error:
+        return 0
+
+
+def _validate_sqlite(sqlite_path: Path) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    try:
+        with sqlite_connection(sqlite_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')"
+                ).fetchall()
+            }
+            required = {"imports", "conversations", "messages", "message_chunks"}
+            missing = sorted(required - tables)
+            checks.append(
+                {
+                    "name": "sqlite_schema",
+                    "status": "error" if missing else "ok",
+                    "message": "Missing required tables." if missing else "Required tables exist.",
+                    "path": str(sqlite_path),
+                    "details": {"missing_tables": missing, "tables": sorted(tables)},
+                }
+            )
+            if not missing and {"subjects", "chunk_subjects", "conversation_subjects"}.issubset(tables):
+                checks.extend(_validate_subject_provenance(connection, path=sqlite_path))
+    except sqlite3.Error as exc:
+        checks.append(
+            {
+                "name": "sqlite_open",
+                "status": "error",
+                "message": str(exc),
+                "path": str(sqlite_path),
+            }
+        )
+    return checks
+
+
+def _validate_subject_provenance(connection: sqlite3.Connection, *, path: Path) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    chunk_without_conversation_rows = connection.execute(
+        """
+        SELECT s.name, COUNT(DISTINCT chs.chunk_id) AS chunk_count
+        FROM subjects s
+        JOIN chunk_subjects chs ON chs.subject_id = s.id
+        JOIN message_chunks mc ON mc.id = chs.chunk_id AND mc.is_deleted = 0
+        LEFT JOIN conversations c ON c.id = mc.conversation_id AND c.is_deleted = 0
+        WHERE c.id IS NULL
+        GROUP BY s.id
+        HAVING chunk_count > 0
+        ORDER BY chunk_count DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    if chunk_without_conversation_rows:
+        checks.append(
+            {
+                "name": "subject_chunk_conversation_provenance",
+                "status": "warn",
+                "message": "Some subject chunk assignments do not resolve to live conversations.",
+                "path": str(path),
+                "details": {
+                    "subjects": [
+                        {"name": row[0], "chunk_count": int(row[1] or 0)} for row in chunk_without_conversation_rows
+                    ]
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "subject_chunk_conversation_provenance",
+                "status": "ok",
+                "message": "Subject chunk assignments resolve to live conversations.",
+                "path": str(path),
+            }
+        )
+
+    concentrated_rows = connection.execute(
+        """
+        SELECT s.name, COUNT(DISTINCT mc.conversation_id) AS conversation_count, COUNT(DISTINCT chs.chunk_id) AS chunk_count
+        FROM subjects s
+        JOIN chunk_subjects chs ON chs.subject_id = s.id
+        JOIN message_chunks mc ON mc.id = chs.chunk_id AND mc.is_deleted = 0
+        JOIN conversations c ON c.id = mc.conversation_id AND c.is_deleted = 0
+        GROUP BY s.id
+        HAVING conversation_count = 1 AND chunk_count >= 500
+        ORDER BY chunk_count DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    if concentrated_rows:
+        checks.append(
+            {
+                "name": "subject_conversation_concentration",
+                "status": "warn",
+                "message": "Some subjects have many chunks from one conversation; inspect for over-broad assignment.",
+                "path": str(path),
+                "details": {
+                    "subjects": [
+                        {
+                            "name": row[0],
+                            "conversation_count": int(row[1] or 0),
+                            "chunk_count": int(row[2] or 0),
+                        }
+                        for row in concentrated_rows
+                    ]
+                },
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "subject_conversation_concentration",
+                "status": "ok",
+                "message": "No pathological subject concentration detected.",
+                "path": str(path),
+            }
+        )
+    return checks
+
+
+def _validate_jsonl_files(parsed_dir: Path) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    for path in sorted(parsed_dir.rglob("*.jsonl")):
+        errors = 0
+        lines = 0
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                lines += 1
+                try:
+                    json.loads(line)
+                except json.JSONDecodeError:
+                    errors += 1
+                    checks.append(
+                        {
+                            "name": "jsonl_valid",
+                            "status": "error",
+                            "message": f"Invalid JSON on line {line_number}.",
+                            "path": str(path),
+                        }
+                    )
+        if errors == 0:
+            checks.append(
+                {
+                    "name": "jsonl_valid",
+                    "status": "ok",
+                    "message": f"Validated {lines} JSONL records.",
+                    "path": str(path),
+                }
+            )
+    return checks
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                events.append(json.loads(line))
+    return events

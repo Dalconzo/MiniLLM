@@ -1,0 +1,67 @@
+app:
+  name: local-agent-lab
+  log_level: info
+
+paths:
+  data_dir: data
+  logs_dir: data/logs
+  indexes_dir: data/indexes
+  memory_dir: data/memory
+  patches_dir: data/patches
+
+ollama:
+  host: http://127.0.0.1:11434
+  request_timeout_seconds: 180
+
+runtime:
+  default_task: chat
+  redact_before_model: true
+  save_full_prompts: true
+
+models:
+  code_default:
+    model: qwen2.5-coder:7b
+    task: code
+    temperature: 0.2
+    max_tokens: 1024
+    routing_label: LOCAL_OK
+    notes: Strongest local option for code-centric tasks.
+  chat_default:
+    model: llama3.2:3b
+    task: chat
+    temperature: 0.3
+    max_tokens: 768
+    routing_label: LOCAL_WEAK_BUT_TRY
+    notes: Fast local general-purpose fallback on this Mac mini.
+  summarize_fast:
+    model: llama3.2:3b
+    task: summarize
+    temperature: 0.1
+    max_tokens: 640
+    routing_label: LOCAL_OK
+    notes: Short context summarization and repo orientation.
+  embeddings:
+    model: nomic-embed-text
+    task: embeddings
+    temperature: 0.0
+    max_tokens: 256
+    routing_label: LOCAL_OK
+    notes: Placeholder for later indexing work.
+
+routing:
+  task_map:
+    chat: chat_default
+    summarize: summarize_fast
+    code: code_default
+    review: code_default
+    write_function: code_default
+    write_tests: code_default
+    search: summarize_fast
+    log: summarize_fast
+  escalation_rules:
+    - task: large_refactor
+      label: ESCALATE_TO_FRONTIER
+      reason: Multi-file refactors with ambiguous requirements exceed the local baseline.
+    - task: complex_architecture
+      label: ESCALATE_TO_FRONTIER
+      reason: Long-horizon reasoning should be routed to a stronger model.

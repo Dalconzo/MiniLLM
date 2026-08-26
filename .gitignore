@@ -1,0 +1,45 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+runs/
+*.egg-info/
+.pytest_cache/
+/build/
+/dist/
+
+# Generated runtime state
+data/indexes/*
+!data/indexes/.gitkeep
+data/logs/*
+!data/logs/.gitkeep
+data/patches/*
+!data/patches/.gitkeep
+data/memory/*
+!data/memory/.gitkeep
+data/local_staging/
+data/home_mcp/
+
+# Private imported/exported personal data
+data/chatgpt_exports/
+export.zip
+# ChatGPT exports unpacked at the repository root use a hash plus timestamp.
+[0-9a-f]*-20??-??-??-??-??-??-*/
+
+# Local credentials and private key material
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+credentials.json
+service-account*.json
+.aws/
+.ssh/

@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from ..security.paths import normalize_relative_path, safe_write_text
+from ..sqlite_utils import sqlite_connection
+
+from local_agent_lab.evals.fixtures import (
+    MemoryEvalConversation,
+    UsagePromptCase,
+    memory_eval_conversations,
+    memory_usage_prompt_cases,
+)
+from local_agent_lab.evals.memory_v1 import run_memory_eval_v1
+from local_agent_lab.evals.runner import score_expectations, summarize_usage_cases
+
+from .audit import record_retrieval_event, retrieval_exposures_for_run, tombstone_source
+from .chatgpt_ingest import import_chatgpt_export
+from .candidates import list_candidate_memories
+from .curated import create_memory_record, promote_chunk_to_memory_record
+from .search import search_chatgpt_memory
+from .subjects import assign_conversation_subject, get_subject
+
+
+def run_memory_eval(work_dir: Path) -> dict[str, Any]:
+    input_path = _write_eval_export(work_dir)
+    work_dir = input_path.parent
+    data_dir = work_dir / "data"
+    memory_dir = data_dir / "memory"
+    import_report = import_chatgpt_export(input_path=input_path, data_dir=data_dir, memory_dir=memory_dir)
+    db_path = memory_dir / "chatgpt_memory.sqlite3"
+
+    _prepare_eval_memory_state(db_path)
+
+    checks: list[dict[str, Any]] = []
+    exact = search_chatgpt_memory(memory_dir=memory_dir, query="barcode parser")
+    checks.append(_check("exact_search", exact["count"] >= 1, {"count": exact["count"]}))
+
+    secret = search_chatgpt_memory(memory_dir=memory_dir, query="credential", depth="full")
+    snippet = secret["results"][0].get("snippet", "") if secret["results"] else ""
+    secret_canary = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+    checks.append(
+        _check(
+            "redaction",
+            secret_canary not in snippet and bool(secret["results"]),
+            {
+                "snippet": snippet,
+                "redacted": secret["results"][0].get("redacted_secret_count") if secret["results"] else None,
+            },
+        )
+    )
+
+    subject = search_chatgpt_memory(memory_dir=memory_dir, query="barcode", subject="Lab Automation")
+    checks.append(_check("subject_filter", subject["count"] >= 1, {"count": subject["count"]}))
+
+    with sqlite_connection(db_path) as connection:
+        candidates = list_candidate_memories(connection)
+    assistant = next(candidate for candidate in candidates if candidate.assistant_suggestion)
+    user = next(candidate for candidate in candidates if not candidate.assistant_suggestion)
+    checks.append(
+        _check(
+            "assistant_user_separation",
+            assistant.assistant_suggestion and not user.assistant_suggestion and assistant.review_status == "pending",
+            {
+                "assistant": assistant.to_dict(),
+                "user": user.to_dict(),
+            },
+        )
+    )
+
+    with sqlite_connection(db_path) as connection:
+        chunk_id = connection.execute(
+            "SELECT id FROM message_chunks WHERE text LIKE '%barcode parser%' LIMIT 1"
+        ).fetchone()[0]
+        record = promote_chunk_to_memory_record(
+            connection,
+            chunk_id,
+            record_type="decision",
+            title="Use barcode parser",
+            trust_level="high",
+        )
+    curated = search_chatgpt_memory(memory_dir=memory_dir, query="Use barcode parser")
+    checks.append(
+        _check(
+            "curated_retrieval",
+            any(item["source_kind"] == "curated_memory" for item in curated["results"]),
+            {"record_id": record.id, "count": curated["count"]},
+        )
+    )
+
+    effort_one = search_chatgpt_memory(memory_dir=memory_dir, query="barcode parser", depth="full", effort=1)
+    checks.append(
+        _check(
+            "effort_tier_cap",
+            effort_one["results"] and effort_one["results"][0]["disclosure_tier"] == "far",
+            {
+                "disclosure_tier": effort_one["results"][0]["disclosure_tier"] if effort_one["results"] else None,
+                "lenses": effort_one.get("lenses", []),
+            },
+        )
+    )
+
+    high_risk = search_chatgpt_memory(memory_dir=memory_dir, query="portfolio", depth="full", effort=4)
+    checks.append(
+        _check(
+            "high_risk_governance",
+            high_risk["governance"]["high_risk"]
+            and "financial_caution" in high_risk["governance"]["labels"]
+            and len(high_risk["results"]) == 1
+            and high_risk["results"][0]["governance_reason"] == "high_risk_allowed",
+            {
+                "governance": high_risk["governance"],
+                "count": high_risk["count"],
+            },
+        )
+    )
+
+    with sqlite_connection(db_path) as connection:
+        audit = record_retrieval_event(
+            connection,
+            run_id="memory_eval_run",
+            query="barcode parser",
+            command="memory-eval",
+            filters=exact["filters_applied"],
+            ranking_profile=exact["ranking_profile"],
+            disclosure_depth="medium",
+            results=exact["results"],
+        )
+        exposures = retrieval_exposures_for_run(connection, "memory_eval_run")
+    checks.append(_check("audit_exposures", audit["exposures"] == len(exposures) >= 1, {"exposures": len(exposures)}))
+
+    usage_cases = [_run_usage_prompt_case(memory_dir, case) for case in memory_usage_prompt_cases()]
+    usage_summary = summarize_usage_cases(usage_cases)
+    evaluation_v1 = run_memory_eval_v1(work_dir / "evaluation_v1")
+    failed = [check for check in checks if check["status"] != "pass"]
+    failed_usage = [case for case in usage_cases if case["status"] != "pass"]
+    return {
+        "status": "fail" if failed or failed_usage or evaluation_v1["status"] != "pass" else "pass",
+        "import_report": {
+            "import_id": import_report["import_id"],
+            "summary": import_report["summary"],
+        },
+        "checks": checks,
+        "usage_cases": usage_cases,
+        "usage_summary": usage_summary,
+        "evaluation_v1": evaluation_v1,
+        # Keep the old field name for one release so existing artifact readers can
+        # consume the now-executable comparison without receiving simulated data.
+        "ab_report": evaluation_v1,
+        "summary": {
+            "checks": len(checks),
+            "passed": len(checks) - len(failed),
+            "failed": len(failed),
+            "usage_cases": len(usage_cases),
+            "usage_passed": len(usage_cases) - len(failed_usage),
+            "usage_failed": len(failed_usage),
+            "usage_score": usage_summary["score"],
+            "usage_max_score": usage_summary["max_score"],
+            "usage_score_pct": usage_summary["score_pct"],
+            "evaluation_cases": evaluation_v1["case_count"],
+            "evaluation_variants": len(evaluation_v1["variants"]),
+            "evaluation_status": evaluation_v1["status"],
+        },
+    }
+
+
+def _write_eval_export(root: Path) -> Path:
+    requested_root = root.expanduser().absolute()
+    root_name = normalize_relative_path(requested_root.name, allow_nested=False)
+    export = [_conversation_to_export_item(conversation) for conversation in memory_eval_conversations()]
+    fixture = safe_write_text(
+        requested_root.parent,
+        f"{root_name}/raw/eval-export/conversations.json",
+        json.dumps(export),
+        create_parents=True,
+        mode=0o600,
+    )
+    return fixture.parent.parent
+
+
+def _check(name: str, passed: bool, details: dict[str, Any]) -> dict[str, Any]:
+    return {"name": name, "status": "pass" if passed else "fail", "details": details}
+
+
+def _prepare_eval_memory_state(db_path: Path) -> None:
+    with sqlite_connection(db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for conversation in memory_eval_conversations():
+            if conversation.subject is None:
+                continue
+            row = connection.execute(
+                "SELECT id FROM conversations WHERE source_conversation_id = ?", (conversation.id,)
+            ).fetchone()
+            if row is not None:
+                assign_conversation_subject(
+                    connection,
+                    row[0],
+                    conversation.subject,
+                    kind=conversation.subject_kind,
+                    include_chunks=True,
+                    source="eval_fixture",
+                )
+
+        home_mcp_subject = get_subject(connection, "Home MCP")
+        recipe_subject = get_subject(connection, "Recipes and Baking")
+        health_subject = get_subject(connection, "Health Notes")
+        relationship_subject = get_subject(connection, "Relationship Notes")
+        legal_subject = get_subject(connection, "Legal Study")
+        open_loop_subject = get_subject(connection, "Baking Cameras")
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Home MCP memory tools",
+            body="Home MCP should expose memory_status, memory_search, recipe tools, and trace run IDs through narrow JSON-RPC tools.",
+            subject_id=home_mcp_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-home-mcp",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="workflow",
+            title="Transferable lab checklist",
+            body="Lab automation checklist: define inputs, capture timing, record failures, and keep every workflow step traceable.",
+            trust_level="high",
+            source_kind="eval_fixture",
+            source_ref="eval-cross-domain-lab-checklist",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Recipe card style",
+            body="Recipe cards should be concise and AI-readable, with confirmed ingredients and steps separated from assistant draft suggestions.",
+            subject_id=recipe_subject.id,
+            trust_level="high",
+            source_kind="eval_fixture",
+            source_ref="eval-recipe",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Sleep supplement caution",
+            body="Health supplement memories require cautious, source-backed handling; melatonin dose ideas are unverified until checked.",
+            subject_id=health_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-health",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="preference",
+            title="Relationship context boundary",
+            body="Relationship notes should stay contextual and should not convert one vent about a partner or family conflict into a durable fact.",
+            subject_id=relationship_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-relationship",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="research_note",
+            title="Legal study caution",
+            body="Legal and LSAT notes require source authority and must not become current legal advice without checking current law.",
+            subject_id=legal_subject.id,
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-legal",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="open_loop",
+            title="Baking camera open loop",
+            body="Decide whether ESP32 cameras belong in v1 or later for baking captures.",
+            subject_id=open_loop_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-open-loop",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="lesson",
+            title="Sourdough 12 hour cadence",
+            body="Older note says the sourdough starter feeding cadence was every 12 hours.",
+            subject_id=recipe_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-conflict-old",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="lesson",
+            title="Sourdough 24 hour cadence",
+            body="Newer note says the sourdough starter feeding cadence is every 24 hours while the starter is sluggish.",
+            subject_id=recipe_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-conflict-new",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Portfolio rebalancing notes",
+            body="Rebalance index funds monthly and document the rationale.",
+            trust_level="canonical",
+            source_kind="eval_fixture",
+            source_ref="eval-finance-current",
+            created_by="eval",
+        )
+        create_memory_record(
+            connection,
+            record_type="decision",
+            title="Old portfolio note",
+            body="Old portfolio note should no longer surface in high-risk search.",
+            trust_level="low",
+            status="stale",
+            source_kind="eval_fixture",
+            source_ref="eval-finance-stale",
+            created_by="eval",
+        )
+        blocked = create_memory_record(
+            connection,
+            record_type="research_note",
+            title="Blocked recipe spam source",
+            body="Blocked recipe spam source says to use one hundred ingredients and no steps.",
+            subject_id=recipe_subject.id,
+            trust_level="medium",
+            source_kind="eval_fixture",
+            source_ref="eval-blocked-source",
+            created_by="eval",
+        )
+        tombstone_source(
+            connection,
+            source_kind="memory_record",
+            source_id=blocked.id,
+            reason="eval tombstone for blocked source suppression",
+            deleted_by="eval",
+        )
+
+
+def _run_usage_prompt_case(memory_dir: Path, case: UsagePromptCase) -> dict[str, Any]:
+    result = search_chatgpt_memory(
+        memory_dir=memory_dir,
+        query=case.query,
+        subject=case.subject,
+        depth=case.depth,
+        effort=case.effort,
+        allow_cross_domain=case.allow_cross_domain,
+    )
+    searchable_text = _result_text(result)
+    source_kinds = {str(item.get("source_kind")) for item in result.get("results", [])}
+    domain_relations = {str(item.get("domain_relation")) for item in result.get("results", [])}
+    filters = {
+        (str(item.get("field")), _hashable_value(item.get("value"))) for item in result.get("filters_applied", [])
+    }
+    governance_labels = set(result.get("governance", {}).get("labels", []))
+    first = result.get("results", [{}])[0] if result.get("results") else {}
+    expectations: list[tuple[str, bool, dict[str, Any] | None]] = [
+        (
+            "min_results",
+            int(result.get("count", 0)) >= case.min_results,
+            {"count": result.get("count"), "min_results": case.min_results},
+        ),
+    ]
+    expectations.extend(
+        (
+            f"required_term:{term}",
+            term.lower() in searchable_text,
+            {"term": term},
+        )
+        for term in case.required_terms
+    )
+    expectations.extend(
+        (
+            f"forbidden_term:{term}",
+            term.lower() not in searchable_text,
+            {"term": term},
+        )
+        for term in case.forbidden_terms
+    )
+    expectations.extend(
+        (
+            f"source_kind:{source_kind}",
+            source_kind in source_kinds,
+            {"source_kinds": sorted(source_kinds)},
+        )
+        for source_kind in case.expected_source_kinds
+    )
+    expectations.extend(
+        (
+            f"domain_relation:{domain_relation}",
+            domain_relation in domain_relations,
+            {"domain_relations": sorted(domain_relations)},
+        )
+        for domain_relation in case.expected_domain_relations
+    )
+    if case.expected_primary_domain is not None:
+        expectations.append(
+            (
+                "primary_domain",
+                result.get("domain_detection", {}).get("primary_domain") == case.expected_primary_domain,
+                {
+                    "actual": result.get("domain_detection", {}).get("primary_domain"),
+                    "expected": case.expected_primary_domain,
+                },
+            )
+        )
+    expectations.extend(
+        (
+            f"filter:{field}",
+            (field, _hashable_value(value)) in filters,
+            {"filters": sorted((field, repr(value)) for field, value in filters), "expected": (field, value)},
+        )
+        for field, value in case.expected_filters
+    )
+    expectations.extend(
+        (
+            f"governance_label:{label}",
+            label in governance_labels,
+            {"labels": sorted(governance_labels)},
+        )
+        for label in case.expected_governance_labels
+    )
+    if case.require_score_breakdown:
+        expectations.append(
+            (
+                "score_breakdown",
+                bool(first.get("score_breakdown")),
+                {"score_breakdown": first.get("score_breakdown")},
+            )
+        )
+    if case.require_validation_checks:
+        expectations.append(
+            (
+                "validation_checks",
+                bool(first.get("validation_checks")),
+                {"validation_checks": first.get("validation_checks")},
+            )
+        )
+
+    scored = score_expectations(expectations)
+    return {
+        "id": case.id,
+        "category": case.category,
+        "complexity": case.complexity,
+        "prompt": case.prompt,
+        "query": case.query,
+        "subject": case.subject,
+        "status": scored["status"],
+        "score": scored["score"],
+        "max_score": scored["max_score"],
+        "score_pct": scored["score_pct"],
+        "expectations": scored["expectations"],
+        "result_summary": {
+            "count": result.get("count"),
+            "ranking_profile": result.get("ranking_profile"),
+            "domain_detection": result.get("domain_detection"),
+            "governance": result.get("governance"),
+            "filters_applied": result.get("filters_applied"),
+            "source_kinds": sorted(source_kinds),
+            "domain_relations": sorted(domain_relations),
+            "top_result": {
+                key: first.get(key)
+                for key in (
+                    "source_kind",
+                    "title",
+                    "role",
+                    "domain_primary",
+                    "domain_relation",
+                    "governance_reason",
+                    "trust_level",
+                )
+            },
+        },
+    }
+
+
+def _conversation_to_export_item(conversation: MemoryEvalConversation) -> dict[str, Any]:
+    mapping: dict[str, Any] = {}
+    for index, message in enumerate(conversation.messages):
+        mapping[message.id] = {
+            "id": message.id,
+            "message": {
+                "id": message.id,
+                "author": {"role": message.role},
+                "create_time": message.created_at,
+                "content": {"parts": [message.text]},
+                "metadata": {},
+            },
+            "parent": conversation.messages[index - 1].id if index else None,
+            "children": [conversation.messages[index + 1].id] if index + 1 < len(conversation.messages) else [],
+        }
+    return {
+        "id": conversation.id,
+        "title": conversation.title,
+        "create_time": None,
+        "update_time": None,
+        "mapping": mapping,
+    }
+
+
+def _result_text(result: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in result.get("results", []):
+        parts.extend(
+            str(item.get(key) or "")
+            for key in ("title", "snippet", "chunk_text", "role", "source_kind", "domain_primary")
+        )
+    return "\n".join(parts).lower()
+
+
+def _hashable_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(value)
+    if isinstance(value, dict):
+        return tuple(sorted((key, _hashable_value(item)) for key, item in value.items()))
+    return value

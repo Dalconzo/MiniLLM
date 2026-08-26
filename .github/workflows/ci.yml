@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.10.10"
+
+jobs:
+  core:
+    name: Linux Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --all-groups
+      - run: uv run --frozen pytest -q
+
+  quality:
+    name: Quality and security gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --all-groups
+      - run: uv run --frozen ruff check src tests scripts examples
+      - run: uv run --frozen ruff format --check src tests scripts examples
+      - run: uv run --frozen mypy
+      - run: ./scripts/run_security_tests.sh
+      - name: Build and audit the distributable public tree
+        shell: bash
+        run: |
+          canaries="$RUNNER_TEMP/minillm-private-overlap-canaries.txt"
+          candidate="$RUNNER_TEMP/minillm-public-candidate"
+          manifest="$RUNNER_TEMP/minillm-public-candidate-manifest.json"
+          printf '%s-public-overlap-canary\n' "$GITHUB_SHA" > "$canaries"
+          uv run --frozen python scripts/create_public_release_candidate.py \
+            --source-repo . \
+            --source-commit HEAD \
+            --output-dir "$candidate" \
+            --manifest "$manifest" \
+            --forbidden-literals-file "$canaries"
+          uv run --frozen python scripts/audit_public_artifacts.py \
+            --path "$candidate" \
+            --path "$manifest" \
+            --forbidden-literals-file "$canaries"
+      - name: Audit locked runtime dependencies
+        shell: bash
+        run: |
+          requirements="$RUNNER_TEMP/minillm-runtime-requirements.txt"
+          uv export --frozen --no-dev --no-emit-project --output-file "$requirements"
+          uv run --frozen pip-audit --disable-pip --requirement "$requirements"
+      - run: mkdir -p build
+      - name: Measure coverage
+        env:
+          COVERAGE_FILE: build/.coverage
+        run: >-
+          ulimit -n 4096 && uv run --frozen pytest
+          --cov=local_agent_lab
+          --cov-branch
+          --cov-report=term-missing
+          --cov-report=json:build/coverage.json
+          --cov-report=xml:build/coverage.xml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-python-3.11
+          path: |
+            build/coverage.json
+            build/coverage.xml
+          if-no-files-found: error
+
+  macos-smoke:
+    name: macOS Python 3.11 smoke
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --all-groups
+      - run: uv run --frozen pytest -q tests/test_packaging.py tests/test_router.py tests/test_home_mcp_launchd.py
+      - run: uv run --frozen lagent --help
+
+  wheel-smoke:
+    name: Build and install wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --all-groups
+      - run: uv build --wheel --no-build-isolation --out-dir dist
+      - run: python -m venv "$RUNNER_TEMP/wheel-venv"
+      - run: uv pip install --python "$RUNNER_TEMP/wheel-venv/bin/python" dist/minillm-*.whl
+      - name: Smoke installed wheel outside the checkout
+        env:
+          LAGENT_HOME: ${{ runner.temp }}/wheel-runtime
+        run: cd "$RUNNER_TEMP" && "$RUNNER_TEMP/wheel-venv/bin/python" "$GITHUB_WORKSPACE/tests/wheel_smoke.py"
+      - run: >-
+          "$RUNNER_TEMP/wheel-venv/bin/lagent" --help

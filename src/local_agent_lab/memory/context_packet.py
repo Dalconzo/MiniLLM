@@ -1,0 +1,633 @@
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from typing import Any
+
+from .ranking import DISCLOSURE_TIERS
+
+
+CONTEXT_PACKET_SCHEMA_VERSION = 2
+RETRIEVAL_DEPTHS = ("close", "broad")
+PACKET_DETAILS = ("summary", "standard", "complete")
+CONTEXT_PACKET_SECTIONS = (
+    "critical_constraints",
+    "current_state",
+    "relevant_preferences",
+    "relevant_outcomes",
+    "failures_and_lessons",
+    "contradictions_and_qualifications",
+    "inferred_patterns",
+    "analogies",
+    "uncertainty",
+    "omitted_but_available",
+)
+
+
+@dataclass(frozen=True)
+class ContextControls:
+    retrieval_depth: str
+    packet_detail: str
+    disclosure_tier: str
+    requested_depth: str | None
+    legacy_depth_alias: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "retrieval_depth": self.retrieval_depth,
+            "packet_detail": self.packet_detail,
+            "disclosure_tier": self.disclosure_tier,
+            "requested_depth": self.requested_depth,
+            "legacy_depth_alias": self.legacy_depth_alias,
+        }
+
+
+def normalize_context_controls(
+    *,
+    depth: str | None = None,
+    retrieval_depth: str | None = None,
+    packet_detail: str | None = None,
+    disclosure_tier: str | None = None,
+    effort: int = 2,
+) -> ContextControls:
+    """Separate the legacy depth knob into retrieval, packet, and disclosure controls."""
+    requested_depth = depth
+    legacy_depth_alias = retrieval_depth is None and packet_detail is None and disclosure_tier is None
+    if legacy_depth_alias:
+        disclosure_tier = depth or "medium"
+        if disclosure_tier not in DISCLOSURE_TIERS:
+            raise ValueError(f"depth must be one of: {', '.join(DISCLOSURE_TIERS)}")
+        retrieval_depth = "broad" if disclosure_tier == "full" or effort >= 4 else "close"
+        packet_detail = (
+            "complete" if disclosure_tier == "full" else "summary" if disclosure_tier == "far" else "standard"
+        )
+    else:
+        retrieval_depth = retrieval_depth or ("broad" if effort >= 4 else "close")
+        packet_detail = packet_detail or "standard"
+        disclosure_tier = disclosure_tier or depth or "medium"
+
+    if retrieval_depth not in RETRIEVAL_DEPTHS:
+        raise ValueError(f"retrieval_depth must be one of: {', '.join(RETRIEVAL_DEPTHS)}")
+    if packet_detail not in PACKET_DETAILS:
+        raise ValueError(f"packet_detail must be one of: {', '.join(PACKET_DETAILS)}")
+    if disclosure_tier not in DISCLOSURE_TIERS:
+        raise ValueError(f"disclosure_tier must be one of: {', '.join(DISCLOSURE_TIERS)}")
+
+    return ContextControls(
+        retrieval_depth=retrieval_depth,
+        packet_detail=packet_detail,
+        disclosure_tier=disclosure_tier,
+        requested_depth=requested_depth,
+        legacy_depth_alias=legacy_depth_alias,
+    )
+
+
+def build_context_packet(
+    *,
+    query: str,
+    retrieval_event_id: str,
+    search_result: dict[str, Any],
+    context_items: list[dict[str, Any]],
+    requested_depth: str | None = None,
+    retrieval_depth: str | None = None,
+    packet_detail: str | None = None,
+    disclosure_tier: str | None = None,
+) -> dict[str, Any]:
+    """Compile retrieved memory evidence into the AI Memory Contract packet shape."""
+    controls = normalize_context_controls(
+        depth=requested_depth,
+        retrieval_depth=retrieval_depth,
+        packet_detail=packet_detail,
+        disclosure_tier=disclosure_tier,
+    )
+    packet_id = _packet_id(query=query, retrieval_event_id=retrieval_event_id, context_items=context_items)
+    packet: dict[str, Any] = {
+        "schema_version": CONTEXT_PACKET_SCHEMA_VERSION,
+        "context_packet_id": packet_id,
+        "task": {
+            "query": query,
+            "subject": _filter_value(search_result.get("filters_applied", []), "subject"),
+            "depth": controls.disclosure_tier,
+            "retrieval_depth": controls.retrieval_depth,
+            "packet_detail": controls.packet_detail,
+            "disclosure_tier": controls.disclosure_tier,
+            "legacy_depth_alias": controls.legacy_depth_alias,
+            "ranking_profile": search_result.get("ranking_profile"),
+        },
+        "critical_constraints": [],
+        "current_state": [],
+        "relevant_preferences": [],
+        "relevant_outcomes": [],
+        "failures_and_lessons": [],
+        "contradictions_and_qualifications": [],
+        "inferred_patterns": [],
+        "analogies": [],
+        "uncertainty": [],
+        "omitted_but_available": [],
+        "provenance": {
+            "retrieval_event_id": retrieval_event_id,
+            "context_packet_id": packet_id,
+            "source_ids": [str(item.get("source_id")) for item in context_items if item.get("source_id")],
+            "candidate_counts": search_result.get("candidate_counts", {}),
+            "filters_applied": search_result.get("filters_applied", []),
+            "domain_detection": search_result.get("domain_detection", {}),
+            "governance": search_result.get("governance", {}),
+        },
+    }
+
+    for item in context_items:
+        entry = _packet_entry(item)
+        section = _section_for_item(item, entry)
+        if section == "_omit":
+            packet["omitted_but_available"].append(
+                {
+                    "category": "question_only_context_item",
+                    "source_ids": entry["source_ids"],
+                    "reason": "interrogative chunk did not contain concrete state, preference, outcome, or constraint",
+                }
+            )
+            continue
+        entry["packet_slot"] = section
+        packet[section].append(entry)
+        if section != "current_state" and _should_mirror_as_current_state(query, item, entry):
+            mirrored = dict(entry)
+            mirrored["packet_slot"] = "current_state"
+            mirrored["reason"] = "concrete_user_reported_tracking_state"
+            packet["current_state"].append(mirrored)
+        if section != "relevant_outcomes" and _should_mirror_as_relevant_outcome(query, item, entry):
+            mirrored = dict(entry)
+            mirrored["packet_slot"] = "relevant_outcomes"
+            mirrored["reason"] = "concrete_user_reported_tracking_outcome"
+            packet["relevant_outcomes"].append(mirrored)
+        if section != "uncertainty" and _is_uncertain(item, entry):
+            packet["uncertainty"].append(_uncertainty_entry(item, entry))
+
+    if search_result.get("governance", {}).get("high_risk"):
+        packet["critical_constraints"].append(
+            {
+                "claim": "This query intersects a high-risk domain; downstream agents must avoid unsupported advice and preserve uncertainty.",
+                "strength": "hard",
+                "confidence": 1.0,
+                "epistemic_status": "system_policy",
+                "source_ids": [],
+                "reason": "memory_governance_high_risk",
+            }
+        )
+
+    _add_inferred_pattern(packet, context_items)
+    _resolve_current_state(packet, query=query)
+    _add_omission_note(packet, search_result, context_items)
+    _add_empty_slot_notes(packet)
+    return packet
+
+
+def compact_context_items(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_context_item(result) for result in results]
+
+
+def _context_item(result: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "source_kind": result.get("source_kind"),
+        "source_id": result.get("source_id") or result.get("chunk_id"),
+        "conversation_id": result.get("conversation_id"),
+        "message_id": result.get("message_id"),
+        "title": result.get("title"),
+        "score": result.get("score"),
+        "score_breakdown": result.get("score_breakdown"),
+        "disclosure_tier": result.get("disclosure_tier"),
+        "exposed_fields": result.get("exposed_fields", []),
+        "retrieval_sources": result.get("retrieval_sources", []),
+        "epistemic_status": result.get("epistemic_status"),
+        "confidence_basis": result.get("confidence_basis"),
+        "record_type": result.get("record_type"),
+        "trust_level": result.get("trust_level"),
+        "status": result.get("status"),
+        "source_role": result.get("source_role") or result.get("role"),
+        "message_created_at": result.get("message_created_at"),
+        "turn_index": result.get("turn_index"),
+        "validation_checks": result.get("validation_checks", {}),
+        "source_refs": result.get("source_refs", []),
+        "provenance": result.get("provenance", {}),
+    }
+    if "snippet" in result:
+        payload["snippet"] = result["snippet"]
+    return payload
+
+
+def _packet_entry(item: dict[str, Any]) -> dict[str, Any]:
+    text = _claim_text(item)
+    return {
+        "claim": text,
+        "confidence": _confidence(item),
+        "epistemic_status": item.get("epistemic_status") or _epistemic_status(item),
+        "confidence_basis": item.get("confidence_basis") or "retrieved_evidence",
+        "source_ids": [str(item["source_id"])] if item.get("source_id") else [],
+        "source_kind": item.get("source_kind"),
+        "record_type": item.get("record_type"),
+        "trust_level": item.get("trust_level"),
+        "retrieval_sources": item.get("retrieval_sources", []),
+        "message_created_at": item.get("message_created_at"),
+        "turn_index": item.get("turn_index"),
+    }
+
+
+def _section_for_item(item: dict[str, Any], entry: dict[str, Any]) -> str:
+    hinted = str(item.get("packet_slot_hint") or "")
+    text = str(entry.get("claim") or "").lower()
+    title = str(item.get("title") or "").lower()
+    combined = f"{title} {text}"
+    if hinted in CONTEXT_PACKET_SECTIONS and hinted != "omitted_but_available":
+        if item.get("source_role") == "assistant" and hinted in _FACTUAL_PACKET_SECTIONS:
+            return "uncertainty"
+        if hinted in _FACTUAL_PACKET_SECTIONS and _is_question_only_user_chunk(item, text, combined):
+            return "_omit"
+        return hinted
+    record_type = str(item.get("record_type") or "").lower()
+    if item.get("source_role") == "assistant":
+        return "uncertainty"
+    if _is_question_only_user_chunk(item, text, combined):
+        return "_omit"
+    if record_type in {"constraint", "risk"} or any(
+        token in text for token in ("must not", "do not", "blocked", "boundary", "require")
+    ):
+        return "critical_constraints"
+    if record_type in {"preference", "contact_note"} or "prefer" in text:
+        entry["strength"] = "strong" if item.get("trust_level") in {"canonical", "high"} else "contextual"
+        return "relevant_preferences"
+    if record_type in {"lesson"} or _contains_context_token(
+        combined, ("failed", "failure", "wrong", "avoid", "lesson", "underproof", "overproof")
+    ):
+        return "failures_and_lessons"
+    if record_type in {"decision", "workflow", "project", "open_loop"}:
+        return "current_state"
+    if _contains_context_token(
+        combined, ("outcome", "worked", "completed", "attempted", "successful", "mixed", "rose", "fell", "peaked")
+    ):
+        return "relevant_outcomes"
+    checks = item.get("validation_checks", {})
+    contradiction = checks.get("contradiction", {}) if isinstance(checks, dict) else {}
+    if contradiction.get("status") in {"possible", "review"}:
+        return "contradictions_and_qualifications"
+    return "current_state"
+
+
+def _contains_context_token(text: str, tokens: tuple[str, ...]) -> bool:
+    for token in tokens:
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])", text):
+            return True
+    return False
+
+
+def _is_question_only_user_chunk(item: dict[str, Any], claim_text: str, combined_text: str) -> bool:
+    if item.get("source_role") != "user":
+        return False
+    has_question_shape = "?" in claim_text or re.search(
+        r"^\s*(what|what's|whats|when|where|why|how|can|could|should|would|will|is|are|do|does|did)\b",
+        claim_text,
+    )
+    if not has_question_shape:
+        return False
+    factual_tokens = (
+        "rose",
+        "risen",
+        "fell",
+        "fallen",
+        "peaked",
+        "worked",
+        "failed",
+        "succeeded",
+        "confirmed",
+        "decided",
+        "prefer",
+        "usually",
+        "always",
+        "avoid",
+        "using",
+        "fed",
+        "kept",
+    )
+    return not any(token in combined_text for token in factual_tokens)
+
+
+def _resolve_current_state(packet: dict[str, Any], *, query: str) -> None:
+    """Keep the active state slot compact while preserving older evidence for audit."""
+    if not _is_tracking_state_query(query):
+        _dedupe_packet_section(packet, "current_state")
+        return
+
+    entries = list(packet.get("current_state") or [])
+    if not entries:
+        return
+
+    concrete_state = [entry for entry in entries if _is_concrete_tracking_state(entry)]
+    if not concrete_state:
+        _dedupe_packet_section(packet, "current_state")
+        return
+
+    preferred = max(concrete_state, key=_state_preference_key)
+    preferred_key = _entry_identity(preferred)
+    revised_current: list[dict[str, Any]] = []
+    demoted: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        identity = _entry_identity(entry)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if identity == preferred_key:
+            active = dict(entry)
+            active["state_resolution"] = "active_current_state"
+            revised_current.append(active)
+            continue
+        if _is_starter_state_entry(entry):
+            qualified = dict(entry)
+            qualified["packet_slot"] = "contradictions_and_qualifications"
+            qualified["reason"] = (
+                "historical_or_less_specific_state; retained for audit but not treated as active current state"
+            )
+            qualified["state_resolution"] = "historical_or_superseded"
+            demoted.append(qualified)
+            continue
+        if _is_question_entry(entry):
+            qualified = dict(entry)
+            qualified["packet_slot"] = "contradictions_and_qualifications"
+            qualified["reason"] = "question-shaped context; not canonical current state"
+            qualified["state_resolution"] = "question_context"
+            demoted.append(qualified)
+            continue
+        revised_current.append(entry)
+
+    packet["current_state"] = revised_current
+    packet["contradictions_and_qualifications"] = _dedupe_entries(
+        [*(packet.get("contradictions_and_qualifications") or []), *demoted]
+    )
+
+
+def _should_mirror_as_current_state(query: str, item: dict[str, Any], entry: dict[str, Any]) -> bool:
+    if item.get("source_role") != "user":
+        return False
+    if str(entry.get("epistemic_status") or "") not in {"user_reported", "raw_evidence", ""}:
+        return False
+    query_lower = query.lower()
+    if not any(token in query_lower for token in ("starter", "sourdough", "baking", "tracking")):
+        return False
+    text = f"{item.get('title') or ''} {entry.get('claim') or ''}".lower()
+    has_domain = any(token in text for token in ("starter", "sourdough", "levain", "dough", "bake", "baking"))
+    has_state = _contains_context_token(
+        text,
+        (
+            "fed",
+            "feeding",
+            "mixed",
+            "retained",
+            "using",
+            "rose",
+            "risen",
+            "fell",
+            "fallen",
+            "peaked",
+            "ready",
+        ),
+    )
+    return has_domain and has_state
+
+
+def _should_mirror_as_relevant_outcome(query: str, item: dict[str, Any], entry: dict[str, Any]) -> bool:
+    if item.get("source_role") != "user":
+        return False
+    if str(entry.get("epistemic_status") or "") not in {"user_reported", "raw_evidence", ""}:
+        return False
+    if not _is_tracking_state_query(query):
+        return False
+    text = str(entry.get("claim") or "").lower()
+    return _is_concrete_tracking_state(entry) and _contains_context_token(
+        text,
+        ("rose", "risen", "fell", "fallen", "peaked", "worked", "failed", "succeeded"),
+    )
+
+
+def _is_tracking_state_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(token in lowered for token in ("starter", "sourdough", "tracking", "feeding", "baking"))
+
+
+def _is_concrete_tracking_state(entry: dict[str, Any]) -> bool:
+    text = str(entry.get("claim") or "").lower()
+    if not _is_starter_state_entry(entry):
+        return False
+    has_measurement = bool(re.search(r"\b\d+\s*(?:-|to)?\s*\d*\s*(?:%|percent|hours?|hrs?|g|grams?)\b", text))
+    has_event = _contains_context_token(
+        text,
+        ("fed", "feeding", "mixed", "retained", "rose", "risen", "fell", "fallen", "peaked", "ready"),
+    )
+    return has_measurement or has_event
+
+
+def _is_starter_state_entry(entry: dict[str, Any]) -> bool:
+    text = str(entry.get("claim") or "").lower()
+    return any(token in text for token in ("starter", "sourdough", "levain")) and _contains_context_token(
+        text,
+        ("fed", "feeding", "mixed", "retained", "rose", "risen", "fell", "fallen", "peaked", "ready", "tap water"),
+    )
+
+
+def _state_preference_key(entry: dict[str, Any]) -> tuple[int, int, str, str]:
+    text = str(entry.get("claim") or "").lower()
+    specificity = 0
+    specificity += 3 if re.search(r"\b\d+\s*(?:-|to)?\s*\d*\s*(?:%|percent)\b", text) else 0
+    specificity += 2 if re.search(r"\b\d+\s*(?:hours?|hrs?)\b", text) else 0
+    specificity += 1 if _contains_context_token(text, ("rose", "risen", "fell", "fallen", "peaked")) else 0
+    specificity += 1 if _contains_context_token(text, ("fed", "feeding", "mixed", "retained")) else 0
+    timestamp = str(entry.get("message_created_at") or "")
+    return (
+        1 if str(entry.get("epistemic_status") or "") == "user_reported" else 0,
+        specificity,
+        timestamp,
+        str(entry.get("source_ids") or ""),
+    )
+
+
+def _is_question_entry(entry: dict[str, Any]) -> bool:
+    claim = str(entry.get("claim") or "").strip().lower()
+    return (
+        "?" in claim
+        or re.match(
+            r"^(what|what's|whats|when|where|why|how|can|could|should|would|will|is|are|do|does|did)\b",
+            claim,
+        )
+        is not None
+    )
+
+
+def _dedupe_packet_section(packet: dict[str, Any], section: str) -> None:
+    packet[section] = _dedupe_entries(packet.get(section) or [])
+
+
+def _dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        identity = _entry_identity(entry)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(entry)
+    return deduped
+
+
+def _entry_identity(entry: dict[str, Any]) -> str:
+    source_ids = entry.get("source_ids") or []
+    if source_ids:
+        return "|".join(str(source_id) for source_id in source_ids)
+    claim = re.sub(r"\s+", " ", str(entry.get("claim") or "").strip().lower())
+    return claim[:180]
+
+
+_FACTUAL_PACKET_SECTIONS = {
+    "critical_constraints",
+    "current_state",
+    "relevant_preferences",
+    "relevant_outcomes",
+    "failures_and_lessons",
+    "contradictions_and_qualifications",
+}
+
+
+def _uncertainty_entry(item: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    reason = (
+        "assistant-authored evidence requires confirmation"
+        if item.get("source_role") == "assistant"
+        else "low-confidence retrieved evidence"
+    )
+    return {
+        "claim": entry["claim"],
+        "reason": reason,
+        "confidence": entry["confidence"],
+        "source_ids": entry["source_ids"],
+        "epistemic_status": entry["epistemic_status"],
+    }
+
+
+def _add_inferred_pattern(packet: dict[str, Any], context_items: list[dict[str, Any]]) -> None:
+    if len(context_items) < 2:
+        return
+    domains = sorted(
+        {
+            str(item.get("provenance", {}).get("domain_primary") or "")
+            for item in context_items
+            if isinstance(item.get("provenance"), dict) and item.get("provenance", {}).get("domain_primary")
+        }
+    )
+    packet["inferred_patterns"].append(
+        {
+            "pattern": "Multiple retrieved memories appear relevant to this task; use the factual sections as evidence, not as an answer draft.",
+            "confidence": 0.5,
+            "supporting_ids": [str(item.get("source_id")) for item in context_items if item.get("source_id")][:5],
+            "epistemic_status": "system_inference",
+            "confidence_basis": "retrieval_set_pattern",
+            "domains": domains,
+        }
+    )
+
+
+def _add_omission_note(
+    packet: dict[str, Any], search_result: dict[str, Any], context_items: list[dict[str, Any]]
+) -> None:
+    counts = (
+        search_result.get("candidate_counts", {}) if isinstance(search_result.get("candidate_counts"), dict) else {}
+    )
+    available = int(counts.get("fts", 0) or 0) + int(counts.get("vector", 0) or 0) + int(counts.get("curated", 0) or 0)
+    omitted = max(0, available - len(context_items))
+    if omitted:
+        packet["omitted_but_available"].append(
+            {
+                "category": "retrieved_candidates",
+                "count": omitted,
+                "reason": "bounded_context_packet",
+            }
+        )
+    if not context_items:
+        packet["omitted_but_available"].append(
+            {
+                "category": "raw_history",
+                "reason": "no context items survived retrieval, filtering, and governance",
+            }
+        )
+
+
+def _add_empty_slot_notes(packet: dict[str, Any]) -> None:
+    evidence_sections = (
+        "critical_constraints",
+        "current_state",
+        "relevant_preferences",
+        "relevant_outcomes",
+        "failures_and_lessons",
+        "contradictions_and_qualifications",
+        "uncertainty",
+    )
+    empty_sections = [section for section in evidence_sections if not packet.get(section)]
+    if empty_sections:
+        packet["omitted_but_available"].append(
+            {
+                "category": "empty_context_slots",
+                "sections": empty_sections,
+                "reason": "no retrieved item classified into these packet slots",
+            }
+        )
+
+
+def _claim_text(item: dict[str, Any]) -> str:
+    snippet = str(item.get("snippet") or "").strip()
+    title = str(item.get("title") or "").strip()
+    if snippet:
+        return snippet
+    return title or str(item.get("source_id") or "retrieved memory item")
+
+
+def _confidence(item: dict[str, Any]) -> float:
+    trust = str(item.get("trust_level") or "").lower()
+    if trust == "canonical":
+        return 0.92
+    if trust == "high":
+        return 0.8
+    if item.get("source_role") == "assistant":
+        return 0.35
+    if item.get("source_kind") == "curated_memory":
+        return 0.65
+    return 0.55
+
+
+def _epistemic_status(item: dict[str, Any]) -> str:
+    if item.get("source_role") == "assistant":
+        return "assistant_hypothesis"
+    if item.get("source_kind") == "curated_memory":
+        return "current_canonical_claim" if item.get("trust_level") in {"canonical", "high"} else "current_claim"
+    return "raw_evidence"
+
+
+def _is_uncertain(item: dict[str, Any], entry: dict[str, Any]) -> bool:
+    return item.get("source_role") == "assistant" or float(entry.get("confidence") or 0.0) < 0.5
+
+
+def _packet_id(*, query: str, retrieval_event_id: str, context_items: list[dict[str, Any]]) -> str:
+    source_ids = ",".join(str(item.get("source_id") or "") for item in context_items)
+    digest = hashlib.sha256(f"{retrieval_event_id}\n{query}\n{source_ids}".encode("utf-8")).hexdigest()[:16]
+    return f"ctx_{digest}"
+
+
+def _filter_value(filters: Any, field: str) -> Any:
+    if not isinstance(filters, list):
+        return None
+    for item in filters:
+        if isinstance(item, dict) and item.get("field") == field:
+            return item.get("value")
+    return None
+
+
+def _first_non_empty(values: Any) -> Any:
+    for value in values:
+        if value:
+            return value
+    return None
+    return None

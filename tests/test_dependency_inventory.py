@@ -22,6 +22,16 @@ def test_dependency_license_inventory_covers_and_binds_the_lockfile() -> None:
     inventory_names = {_normalize_name(package["name"]) for package in inventory["python_packages"]}
 
     assert locked_names == inventory_names | {"minillm"}
+    assert len(inventory_names) == len(inventory["python_packages"])
+    locked_versions = {
+        (_normalize_name(package["name"]), package["version"])
+        for package in lock["package"]
+        if _normalize_name(package["name"]) != "minillm"
+    }
+    inventory_versions = {
+        (_normalize_name(package["name"]), package["version"]) for package in inventory["python_packages"]
+    }
+    assert locked_versions == inventory_versions
     assert inventory["locked_project_count"] == 1
     assert inventory["locked_third_party_count"] == len(inventory_names)
     assert (

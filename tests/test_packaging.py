@@ -21,11 +21,9 @@ def test_python_and_tooling_target_the_advertised_311_floor() -> None:
     assert metadata["project"]["requires-python"] == ">=3.11,<3.15"
     assert metadata["tool"]["ruff"]["target-version"] == "py311"
     assert metadata["tool"]["mypy"]["python_version"] == "3.11"
-    assert (
-        (ROOT / "uv.lock")
-        .read_text(encoding="utf-8")
-        .startswith('version = 1\nrevision = 3\nrequires-python = ">=3.11, <3.15"\n')
-    )
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    assert lock["version"] == 1
+    assert lock["requires-python"].replace(" ", "") == metadata["project"]["requires-python"]
 
 
 def test_wheel_declares_default_config_and_prompt_data() -> None:
